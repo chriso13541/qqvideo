@@ -1,0 +1,7 @@
+{
+  "id": "mkv",
+  "display_name": "MKV / WebM",
+  "extensions": ".mkv, .webm",
+  "plugin": "demux_mkv",
+  "version": "0.0.0"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "passthrough-decoder",
+  "kind": "decoder",
+  "version": "0.1.0",
+  "library": "decoder_passthrough",
+  "claims": { "fourccs": ["SYNT"] }
+}

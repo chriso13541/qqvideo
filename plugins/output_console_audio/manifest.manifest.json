@@ -1,0 +1,7 @@
+{
+  "name": "console-audio-output",
+  "kind": "output-audio",
+  "version": "0.1.0",
+  "library": "output_console_audio",
+  "claims": {}
+}

@@ -1,0 +1,83 @@
+# qqvideo .gitignore
+
+# ─── Build directories ───────────────────────────────────────────────────────
+# Main build output
+build/
+cmake-build-*/
+
+# CMake-generated files that appear at project root
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+CTestTestfile.cmake
+
+# Ninja
+*.ninja
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Per-package build directories (each package builds independently)
+packages/*/build/
+packages/*/*/build/
+packages/*/*/*/build/
+
+# ─── FFmpeg source tree ──────────────────────────────────────────────────────
+# Users clone FFmpeg into packages/ffmpeg/ themselves.
+# Run: git clone https://github.com/FFmpeg/FFmpeg packages/ffmpeg
+# Then: bash packages/build_ffmpeg.sh
+#
+# The built install also lives here; ignore the whole thing.
+packages/ffmpeg/
+
+# ─── Compiled package plugins ────────────────────────────────────────────────
+# Plugin DLLs and generated manifests are user-built and not committed.
+# The package.json, CMakeLists.txt, and FindQQVideoFFmpeg.cmake ARE committed.
+packages/**/*.dll
+packages/**/*.so
+packages/**/*.dylib
+packages/**/*.manifest.json
+
+# ─── Compiled output ─────────────────────────────────────────────────────────
+*.o
+*.obj
+*.pdb
+*.exp
+*.ilk
+*.map
+
+# The exe itself (users build it)
+*.exe
+
+# Static and import libraries (build artifacts)
+*.a
+*.lib
+
+# ─── IDE and editors ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
+*.sln.DotSettings
+*.vcxproj.user
+*.swp
+*.swo
+*~
+*.orig
+.clangd/
+.clang-tidy
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/

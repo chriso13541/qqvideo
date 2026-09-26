@@ -1,0 +1,12 @@
+{
+  "id": "h264",
+  "display_name": "H.264 / AVC",
+  "fourcc": "H264",
+  "codec_type": "video",
+  "plugin": "decoder_h264",
+  "version": "0.2.0",
+  "source_url": "https://github.com/FFmpeg/FFmpeg",
+  "decoder_library": "libavcodec (built-in H.264 decoder)",
+  "license": "LGPL-2.1",
+  "notes": "Wraps libavcodec. Works with any installed container demuxer."
+}

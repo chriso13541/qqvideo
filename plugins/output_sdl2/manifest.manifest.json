@@ -1,0 +1,7 @@
+{
+  "name": "sdl2-video-output",
+  "kind": "output-video",
+  "version": "0.1.0",
+  "library": "output_sdl2",
+  "claims": {}
+}

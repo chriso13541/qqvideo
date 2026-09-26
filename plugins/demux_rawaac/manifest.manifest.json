@@ -1,0 +1,7 @@
+{
+  "name": "rawaac-demuxer",
+  "kind": "demuxer",
+  "version": "0.1.0",
+  "library": "demux_rawaac",
+  "claims": { "extensions": [".aac", ".adts"] }
+}

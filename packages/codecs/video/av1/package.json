@@ -1,0 +1,12 @@
+{
+  "id": "av1",
+  "display_name": "AV1",
+  "fourcc": "AV01",
+  "codec_type": "video",
+  "plugin": "decoder_av1",
+  "version": "0.0.0",
+  "source_url": "https://aomedia.googlesource.com/aom",
+  "decoder_library": "libavcodec + libaom or libdav1d",
+  "license": "BSD-2-Clause",
+  "notes": "Not yet built."
+}

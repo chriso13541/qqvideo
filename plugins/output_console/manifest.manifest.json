@@ -1,0 +1,7 @@
+{
+  "name": "console-video-output",
+  "kind": "output-video",
+  "version": "0.1.0",
+  "library": "output_console",
+  "claims": {}
+}

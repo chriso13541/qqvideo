@@ -1,0 +1,7 @@
+{
+  "name": "mp4-demuxer",
+  "kind": "demuxer",
+  "version": "0.1.0",
+  "library": "demux_mp4",
+  "claims": { "extensions": [".mp4", ".m4v", ".mov", ".m4a"] }
+}

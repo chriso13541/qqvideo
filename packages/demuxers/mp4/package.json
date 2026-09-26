@@ -1,0 +1,7 @@
+{
+  "id": "mp4",
+  "display_name": "MP4 / M4V / MOV",
+  "extensions": ".mp4, .m4v, .mov",
+  "plugin": "demux_mp4",
+  "version": "0.1.0"
+}

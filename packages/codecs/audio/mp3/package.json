@@ -1,0 +1,12 @@
+{
+  "id": "mp3",
+  "display_name": "MP3",
+  "fourcc": "MP3",
+  "codec_type": "audio",
+  "plugin": "decoder_mp3",
+  "version": "0.0.0",
+  "source_url": "https://www.mpg123.de",
+  "decoder_library": "libavcodec mp3float decoder",
+  "license": "LGPL-2.1",
+  "notes": "Not yet built."
+}

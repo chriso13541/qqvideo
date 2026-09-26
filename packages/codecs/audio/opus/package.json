@@ -1,0 +1,12 @@
+{
+  "id": "opus",
+  "display_name": "Opus",
+  "fourcc": "OPUS",
+  "codec_type": "audio",
+  "plugin": "decoder_opus",
+  "version": "0.0.0",
+  "source_url": "https://opus-codec.org",
+  "decoder_library": "libavcodec + libopus",
+  "license": "BSD-3-Clause",
+  "notes": "Not yet built."
+}

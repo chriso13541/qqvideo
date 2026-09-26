@@ -1,0 +1,7 @@
+{
+  "name": "h264-decoder",
+  "kind": "decoder",
+  "version": "0.1.0",
+  "library": "decoder_h264",
+  "claims": { "fourccs": ["H264", "AVC1"] }
+}

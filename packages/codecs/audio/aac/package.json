@@ -1,0 +1,12 @@
+{
+  "id": "aac",
+  "display_name": "AAC",
+  "fourcc": "AAC",
+  "codec_type": "audio",
+  "plugin": "decoder_aac",
+  "version": "0.2.0",
+  "source_url": "https://github.com/FFmpeg/FFmpeg",
+  "decoder_library": "libavcodec + libswresample",
+  "license": "LGPL-2.1",
+  "notes": "Wraps libavcodec AAC decoder with libswresample for format conversion."
+}

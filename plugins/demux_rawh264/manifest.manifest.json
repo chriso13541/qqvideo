@@ -1,0 +1,7 @@
+{
+  "name": "rawh264-demuxer",
+  "kind": "demuxer",
+  "version": "0.1.0",
+  "library": "demux_rawh264",
+  "claims": { "extensions": [".h264", ".264"] }
+}

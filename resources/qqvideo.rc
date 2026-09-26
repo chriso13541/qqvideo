@@ -1,0 +1,4 @@
+// qqvideo Windows resource file
+// This makes qqvideo.ico appear as the app icon in Explorer and the taskbar.
+#include <windows.h>
+IDI_ICON1 ICON "qqvideo.ico"

@@ -1,0 +1,7 @@
+{
+  "name": "aac-decoder",
+  "kind": "decoder",
+  "version": "0.1.0",
+  "library": "decoder_aac",
+  "claims": { "fourccs": ["AAC", "MP4A"] }
+}

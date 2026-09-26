@@ -1,0 +1,7 @@
+{
+  "name": "synthetic-demuxer",
+  "kind": "demuxer",
+  "version": "0.1.0",
+  "library": "demux_synthetic",
+  "claims": { "extensions": [".synt"] }
+}

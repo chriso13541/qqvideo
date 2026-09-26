@@ -1,0 +1,12 @@
+{
+  "id": "h265",
+  "display_name": "H.265 / HEVC",
+  "fourcc": "HEVC",
+  "codec_type": "video",
+  "plugin": "decoder_h265",
+  "version": "0.0.0",
+  "source_url": "https://bitbucket.org/multicoreware/x265_git",
+  "decoder_library": "libavcodec + libx265",
+  "license": "GPL-2.0",
+  "notes": "Not yet built."
+}

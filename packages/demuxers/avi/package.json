@@ -1,0 +1,7 @@
+{
+  "id": "avi",
+  "display_name": "AVI",
+  "extensions": ".avi",
+  "plugin": "demux_avi",
+  "version": "0.0.0"
+}

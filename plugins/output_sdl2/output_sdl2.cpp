@@ -429,9 +429,15 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
 
         /* ---- Tab 1: Packages ----------------------------------------- */
         if (ImGui::BeginTabItem("Packages")) {
+#ifdef LUMEN_SYSTEM_FFMPEG
+            ImGui::TextDisabled(
+                "Codecs come from your system FFmpeg. To get a missing one,\n"
+                "install or upgrade FFmpeg (e.g. a /usr/local source build) and rebuild qqvideo.");
+#else
             ImGui::TextDisabled(
                 "Packages are .dll files you build and drop in. "
                 "See packages/BUILD.md for instructions.");
+#endif
             ImGui::Separator();
 
             float tbl_h = (float)win_h - 155.0f;
@@ -470,14 +476,29 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
                         ImGui::TextDisabled("%s",
                             ti==0 ? "Demuxer" : ti==1 ? "Video" : "Audio");
 
+                        /* Empty dir_path = provided by the system FFmpeg
+                         * (see push_pkg_entries_system in main.c): there is
+                         * no package folder to install into. */
+                        const bool from_system = (e.dir_path[0] == '\0');
+
                         ImGui::TableSetColumnIndex(2);
-                        if (e.installed)
+                        if (from_system && e.installed)
+                            ImGui::TextColored(col_inst, "+ Available (system)");
+                        else if (from_system)
+                            ImGui::TextColored(col_miss, "- Not in system FFmpeg");
+                        else if (e.installed)
                             ImGui::TextColored(col_inst, "+ Installed  v%s", e.version);
                         else
                             ImGui::TextColored(col_miss, "- Not installed");
 
                         ImGui::TableSetColumnIndex(3);
-                        if (!e.installed) {
+                        if (from_system) {
+                            ImGui::TextDisabled(e.installed ? "(system)" : "--");
+                            if (!e.installed && ImGui::IsItemHovered())
+                                ImGui::SetTooltip(
+                                    "Your FFmpeg was built without this decoder.\n"
+                                    "Install an FFmpeg that has it, then rebuild qqvideo.");
+                        } else if (!e.installed) {
                             char btn[48];
                             snprintf(btn, sizeof(btn), "Install...##ins%d", i);
                             if (ImGui::SmallButton(btn))
@@ -494,7 +515,9 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
                 }
                 ImGui::EndTable();
             }
+#ifndef LUMEN_SYSTEM_FFMPEG
             ImGui::TextDisabled("+ Installed   - Not installed   |   Click Install... to add a package.");
+#endif
             ImGui::EndTabItem();
         }
 

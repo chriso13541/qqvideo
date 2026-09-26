@@ -14,9 +14,12 @@
 #   AV_LIBS      - libraries to link (full paths for local builds, names for system)
 #   FFMPEG_SOURCE - "local" or "system"
 
+# NOTE: set(... CACHE ...) takes exactly ONE docstring argument. This used
+# to pass two, which makes CMake silently treat the whole call as a normal
+# list variable (";CACHE;PATH;...") -- non-empty, so auto-detection never
+# ran and a -DFFMPEG_DIR= on the command line was shadowed.
 set(FFMPEG_DIR "" CACHE PATH
-    "Path to a built FFmpeg install prefix (e.g. /c/dev/lumen/packages/ffmpeg/install).\n"
-    "Leave empty to auto-detect packages/ffmpeg/install/ or fall back to system pkg-config.")
+    "Built FFmpeg install prefix (e.g. /c/dev/lumen/packages/ffmpeg/install). Empty = auto-detect packages/ffmpeg/install/, then system pkg-config.")
 
 if (NOT FFMPEG_DIR)
     # Walk up from this package's CMakeLists directory, checking each level for

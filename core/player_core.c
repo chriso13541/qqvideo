@@ -17,6 +17,44 @@ static const char *file_ext(const char *path) {
     return dot ? dot : "";
 }
 
+/* "lib/x/libdecoder_h264.so" -> "decoder_h264" (what the Package Manager
+ * UI stores in its rules, since that's what package dirs are keyed by). */
+static void plugin_basename(const char *library_path, char *out, size_t n) {
+    const char *b = strrchr(library_path, '/');
+    const char *b2 = strrchr(library_path, '\\');
+    if (b2 > b) b = b2;
+    b = b ? b + 1 : library_path;
+    if (strncmp(b, "lib", 3) == 0) b += 3;
+    strncpy(out, b, n - 1);
+    out[n - 1] = '\0';
+    char *dot = strrchr(out, '.');
+    if (dot) *dot = '\0';
+}
+
+/* Playback Rules check. Rules were written by the UI using plugin file
+ * base names ("demux_mp4"/"decoder_h264"), but this used to compare them
+ * against MANIFEST names ("mp4-demuxer"/"h264-decoder") -- they never
+ * matched, so disabling a codec for a container silently did nothing.
+ * Accept either spelling, and for the codec side also a bare fourcc,
+ * which is what system-FFmpeg mode stores (one decoder plugin serves
+ * every codec there, so rules have to be per-codec, not per-plugin). */
+static int rule_blocks(const lumen_playback_state_t *state,
+                       const lumen_registry_entry_t *demux_entry,
+                       const lumen_registry_entry_t *dec_entry,
+                       const char *fourcc) {
+    char dbase[64], cbase[64];
+    plugin_basename(demux_entry->library_path, dbase, sizeof(dbase));
+    plugin_basename(dec_entry->library_path, cbase, sizeof(cbase));
+    for (int j = 0; j < state->disabled_pair_count; j++) {
+        const lumen_disabled_pair_t *r = &state->disabled_pairs[j];
+        int dm = strcmp(r->demuxer_name, demux_entry->name) == 0 || strcmp(r->demuxer_name, dbase) == 0;
+        int cm = strcmp(r->codec_name, dec_entry->name) == 0 || strcmp(r->codec_name, cbase) == 0 ||
+                 strcmp(r->codec_name, fourcc) == 0;
+        if (dm && cm) return 1;
+    }
+    return 0;
+}
+
 /* Per-stream runtime state: one decoder instance per stream, exactly as
  * many as the demuxer reported, NOT one decoder shared across streams. */
 typedef struct {
@@ -205,7 +243,24 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     const lumen_demuxer_vtable_t *dmx = demux_plugin.desc->vtable.demuxer;
     lumen_demuxer_ctx_t *dctx = NULL;
     lumen_stream_table_t table;
-    if (dmx->open(&dctx, path, &table) != 0) {
+
+    /* Allow-list for this file: every fourcc an installed decoder claims,
+     * minus Playback Rules for this container. libav-backed demuxers turn
+     * it into libavformat's codec_whitelist (see open_ex in lumen_plugin.h). */
+    const char *allowed[128];
+    int allowed_count = 0;
+    for (int i = 0; i < reg->count; i++) {
+        const lumen_registry_entry_t *e = &reg->entries[i];
+        if (e->kind != LUMEN_PLUGIN_DECODER) continue;
+        for (int j = 0; j < e->fourcc_count && allowed_count < 128; j++) {
+            if (!rule_blocks(state, demux_entry, e, e->fourccs[j]))
+                allowed[allowed_count++] = e->fourccs[j];
+        }
+    }
+
+    int open_rc = dmx->open_ex ? dmx->open_ex(&dctx, path, &table, allowed, allowed_count)
+                               : dmx->open(&dctx, path, &table);
+    if (open_rc != 0) {
         fprintf(stderr, "lumen: demuxer failed to open '%s'\n", path);
         lumen_unload_plugin(&demux_plugin);
         return 1;
@@ -234,30 +289,31 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
              * audio-only fallback is silent but a missing video codec leaves
              * the user staring at a black screen with no explanation. */
             if (sd->type == LUMEN_STREAM_VIDEO) {
+#ifdef LUMEN_SYSTEM_FFMPEG
+                snprintf(state->error_msg, sizeof(state->error_msg),
+                    "No decoder available for video codec '%s'.\n"
+                    "Your system FFmpeg doesn't include it, or qqvideo\n"
+                    "doesn't support it yet (see Tools > Package Manager).",
+                    sd->codec_fourcc);
+#else
                 snprintf(state->error_msg, sizeof(state->error_msg),
                     "No decoder installed for video codec '%s'.\n"
                     "Install a %s decoder plugin to play this file.",
                     sd->codec_fourcc, sd->codec_fourcc);
+#endif
             }
             continue;
         }
 
         /* Check the Package Manager's per-container block list. */
         {
-            int blocked = 0;
-            for (int j = 0; j < state->disabled_pair_count && !blocked; j++) {
-                if (strcmp(state->disabled_pairs[j].demuxer_name, demux_entry->name) == 0 &&
-                    strcmp(state->disabled_pairs[j].codec_name, dec_entry->name) == 0) {
-                    blocked = 1;
-                }
-            }
-            if (blocked) {
-                fprintf(stderr, "lumen: decoder '%s' is disabled for '%s' -- blocked by Package Manager\n",
-                        dec_entry->name, demux_entry->name);
+            if (rule_blocks(state, demux_entry, dec_entry, sd->codec_fourcc)) {
+                fprintf(stderr, "lumen: codec '%s' (decoder '%s') is disabled for '%s' -- blocked by Playback Rules\n",
+                        sd->codec_fourcc, dec_entry->name, demux_entry->name);
                 snprintf(state->error_msg, sizeof(state->error_msg),
                     "Codec '%s' is disabled for this container (%s).\n"
                     "Re-enable it in Tools > Package Manager if needed.",
-                    dec_entry->name, demux_entry->name);
+                    sd->codec_fourcc, demux_entry->name);
                 continue;
             }
         }

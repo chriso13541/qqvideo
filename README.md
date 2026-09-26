@@ -12,6 +12,60 @@ simply cannot be triggered on a system where that decoder plugin was never
 installed -- because the code is never mapped into the process at all,
 not merely "disabled."
 
+## Linux: system FFmpeg (default on Linux)
+
+On Linux, qqvideo uses whatever FFmpeg your system already has instead
+of per-codec packages you compile yourself. Two plugins do everything:
+`demux_libav` (MP4/MOV, MKV/WebM, AVI, TS, Ogg, FLAC, MP3) and
+`decoder_libav` (every codec in `plugins/common/libav_common.h`), both
+built with the app into `build/bin/plugins/`.
+
+```
+sudo apt install build-essential cmake pkg-config libsdl2-dev \
+     libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev
+mkdir build && cd build && cmake .. && make -j$(nproc)
+./bin/qqvideo --list        # which codecs your FFmpeg actually provides
+```
+
+Minimum is FFmpeg 5.1 (Debian 12). Nothing else to configure: at startup
+qqvideo asks the loaded libavcodec which allowlisted decoders it has, and
+logs exactly which FFmpeg it's running
+(`libav-decoder 0.3.0 (FFmpeg 6.1.1-3ubuntu5, libavcodec 60.31.102)`).
+Codecs your FFmpeg lacks -- e.g. H.264/HEVC on Fedora's `ffmpeg-free` --
+show as unavailable in `--list` and Tools > Package Manager.
+
+**Newer FFmpeg than your distro ships:** build it into `/usr/local`, not
+`/usr` (that would overwrite dpkg-owned files):
+
+```
+git clone https://github.com/FFmpeg/FFmpeg.git && cd FFmpeg && git checkout n7.1
+./configure --prefix=/usr/local --enable-shared --disable-static   # needs nasm
+make -j$(nproc) && sudo make install && sudo ldconfig
+```
+
+then re-run cmake and rebuild qqvideo. pkg-config searches `/usr/local`
+before `/usr` on Debian/Ubuntu, so the build picks it up automatically,
+and the runtime linker finds it via `/etc/ld.so.conf.d/libc.conf`. Both
+FFmpegs coexist (different sonames, e.g. `libavcodec.so.59` vs `.61`); a
+qqvideo binary stays on the one it was built against until rebuilt.
+`sudo make uninstall` in the FFmpeg tree reverts to the distro version.
+
+**What changes about the security model.** A distro `libavcodec.so`
+contains every decoder the distro enabled, so "not installed = not
+mapped into the process" no longer holds. What holds instead is "not
+allowed = not reachable": `decoder_libav` only opens allowlisted codecs,
+and `demux_libav` passes the per-file allow-list (installed decoders
+minus Playback Rules) to libavformat as `codec_whitelist` +
+`format_whitelist`. That matters because `avformat_find_stream_info()`
+opens decoders on its own while probing -- verified: without the
+whitelist, an MKV with a MagicYUV track runs the MagicYUV decoder during
+probing; with it, libavcodec refuses (`Codec (magicyuv) not on
+whitelist`) and the stream is skipped. The upside of the trade: CVE fixes
+arrive with normal distro updates.
+
+Windows keeps the `packages/` flow (`-DLUMEN_SYSTEM_FFMPEG=OFF`, the
+default there); see `packages/BUILD.md`.
+
 ## What's here
 
 ```

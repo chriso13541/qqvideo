@@ -26,6 +26,7 @@
 #include "registry.h"
 #include "packages.h"
 #include "player_core.h"
+#include "plugin_loader.h"
 #include "../third_party/tinyfiledialogs/tinyfiledialogs.h"
 #include <stdio.h>
 #include <string.h>
@@ -216,6 +217,111 @@ static void push_pkg_entries(lumen_session_t *session,
     }
 }
 
+#ifdef LUMEN_SYSTEM_FFMPEG
+/* ---- System-FFmpeg mode (Linux) -------------------------------------
+ *
+ * Codecs come from whatever FFmpeg the system has -- apt/dnf/pacman's,
+ * or a source build in /usr/local, which pkg-config and the dynamic
+ * linker both prefer automatically on Debian/Ubuntu. Nothing to install
+ * per codec; the plugins/ dir next to the executable holds just
+ * demux_libav + decoder_libav, both linked against that FFmpeg.
+ *
+ * "Installed" for a codec therefore means: on qqvideo's allowlist
+ * (plugins/common/libav_common.h) AND present in the system libavcodec.
+ * The second half is only knowable at runtime, so we ask. */
+
+typedef struct { char fourcc[8]; int kind; int available; } sys_codec_t;
+static sys_codec_t sys_codecs[64];
+static int         sys_codec_count = 0;
+
+/* Loads each decoder plugin once, asks its probe() about every fourcc it
+ * claims, records the answers for the UI/--list, and removes unavailable
+ * fourccs from the registry so a missing system codec is reported as
+ * "no decoder" up front rather than failing inside the decoder later. */
+static void probe_system_codecs(lumen_registry_t *reg) {
+    for (int i = 0; i < reg->count; i++) {
+        lumen_registry_entry_t *e = &reg->entries[i];
+        if (e->kind != LUMEN_PLUGIN_DECODER) continue;
+
+        lumen_loaded_plugin_t p;
+        const char *err = NULL;
+        if (lumen_load_plugin(e->library_path, &p, &err) != 0) {
+            fprintf(stderr, "lumen: cannot load '%s': %s\n", e->library_path, err);
+            e->fourcc_count = 0;
+            continue;
+        }
+        /* The version string names the FFmpeg actually loaded, e.g.
+         * "0.3.0 (FFmpeg 7.1, libavcodec 61.19.100)". */
+        printf("lumen: %s %s\n", p.desc->name, p.desc->version);
+
+        int keep = 0;
+        for (int j = 0; j < e->fourcc_count; j++) {
+            int kind = p.desc->vtable.decoder->probe(e->fourccs[j]);
+            if (sys_codec_count < 64) {
+                sys_codec_t *c = &sys_codecs[sys_codec_count++];
+                strncpy(c->fourcc, e->fourccs[j], sizeof(c->fourcc) - 1);
+                c->kind = kind;
+                c->available = kind != 0;
+            }
+            if (kind) {
+                if (keep != j) memcpy(e->fourccs[keep], e->fourccs[j], sizeof(e->fourccs[0]));
+                keep++;
+            }
+        }
+        e->fourcc_count = keep;
+        lumen_unload_plugin(&p);
+    }
+}
+
+static void print_system_codecs(void) {
+    printf("\nCodecs (from system FFmpeg):\n");
+    for (int i = 0; i < sys_codec_count; i++) {
+        const sys_codec_t *c = &sys_codecs[i];
+        printf("  [%s] %-5s %s\n", c->available ? "OK  " : "----", c->fourcc,
+               c->available ? (c->kind == LUMEN_PROBE_AUDIO ? "audio" : "video")
+                            : "not in system FFmpeg");
+    }
+}
+
+/* Package Manager UI in system mode: demuxers from the registry, codecs
+ * from the probe. Empty dir_path marks an entry as system-provided, which
+ * output_sdl2.cpp uses to hide the Install... button. `plugin` holds the
+ * fourcc for codecs so Playback Rules are per-codec (see rule_blocks()). */
+static void push_pkg_entries_system(lumen_session_t *session, const lumen_registry_t *reg) {
+    lumen_playback_state_t *st = lumen_session_state(session);
+    st->pkg_entry_count = 0;
+    for (int i = 0; i < reg->count && st->pkg_entry_count < LUMEN_PKG_UI_MAX; i++) {
+        const lumen_registry_entry_t *r = &reg->entries[i];
+        if (r->kind != LUMEN_PLUGIN_DEMUXER) continue;
+        lumen_pkg_ui_entry_t *e = &st->pkg_entries[st->pkg_entry_count++];
+        memset(e, 0, sizeof(*e));
+        strncpy(e->name, "FFmpeg containers", sizeof(e->name) - 1);
+        for (int j = 0; j < r->extension_count; j++) {
+            if (j) strncat(e->detail, " ", sizeof(e->detail) - strlen(e->detail) - 1);
+            strncat(e->detail, r->extensions[j], sizeof(e->detail) - strlen(e->detail) - 1);
+        }
+        strncpy(e->version, r->version, sizeof(e->version) - 1);
+        strncpy(e->plugin, r->name, sizeof(e->plugin) - 1);
+        e->type = LUMEN_PKG_UI_DEMUXER;
+        e->installed = 1;
+    }
+    for (int i = 0; i < sys_codec_count && st->pkg_entry_count < LUMEN_PKG_UI_MAX; i++) {
+        const sys_codec_t *c = &sys_codecs[i];
+        lumen_pkg_ui_entry_t *e = &st->pkg_entries[st->pkg_entry_count++];
+        memset(e, 0, sizeof(*e));
+        strncpy(e->name, c->fourcc, sizeof(e->name) - 1);
+        strncpy(e->detail, c->available ? "provided by system FFmpeg" : "missing from system FFmpeg",
+                sizeof(e->detail) - 1);
+        strncpy(e->version, "system", sizeof(e->version) - 1);
+        strncpy(e->plugin, c->fourcc, sizeof(e->plugin) - 1);
+        /* Unavailable codecs have kind 0; the manifest order puts video
+         * first, but don't guess -- file unknowns under video. */
+        e->type = (c->kind == LUMEN_PROBE_AUDIO) ? LUMEN_PKG_UI_AUDIO : LUMEN_PKG_UI_VIDEO;
+        e->installed = c->available;
+    }
+}
+#endif /* LUMEN_SYSTEM_FFMPEG */
+
 int main(int argc, char **argv) {
     char exe_dir[1024];
     char auto_packages_dir[1100];
@@ -235,11 +341,21 @@ int main(int argc, char **argv) {
 
     lumen_registry_t reg;
     memset(&reg, 0, sizeof(reg));
+    lumen_packages_t pkgs;
+    memset(&pkgs, 0, sizeof(pkgs));
 
+#ifdef LUMEN_SYSTEM_FFMPEG
+    char plugins_dir[1100];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/plugins", exe_dir);
+    if (lumen_registry_scan(plugins_dir, &reg) < 0) {
+        fprintf(stderr, "lumen: plugins directory not found: %s\n", plugins_dir);
+    }
+    probe_system_codecs(&reg);
+    printf("lumen: %d plugin(s) from '%s'\n\n", reg.count, plugins_dir);
+#else
     /* Scan the packages/ directory -- this is the single source of truth for
      * both the Package Manager UI and the registry used by the player.
      * No separate plugins/ directory is needed or used. */
-    lumen_packages_t pkgs;
     int npkg = lumen_packages_scan(auto_packages_dir, &pkgs);
     if (npkg < 0) {
         fprintf(stderr, "lumen: packages directory not found: %s\n", auto_packages_dir);
@@ -270,10 +386,15 @@ int main(int argc, char **argv) {
     }
     printf("lumen: loaded %d codec/demuxer package(s) from '%s'\n\n",
            reg_count, auto_packages_dir);
+#endif
 
     if (list_only) {
         lumen_registry_print(&reg);
+#ifdef LUMEN_SYSTEM_FFMPEG
+        print_system_codecs();
+#else
         lumen_packages_print(&pkgs);
+#endif
         lumen_registry_free(&reg);
         return 0;
     }
@@ -318,7 +439,11 @@ int main(int argc, char **argv) {
         strncpy(st->packages_dir, pkgs.packages_dir, sizeof(st->packages_dir) - 1);
     }
 
+#ifdef LUMEN_SYSTEM_FFMPEG
+    push_pkg_entries_system(session, &reg);
+#else
     push_pkg_entries(session, &pkgs);
+#endif
 
     /* If a file was given on the command line, pre-load the queue with
      * it so the first idle loop iteration immediately starts playing. */
@@ -339,6 +464,9 @@ int main(int argc, char **argv) {
         /* Package Manager requested a rescan (user clicked Install...) */
         {
             lumen_playback_state_t *st = lumen_session_state(session);
+#ifdef LUMEN_SYSTEM_FFMPEG
+            st->rescan_packages_requested = 0; /* nothing to rescan: codecs come from the system */
+#endif
             if (st->rescan_packages_requested) {
                 st->rescan_packages_requested = 0;
                 lumen_packages_rescan(&pkgs);

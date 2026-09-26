@@ -31,6 +31,21 @@ macro(deploy_package target pkg_subdir manifest_src_dir)
         COMMENT "Deploying ${target} to packages/${pkg_subdir}/")
 endmacro()
 
+# ---- FFmpeg source -------------------------------------------------------
+# ON (default on Linux): link the system FFmpeg found by pkg-config and
+#   build decoder_libav + demux_libav right here, into bin/plugins/.
+#   "System FFmpeg" = apt/dnf/pacman's, or a source build installed to
+#   /usr/local -- pkg-config searches /usr/local first on Debian/Ubuntu,
+#   so the newer one wins automatically. To force a specific install:
+#     PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig cmake ..
+# OFF (default on Windows): the per-codec packages/ flow (packages/BUILD.md).
+if (WIN32)
+  set(_lumen_sys_default OFF)
+else()
+  set(_lumen_sys_default ON)
+endif()
+option(LUMEN_SYSTEM_FFMPEG "Use the system FFmpeg via pkg-config" ${_lumen_sys_default})
+
 # ---- Detect optional build dependencies ---------------------------------
 find_package(PkgConfig QUIET)
 if (PkgConfig_FOUND)
@@ -101,11 +116,47 @@ if (WIN32)
   target_link_libraries(qqvideo comdlg32 ole32)
 endif()
 
+# ---- System-FFmpeg plugins ------------------------------------------------
+if (LUMEN_SYSTEM_FFMPEG)
+  find_package(PkgConfig REQUIRED)
+  # Floor = FFmpeg 5.1 (Debian 12). See plugins/common/libav_common.h for why.
+  pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+      libavcodec>=59.37.100
+      libavformat>=59.27.100
+      libavutil>=57.28.100
+      libswresample>=4.7.100
+      libswscale>=6.7.100)
+
+  target_compile_definitions(qqvideo PRIVATE LUMEN_SYSTEM_FFMPEG)
+
+  set(_lumen_plugin_dir "${CMAKE_BINARY_DIR}/bin/plugins")
+  foreach(_p decoder_libav demux_libav)
+    add_library(${_p} MODULE plugins/${_p}/${_p}.c)
+    target_include_directories(${_p} PRIVATE include)
+    target_link_libraries(${_p} PRIVATE PkgConfig::LIBAV)
+    set_target_properties(${_p} PROPERTIES
+        PREFIX "lib"
+        LIBRARY_OUTPUT_DIRECTORY "${_lumen_plugin_dir}")
+    add_custom_command(TARGET ${_p} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/plugins/${_p}/manifest.manifest.json"
+            "${_lumen_plugin_dir}/${_p}.manifest.json")
+    add_dependencies(qqvideo ${_p})
+  endforeach()
+
+  message(STATUS "")
+  message(STATUS "  FFmpeg: system (pkg-config)")
+  message(STATUS "    libavcodec  ${LIBAV_libavcodec_VERSION}  (${LIBAV_libavcodec_PREFIX})")
+  message(STATUS "    libavformat ${LIBAV_libavformat_VERSION}")
+  message(STATUS "")
+endif()
+
 # ---- Codec/demuxer packages ---------------------------------------------
 # These are the ONLY plugin targets. Each one builds directly into its
 # packages/ subdirectory -- no plugins/ directory is involved.
 # The registry is populated at runtime by scanning packages/.
 
+if (NOT LUMEN_SYSTEM_FFMPEG)
 if (LIBAVCODEC_FOUND AND LIBAVUTIL_FOUND)
   message(STATUS "libavcodec found (available for building packages separately)")
 else()
@@ -134,3 +185,4 @@ foreach(src_file ${PKG_COPY_FILES})
     file(RELATIVE_PATH rel "${CMAKE_SOURCE_DIR}/packages" "${src_file}")
     configure_file("${src_file}" "${CMAKE_BINARY_DIR}/bin/packages/${rel}" COPYONLY)
 endforeach()
+endif() # NOT LUMEN_SYSTEM_FFMPEG

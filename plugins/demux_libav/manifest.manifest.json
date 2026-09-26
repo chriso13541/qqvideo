@@ -1,0 +1,9 @@
+{
+  "name": "libav-demuxer",
+  "kind": "demuxer",
+  "version": "0.3.0",
+  "library": "demux_libav",
+  "claims": { "extensions": [".mp4", ".m4v", ".mov", ".m4a", ".3gp",
+                             ".mkv", ".mka", ".webm", ".avi", ".ts", ".m2ts",
+                             ".ogg", ".ogv", ".opus", ".flac", ".mp3", ".aac"] }
+}

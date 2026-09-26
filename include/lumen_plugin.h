@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 14
+#define LUMEN_ABI_VERSION 15
 
 #define LUMEN_MAX_STREAMS 8
 #define LUMEN_PENDING_QUEUE_MAX 16
@@ -88,6 +88,14 @@ typedef struct {
      * leave it 0 -- player_core.c zero-initializes every packet before
      * read_packet() fills it in, so this is never garbage. */
     int       skip_samples_start;
+    /* v15. The other half of the same side data: samples to discard from
+     * the END of this packet's decoded output -- the encoder's trailing
+     * padding on the final packet. Matroska/WebM and Ogg Opus files carry
+     * this (DiscardPadding); without honoring it an Opus track plays up to
+     * a frame of padding past its real end (confirmed: 648 extra samples
+     * on a 2.0s test file versus ffmpeg's reference decode). Same
+     * zero-default convention as skip_samples_start. */
+    int       skip_samples_end;
 } lumen_packet_t;
 
 /* One entry per elementary stream a demuxer found in the file. A typical
@@ -358,6 +366,23 @@ typedef struct {
     int (*seek)(lumen_demuxer_ctx_t *ctx, int64_t target_ms);
 
     void (*close)(lumen_demuxer_ctx_t *ctx);
+
+    /* v15, optional (NULL is valid; the core falls back to open()).
+     * Same as open(), but the core also passes the codec fourccs that are
+     * actually allowed for this file: every fourcc an installed decoder
+     * claims, minus anything the user disabled for this container.
+     *
+     * Why this exists: libavformat's avformat_find_stream_info() opens
+     * DECODERS internally to probe stream parameters. With a system-wide
+     * libavcodec (every decoder the distro enabled lives in one .so), that
+     * means a file could get fed to a decoder no Lumen plugin claims --
+     * e.g. an MKV with a MagicYUV track reaching the MagicYUV decoder
+     * during probing, without the registry ever being consulted.
+     * libav-backed demuxers must turn this list into libavformat's
+     * codec_whitelist so only allowed decoders can ever be opened. */
+    int (*open_ex)(lumen_demuxer_ctx_t **out_ctx, const char *path,
+                   lumen_stream_table_t *out_table,
+                   const char *const *allowed_fourccs, int allowed_count);
 } lumen_demuxer_vtable_t;
 
 /* ---------------------------------------------------------------------- */
@@ -369,7 +394,14 @@ typedef struct {
 
 typedef struct lumen_decoder_ctx lumen_decoder_ctx_t; /* opaque, plugin-owned */
 
+#define LUMEN_PROBE_VIDEO 1
+#define LUMEN_PROBE_AUDIO 2
+
 typedef struct {
+    /* Returns 0 if this decoder cannot handle the fourcc. Nonzero means
+     * it can; decoders MAY return LUMEN_PROBE_VIDEO / LUMEN_PROBE_AUDIO
+     * to also say which kind (decoder_libav does, so the core can list
+     * what the system FFmpeg actually provides without linking libav). */
     int (*probe)(const char *codec_fourcc);
 
     /* `stream` describes the specific stream this decoder instance will

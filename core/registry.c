@@ -80,10 +80,10 @@ static int parse_manifest_into(const char *manifest_path, const char *plugin_dir
     if (claims) {
         ext_collect_ctx_t ctx;
         if (e->kind == LUMEN_PLUGIN_DEMUXER) {
-            ctx.entry = e; ctx.count = &e->extension_count; ctx.cap = 8;
+            ctx.entry = e; ctx.count = &e->extension_count; ctx.cap = 24;
             mj_foreach_string(mj_get(claims, "extensions"), collect_ext, &ctx);
         } else if (e->kind == LUMEN_PLUGIN_DECODER) {
-            ctx.entry = e; ctx.count = &e->fourcc_count; ctx.cap = 8;
+            ctx.entry = e; ctx.count = &e->fourcc_count; ctx.cap = 32;
             mj_foreach_string(mj_get(claims, "fourccs"), collect_fourcc, &ctx);
         }
     }

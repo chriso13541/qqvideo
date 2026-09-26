@@ -26,9 +26,9 @@ typedef struct {
     char manifest_path[512];
 
     /* claims -- only the relevant ones are populated depending on kind */
-    char extensions[8][16];     /* demuxer: ".mp4", ".mkv", ... */
+    char extensions[24][16];    /* demuxer: ".mp4", ".mkv", ... */
     int  extension_count;
-    char fourccs[8][8];         /* decoder: "H264", "VP09", ... */
+    char fourccs[32][8];        /* decoder: "H264", "VP09", ... */
     int  fourcc_count;
 } lumen_registry_entry_t;
 

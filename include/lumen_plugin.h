@@ -372,7 +372,8 @@ typedef struct {
     struct {
         char label[96];   /* "English (SDH) [SRT]", "movie.en.srt" */
         int  available;   /* 0 = listed but can't be shown (image-based) */
-        int  external;    /* 1 = added via "Add Subtitle Track..." */
+        int  external;    /* 1 = separate file (found next to the movie, or added) */
+        char file[128];   /* external: the file's name, shown as a tooltip */
     } subtitle_tracks[LUMEN_MAX_SUB_TRACKS];
     int  subtitle_track_count;
     int  subtitle_selected;          /* index into subtitle_tracks, -1 = None. UI writes. */

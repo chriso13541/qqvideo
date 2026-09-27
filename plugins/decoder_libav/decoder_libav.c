@@ -41,8 +41,9 @@ struct lumen_decoder_ctx {
     AVFrame        *avframe;
     int             kind;                 /* LUMEN_PROBE_VIDEO / _AUDIO */
     int             flush_sent;
-    int             output_frame_counter;
-    double          frame_duration_ms;    /* video pacing */
+    int             output_frame_counter; /* audio fallback when no timestamps */
+    double          frame_duration_ms;    /* video: fallback spacing for frames with no pts */
+    int64_t         last_pts_ms;          /* last emitted pts, for the no-pts fallback */
 
     struct SwsContext *sws;               /* video: lazily created, only if needed */
     SwrContext        *swr;               /* audio: lazily created on first frame */
@@ -82,9 +83,13 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
          * end_display_time (from packet duration) on that same clock. */
         ctx->avctx->pkt_timebase = (AVRational){1, 1000};
     } else if (c->kind == LUMEN_PROBE_VIDEO) {
+        ctx->avctx->pkt_timebase = (AVRational){1, 1000};  /* see libav_decode() */
+        ctx->last_pts_ms = -1;
         double fps = (stream->frame_rate > 0.0) ? stream->frame_rate : 30.0;
         ctx->frame_duration_ms = 1000.0 / fps;
     } else {
+        ctx->avctx->pkt_timebase = (AVRational){1, 1000};
+        ctx->last_pts_ms = -1;
         ctx->channels = stream->channels; /* 0 = unknown until first frame (raw ADTS) */
         ctx->avctx->sample_rate = stream->sample_rate;
         if (stream->channels > 0)
@@ -184,6 +189,10 @@ static int emit_audio(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_
 
 /* Returns 0 = frame emitted, 1 = nothing to emit, <0 = error */
 static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, int skip_end) {
+    /* Real presentation time in ms (packets go in with ms pts and
+     * pkt_timebase = 1/1000, so best_effort_timestamp comes out in ms). */
+    int64_t ts = ctx->avframe->best_effort_timestamp;
+    int sr = ctx->avframe->sample_rate;
     int rc = (ctx->kind == LUMEN_PROBE_VIDEO) ? emit_video(ctx, ctx->avframe, out)
                                               : emit_audio(ctx, ctx->avframe, out);
     av_frame_unref(ctx->avframe);
@@ -193,8 +202,18 @@ static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, 
     }
 
     if (ctx->kind == LUMEN_PROBE_VIDEO) {
-        out->pts = (int64_t)(ctx->output_frame_counter * ctx->frame_duration_ms + 0.5);
-        ctx->output_frame_counter++;
+        /* Use the container's timestamp. The old frame counter assumed
+         * decoding resumed exactly at the seek target, but seeks land on
+         * the keyframe BEFORE it -- frames from 10s got labeled 15s, and
+         * the seek bar + subtitles stayed that far off until the next
+         * seek. Counting also drifted on variable-frame-rate video.
+         * The counter survives only as a fallback for streams with no
+         * timestamps at all (raw .h264). */
+        if (ts != AV_NOPTS_VALUE)
+            out->pts = ts;
+        else
+            out->pts = ctx->last_pts_ms < 0 ? 0 : ctx->last_pts_ms + (int64_t)(ctx->frame_duration_ms + 0.5);
+        ctx->last_pts_ms = out->pts;
         return 0;
     }
 
@@ -219,7 +238,12 @@ static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, 
         out->audio.nb_samples -= skip_end;
         out->audio.size = (size_t)out->audio.nb_samples * ctx->channels * sizeof(int16_t);
     }
-    out->pts = ctx->output_frame_counter++;
+    if (ts != AV_NOPTS_VALUE) {
+        out->pts = ts + (sr > 0 ? (int64_t)skip_samples * 1000 / sr : 0);
+    } else {
+        out->pts = ctx->output_frame_counter;   /* no timestamps: frame index, as before */
+    }
+    ctx->output_frame_counter++;
     return 0;
 }
 
@@ -321,11 +345,10 @@ static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lum
 
     ctx->avpkt->data = pkt->data;
     ctx->avpkt->size = (int)pkt->size;
-    /* Audio pts is our own emit counter, and we don't know the stream
-     * time_base here -- passing a raw pts makes libavcodec warn "Could
-     * not update timestamps for skipped samples" whenever a decoder trims
-     * its own pre-skip (Opus does). */
-    ctx->avpkt->pts = (ctx->kind == LUMEN_PROBE_VIDEO) ? pkt->pts : AV_NOPTS_VALUE;
+    /* Millisecond timestamps from the demuxer (v16 pts_ms), with
+     * pkt_timebase = 1/1000 set at open, so frames come out in ms. */
+    ctx->avpkt->pts = pkt->pts_ms >= 0 ? pkt->pts_ms : AV_NOPTS_VALUE;
+    ctx->avpkt->dts = AV_NOPTS_VALUE;
     ctx->avpkt->flags = pkt->keyframe ? AV_PKT_FLAG_KEY : 0;
 
     int send_rc = avcodec_send_packet(ctx->avctx, ctx->avpkt);
@@ -366,10 +389,9 @@ static void libav_frame_free(lumen_frame_t *frame) {
 static void libav_flush(lumen_decoder_ctx_t *ctx, int64_t resume_at_ms) {
     avcodec_flush_buffers(ctx->avctx);
     ctx->flush_sent = 0;
-    if (ctx->kind == LUMEN_PROBE_VIDEO)
-        ctx->output_frame_counter = (int)(resume_at_ms / ctx->frame_duration_ms);
-    else
-        ctx->output_frame_counter = 0;
+    (void)resume_at_ms;       /* real timestamps resume on their own now */
+    ctx->last_pts_ms = -1;
+    ctx->output_frame_counter = 0;
 }
 
 static void libav_close(lumen_decoder_ctx_t *ctx) {

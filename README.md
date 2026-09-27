@@ -78,6 +78,12 @@ qqvideo binary stays on the one it was built against until rebuilt.
 (labeled from the container's language/title tags) plus **None**, which is
 the default for each new file. **Add Subtitle Track...** loads an external
 `.srt`, `.ass`, `.ssa` or `.vtt` and selects it; `V` cycles tracks.
+Subtitle files next to the movie are listed automatically (never
+auto-selected): `Movie.srt`, `Movie.en.srt`, `Movie.eng.forced.srt`, and
+anything in a `Subs/` or `Subtitles/` folder, including `Subs/<movie>/`.
+If the movie is the only video in its folder, every subtitle file there
+is listed; in a folder with several videos (a TV season) only files named
+after that episode are, so episodes never pick up each other's subs.
 Text formats are supported (SubRip, ASS/SSA, WebVTT, MP4 timed text):
 styling tags are stripped and text is drawn outlined at the bottom of the
 picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD

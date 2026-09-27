@@ -110,6 +110,7 @@ add_executable(qqvideo
     core/player_core.c
     core/registry.c
     core/subtitles.c
+    core/sidecar.c
     core/packages.c
     core/plugin_loader.c
     core/minijson.c

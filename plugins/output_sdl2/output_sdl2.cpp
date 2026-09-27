@@ -683,6 +683,8 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
                                         state->subtitle_tracks[i].available != 0)) {
                         state->subtitle_selected = i;
                     }
+                    if (state->subtitle_tracks[i].file[0])
+                        ImGui::SetItemTooltip("%s", state->subtitle_tracks[i].file);
                 }
                 ImGui::EndMenu();
             }
@@ -1447,7 +1449,9 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
 
     Uint64 now = SDL_GetTicks64();
     if (!ctx->have_start) {
-        ctx->start_ticks = now;
+        /* Anchor on this frame's pts: frames carry real container time
+         * now, and a file's first frame isn't always at exactly 0. */
+        ctx->start_ticks = now - (Uint64)(frame->pts > 0 ? frame->pts : 0);
         ctx->have_start = 1;
     }
     if (ctx->state && ctx->state->seek_generation != ctx->last_seen_seek_generation) {

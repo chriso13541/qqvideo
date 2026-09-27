@@ -1,6 +1,7 @@
 #include "player_core.h"
 #include "plugin_loader.h"
 #include "subtitles.h"
+#include "sidecar.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,28 +70,13 @@ typedef struct {
 
 /* ---- Subtitles ------------------------------------------------------- */
 
-static const char *lang_name(const char *code) {
-    static const char *map[][2] = {
-        {"eng","English"}, {"spa","Spanish"}, {"fre","French"}, {"fra","French"},
-        {"ger","German"}, {"deu","German"}, {"ita","Italian"}, {"por","Portuguese"},
-        {"jpn","Japanese"}, {"chi","Chinese"}, {"zho","Chinese"}, {"kor","Korean"},
-        {"rus","Russian"}, {"dut","Dutch"}, {"nld","Dutch"}, {"swe","Swedish"},
-        {"nor","Norwegian"}, {"dan","Danish"}, {"fin","Finnish"}, {"pol","Polish"},
-        {"tur","Turkish"}, {"ara","Arabic"}, {"heb","Hebrew"}, {"hin","Hindi"},
-        {"gre","Greek"}, {"ell","Greek"}, {"cze","Czech"}, {"ces","Czech"},
-        {"hun","Hungarian"}, {"rum","Romanian"}, {"ron","Romanian"}, {"tha","Thai"},
-        {"vie","Vietnamese"}, {"ind","Indonesian"}, {"ukr","Ukrainian"},
-    };
-    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
-        if (strcmp(map[i][0], code) == 0) return map[i][1];
-    return code;
-}
-
 /* "English (SDH) [SRT]", "Spanish - forced [ASS]", "Track 3 [PGS]" */
 static void make_track_label(const lumen_stream_desc_t *sd, int number, char *out, size_t n) {
     char base[80];
     if (sd->title[0])          snprintf(base, sizeof(base), "%s", sd->title);
-    else if (sd->language[0])  snprintf(base, sizeof(base), "%s", lang_name(sd->language));
+    else if (sd->language[0])  snprintf(base, sizeof(base), "%s",
+                                        lumen_language_name(sd->language) ? lumen_language_name(sd->language)
+                                                                          : sd->language);
     else                       snprintf(base, sizeof(base), "Track %d", number);
     snprintf(out, n, "%s%s [%s]", base, sd->is_forced ? " - forced" : "", sd->codec_fourcc);
 }
@@ -108,8 +94,13 @@ static int add_track_entry(lumen_playback_state_t *st, const char *label, int av
     snprintf(st->subtitle_tracks[i].label, sizeof(st->subtitle_tracks[i].label), "%s", label);
     st->subtitle_tracks[i].available = available;
     st->subtitle_tracks[i].external = external;
+    st->subtitle_tracks[i].file[0] = '\0';
     return i;
 }
+
+/* Full paths of external tracks, by track index -- so adding a file that
+ * was already found next to the movie selects it instead of duplicating. */
+static char g_ext_paths[LUMEN_MAX_SUB_TRACKS][512];
 
 /* "Add Subtitle Track...": open a standalone subtitle file with whatever
  * demuxer claims its extension (demux_libav claims .srt/.ass/.ssa/.vtt),
@@ -117,10 +108,18 @@ static int add_track_entry(lumen_playback_state_t *st, const char *label, int av
  * it. The new track is selected immediately, which is what a user who
  * just picked a file expects. */
 static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_state_t *st,
-                                    lumen_sub_track_t *tracks, const char *path) {
+                                    lumen_sub_track_t *tracks, const char *path,
+                                    const char *label, int select, int quiet) {
     const char *err = NULL;
+    for (int i = 0; i < st->subtitle_track_count; i++) {
+        if (st->subtitle_tracks[i].external && strcmp(g_ext_paths[i], path) == 0) {
+            if (select) st->subtitle_selected = i;   /* already loaded: just pick it */
+            return;
+        }
+    }
     const lumen_registry_entry_t *de = lumen_registry_find_demuxer_by_ext(reg, file_ext(path));
     if (!de) {
+        if (quiet) return;
         snprintf(st->error_msg, sizeof(st->error_msg),
                  "Can't read subtitle files of type '%s'.\nSupported: .srt .ass .ssa .vtt", file_ext(path));
         return;
@@ -141,7 +140,8 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
     int rc = dmx->open_ex ? dmx->open_ex(&dctx, path, &table, allowed, allowed_count)
                           : dmx->open(&dctx, path, &table);
     if (rc != 0) {
-        snprintf(st->error_msg, sizeof(st->error_msg), "Couldn't open subtitle file:\n%s", path_basename(path));
+        if (!quiet)
+            snprintf(st->error_msg, sizeof(st->error_msg), "Couldn't open subtitle file:\n%s", path_basename(path));
         lumen_unload_plugin(&dp);
         return;
     }
@@ -157,7 +157,7 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
         const lumen_decoder_vtable_t *dec = cp.desc->vtable.decoder;
         lumen_decoder_ctx_t *cctx = NULL;
         if (dec->open(&cctx, sd) == 0) {
-            track = add_track_entry(st, path_basename(path), 1, 1);
+            track = add_track_entry(st, label, 1, 1);
             lumen_packet_t pkt;
             memset(&pkt, 0, sizeof(pkt));
             while (track >= 0 && dmx->read_packet(dctx, &pkt) == 0) {
@@ -177,11 +177,17 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
     lumen_unload_plugin(&dp);
 
     if (track < 0 || cues == 0) {
-        if (track >= 0) st->subtitle_track_count--;   /* nothing usable: drop the entry */
-        snprintf(st->error_msg, sizeof(st->error_msg), "No subtitles found in:\n%s", path_basename(path));
+        if (track >= 0) {                              /* nothing usable: drop the entry */
+            lumen_sub_track_free(&tracks[track]);
+            st->subtitle_track_count--;
+        }
+        if (!quiet)
+            snprintf(st->error_msg, sizeof(st->error_msg), "No subtitles found in:\n%s", path_basename(path));
         return;
     }
-    st->subtitle_selected = track;
+    snprintf(g_ext_paths[track], sizeof(g_ext_paths[track]), "%s", path);
+    snprintf(st->subtitle_tracks[track].file, sizeof(st->subtitle_tracks[track].file), "%s", path_basename(path));
+    if (select) st->subtitle_selected = track;
     printf("lumen: loaded %d subtitle cue(s) from '%s' as track %d\n", cues, path, track);
 }
 
@@ -507,6 +513,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                ss->decoder_plugin.desc->name, ss->decoder_plugin.desc->version);
     }
 
+    /* Subtitle files that live next to the movie (or in Subs/): listed
+     * after the embedded tracks, loaded now (a few KB each), NOT selected
+     * -- None stays the default until the user picks one. */
+    {
+        static lumen_sidecar_t found[LUMEN_SIDECAR_MAX];
+        int nfound = lumen_find_sidecar_subs(path, found, LUMEN_SIDECAR_MAX);
+        for (int i = 0; i < nfound; i++)
+            load_external_subtitles(reg, state, sub_tracks, found[i].path, found[i].label, 0, 1);
+        if (nfound) printf("lumen: %d subtitle file(s) found next to the movie\n", nfound);
+    }
+
     /* Reconfigure the SESSION's already-open outputs for this file via
      * load_stream(), rather than opening fresh ones -- the whole point
      * of the restructuring. `vout`/`aout` here are local: NULL means
@@ -593,7 +610,9 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
          * while paused shows its text immediately. */
         if (state->subtitle_add_requested) {
             state->subtitle_add_requested = 0;
-            load_external_subtitles(reg, state, sub_tracks, state->subtitle_add_path);
+            char label[96];
+            lumen_sidecar_label(path_basename(state->subtitle_add_path), NULL, label, sizeof(label));
+            load_external_subtitles(reg, state, sub_tracks, state->subtitle_add_path, label, 1, 0);
         }
         {
             int sel = state->subtitle_selected;

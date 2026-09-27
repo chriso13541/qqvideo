@@ -1458,6 +1458,21 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
         ctx->start_ticks = now - (Uint64)frame->pts;
         ctx->last_seen_seek_generation = ctx->state->seek_generation;
     }
+    if (ctx->state && ctx->state->video_sync_external) {
+        /* player_core already held this frame until the AUDIO clock reached
+         * it (audio is the master clock). Show it now, and keep the
+         * wall-clock anchor in step so pacing continues seamlessly if the
+         * audio clock goes away (audio track ends, decode starves it). */
+        ctx->start_ticks = now - (Uint64)(frame->pts > 0 ? frame->pts : 0);
+        SDL_UpdateYUVTexture(ctx->texture, NULL,
+            frame->video.planes[0], frame->video.stride[0],
+            frame->video.planes[1], frame->video.stride[1],
+            frame->video.planes[2], frame->video.stride[2]);
+        maybe_redraw(ctx);
+        ctx->frames_rendered++;
+        return 0;
+    }
+
     Uint64 target = ctx->start_ticks + (Uint64)frame->pts;
 
     if (target > now) {

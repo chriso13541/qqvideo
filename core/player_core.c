@@ -68,6 +68,13 @@ typedef struct {
     int sub_track;      /* subtitle streams: index into the file's track list */
 } stream_state_t;
 
+/* Every packet starts as "no timing info" (-1), not 0: 0 is a real time. */
+static void reset_pkt(lumen_packet_t *pkt) {
+    memset(pkt, 0, sizeof(*pkt));
+    pkt->pts_ms = -1;
+    pkt->duration_ms = -1;
+}
+
 /* ---- Subtitles ------------------------------------------------------- */
 
 /* "English (SDH) [SRT]", "Spanish - forced [ASS]", "Track 3 [PGS]" */
@@ -159,7 +166,7 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
         if (dec->open(&cctx, sd) == 0) {
             track = add_track_entry(st, label, 1, 1);
             lumen_packet_t pkt;
-            memset(&pkt, 0, sizeof(pkt));
+            reset_pkt(&pkt);
             while (track >= 0 && dmx->read_packet(dctx, &pkt) == 0) {
                 lumen_frame_t f;
                 if (pkt.stream_index == sd->stream_index && dec->decode(cctx, &pkt, &f) == 0) {
@@ -167,7 +174,7 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
                     dec->frame_free(&f);
                 }
                 dmx->packet_free(&pkt);
-                memset(&pkt, 0, sizeof(pkt));
+                reset_pkt(&pkt);
             }
             dec->close(cctx);
         }
@@ -321,21 +328,139 @@ void lumen_session_close(lumen_session_t *session) {
     free(session);
 }
 
-static int route_frame(const lumen_frame_t *frame,
-                        const lumen_video_output_vtable_t *vout, lumen_output_ctx_t *vout_ctx,
-                        const lumen_audio_output_vtable_t *aout, lumen_output_ctx_t *aout_ctx,
-                        lumen_playback_state_t *state,
-                        lumen_play_stats_t *stats) {
-    int stop = 0;
-    if (frame->type == LUMEN_STREAM_VIDEO) {
-        state->position_ms = frame->pts;
-        if (vout && vout->present(vout_ctx, frame) != 0) stop = 1;
-        stats->video_frames++;
-    } else {
-        if (aout && aout->present(aout_ctx, frame) != 0) stop = 1;
-        stats->audio_frames++;
+/* ---- A/V sync: audio is the master clock ------------------------------
+ *
+ * Video frames are held until the audio clock (what the speakers are
+ * playing right now, from the audio output's get_clock) reaches their pts,
+ * and dropped if they're too late. Pausing freezes the audio clock, so
+ * video pauses with it; a stall in decoding lets audio keep going and
+ * video catches up by dropping. Only when there's no usable audio clock
+ * (silent file, audio not started yet, audio track ended) does the video
+ * output pace itself against the wall clock, as it always used to. */
+
+#define LUMEN_VIDEO_LATE_DROP_MS 100   /* later than this vs. the audio clock: skip it */
+
+static int audio_clock(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
+                       int64_t *clock_ms, int *buffered_ms) {
+    if (!aout || !aout->get_clock) return 0;
+    return aout->get_clock(session->aout_ctx, clock_ms, buffered_ms);
+}
+
+/* Pumps both outputs' UI and checks for anything that ends playback of
+ * this file. Returns 1 (and fills out_stats) if playback must stop. */
+static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
+                          lumen_playback_state_t *state, lumen_play_stats_t *out_stats) {
+    if (session->have_vout && session->vout->pump_ui &&
+        session->vout->pump_ui(session->vout_ctx, state)) {
+        state->quit_requested = 1;
+        return 1;
     }
+    if (aout && aout->pump_ui && aout->pump_ui(session->aout_ctx, state)) return 1;
+    if (state->quit_requested) return 1;
+    if (state->open_file_requested) {
+        out_stats->open_file_requested = 1;
+        return 1;
+    }
+    if (state->queue_jump_requested) {
+        out_stats->queue_jump_index = state->queue_jump_index;
+        state->queue_jump_requested = 0;
+        return 1;
+    }
+    if (state->stop_requested) {
+        out_stats->stop_requested = 1;
+        state->stop_requested = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Decoded video frames waiting for their moment. The loop keeps reading
+ * and decoding while frames wait here -- that's what keeps the AUDIO queue
+ * fed. (A first version blocked on each video frame until the audio clock
+ * reached it; since the audio packets that follow a frame in the file
+ * couldn't be read during that wait, audio drained to nothing before every
+ * frame and playback crawled at half speed.) */
+#define VQ_CAP  24   /* hard cap (~72 MB of 1080p frames) */
+#define VQ_SOFT 8    /* normally read ahead this far */
+
+typedef struct {
+    lumen_frame_t                 frame;
+    const lumen_decoder_vtable_t *dec;    /* owner, for frame_free */
+} vq_item_t;
+
+typedef struct {
+    vq_item_t it[VQ_CAP];
+    int head, count;
+} vq_t;
+
+static void vq_pop_free(vq_t *q) {
+    vq_item_t *h = &q->it[q->head];
+    h->dec->frame_free(&h->frame);
+    q->head = (q->head + 1) % VQ_CAP;
+    q->count--;
+}
+static void vq_clear(vq_t *q) { while (q->count > 0) vq_pop_free(q); q->head = 0; }
+
+/* Shows the frame at the head of the queue if it's due. With an audio
+ * clock: due = its pts has been reached (frames already too late are
+ * dropped). Without one (silent file, audio not started, audio ran dry):
+ * hand it to the video output, which paces against the wall clock as it
+ * always did. `force` shows the head regardless (queue full). Returns 1
+ * if the video output asked to stop. */
+static int vq_present_due(lumen_session_t *session, vq_t *q,
+                          const lumen_video_output_vtable_t *vout,
+                          const lumen_audio_output_vtable_t *aout,
+                          lumen_playback_state_t *state, lumen_play_stats_t *stats, int force) {
+    while (q->count > 0) {
+        vq_item_t *h = &q->it[q->head];
+        int64_t clk;
+        int buf;
+        int have = audio_clock(session, aout, &clk, &buf) && (buf > 0 || state->paused);
+        if (have) {
+            int64_t d = h->frame.pts - clk;
+            if (d > 2 && !force) return 0;                     /* not yet */
+            state->position_ms = h->frame.pts;
+            if (-d > LUMEN_VIDEO_LATE_DROP_MS && q->count > 1) {
+                stats->video_dropped++;                        /* too late: skip */
+                vq_pop_free(q);
+                continue;
+            }
+            state->video_sync_external = 1;
+        } else {
+            state->position_ms = h->frame.pts;
+            state->video_sync_external = 0;
+        }
+        int stop = vout->present(session->vout_ctx, &h->frame) != 0;
+        vq_pop_free(q);
+        return stop;          /* at most one frame shown per loop pass */
+    }
+    return 0;
+}
+
+/* Routes one decoded audio/video frame. Video goes into the queue (the
+ * queue takes ownership); audio goes straight to the audio device.
+ * Returns 1 if playback must stop. */
+static int route_frame(lumen_session_t *session, vq_t *q, lumen_frame_t *frame,
+                       const lumen_decoder_vtable_t *dec,
+                       const lumen_video_output_vtable_t *vout,
+                       const lumen_audio_output_vtable_t *aout,
+                       lumen_playback_state_t *state, lumen_play_stats_t *stats) {
+    int stop = 0;
     stats->frames_decoded++;
+    if (frame->type == LUMEN_STREAM_VIDEO) {
+        stats->video_frames++;
+        if (!vout) { state->position_ms = frame->pts; dec->frame_free(frame); return 0; }
+        if (q->count == VQ_CAP)
+            stop = vq_present_due(session, q, vout, aout, state, stats, 1);
+        vq_item_t *slot = &q->it[(q->head + q->count) % VQ_CAP];
+        slot->frame = *frame;
+        slot->dec = dec;
+        q->count++;
+    } else {
+        stats->audio_frames++;
+        if (aout && aout->present(session->aout_ctx, frame) != 0) stop = 1;
+        dec->frame_free(frame);
+    }
     return stop;
 }
 
@@ -563,45 +688,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
 
     lumen_packet_t pkt;
     int stop_requested = 0;
-    memset(&pkt, 0, sizeof(pkt));
+    int eof = 0;
+    reset_pkt(&pkt);
+    static vq_t vq;           /* static: ~24 frames' worth of structs, keep off the stack */
+    memset(&vq, 0, sizeof(vq));
 
     while (!stop_requested) {
-        /* ALWAYS call the session's video output pump_ui to keep the SDL
-         * event loop running. If we guarded this with (vout && ...) then
-         * when no video decoder was found (e.g., H.265 not installed),
-         * vout is NULL, pump_ui is never called, and the window freezes
-         * indefinitely -- the "missing codec hang" bug. The session always
-         * has a vout; it's only the file-specific local vout that may be
-         * NULL when this file had no decodable video stream. */
-        if (session->have_vout && session->vout->pump_ui &&
-            session->vout->pump_ui(session->vout_ctx, state)) {
+        /* Pumping the session's video output EVERY iteration keeps the SDL
+         * event loop alive even when this file has no decodable video
+         * (the old "missing codec hang"). */
+        if (pump_and_check(session, aout, state, out_stats)) {
             stop_requested = 1;
-            if (state) state->quit_requested = 1;
-            break;
-        }
-        if (aout && aout->pump_ui && aout->pump_ui(session->aout_ctx, state)) {
-            stop_requested = 1;
-            break;
-        }
-        if (state->quit_requested) {
-            stop_requested = 1;
-            break;
-        }
-        if (state->open_file_requested) {
-            stop_requested = 1;
-            out_stats->open_file_requested = 1;
-            break;
-        }
-        if (state->queue_jump_requested) {
-            stop_requested = 1;
-            out_stats->queue_jump_index = state->queue_jump_index;
-            state->queue_jump_requested = 0;
-            break;
-        }
-        if (state->stop_requested) {
-            stop_requested = 1;
-            out_stats->stop_requested = 1;
-            state->stop_requested = 0;
             break;
         }
 
@@ -631,8 +728,10 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                             streams[i].dec_vt->flush(streams[i].dec_ctx, state->seek_target_ms);
                         }
                     }
+                    vq_clear(&vq);    /* queued frames are from before the seek */
                     state->position_ms = state->seek_target_ms;
                     state->seek_generation++;
+                    eof = 0;   /* seeking back from the very end works too */
                 } else {
                     fprintf(stderr, "lumen: seek to %lldms failed\n", (long long)state->seek_target_ms);
                 }
@@ -641,7 +740,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             }
             state->seek_requested = 0;
             dmx->packet_free(&pkt);
-            memset(&pkt, 0, sizeof(pkt));
+            reset_pkt(&pkt);
             continue;
         }
 
@@ -650,12 +749,65 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             continue;
         }
 
+        /* Audio-only files: the seek bar follows the audio clock, and the
+         * loop only reads ahead ~0.4 s. Before, nothing paced it at all: a
+         * 10-minute FLAC decoded into 238 MB of RAM in ~1.5 s and the file
+         * was reported finished while it was still playing. (With video,
+         * waiting for each frame's moment already paces everything.) */
+        /* Show the next video frame if its moment has come. */
+        if (vout && vq_present_due(session, &vq, vout, aout, state, out_stats, 0)) {
+            stop_requested = 1;
+            break;
+        }
+
+        int64_t aclk;
+        int abuf;
+        int have_aclk = audio_clock(session, aout, &aclk, &abuf);
+        if (!have_aclk) abuf = 0;
+        if (!vout && have_aclk) state->position_ms = aclk < 0 ? 0 : aclk;
+
+        if (eof) {
+            /* Decoders are drained; show the remaining frames and let the
+             * last queued audio actually play before reporting the file
+             * done -- otherwise loading the next queue item resets the
+             * device and cuts off the ending. */
+            if (vq.count > 0 || abuf > 0) { sleep_ms(2); continue; }
+            break;
+        }
+
+        /* Read ahead only as far as needed. With video: up to VQ_SOFT
+         * decoded frames (further, up to VQ_CAP, if audio is running low
+         * -- files whose audio sits far behind the video in the stream).
+         * Audio-only: ~0.4 s of queued sound. This is what paces audio-only
+         * files; before, nothing did, and a 10-minute FLAC decoded into
+         * 238 MB of RAM in ~1.5 s and was reported finished while still
+         * playing. */
+        int can_read = vout ? (vq.count < VQ_SOFT || (abuf < 150 && vq.count < VQ_CAP - 4))
+                            : (!have_aclk || abuf < 400);
+        if (!can_read) {
+            sleep_ms(2);
+            continue;
+        }
+
         int rc = dmx->read_packet(dctx, &pkt);
-        if (rc != 0) break; /* EOF or unrecoverable error */
+        if (rc != 0) {
+            /* EOF: flush frames still buffered inside the decoders. */
+            for (int i = 0; i < LUMEN_MAX_STREAMS && !stop_requested; i++) {
+                stream_state_t *ss = &streams[i];
+                if (!ss->in_use || !ss->dec_vt->drain || ss->type == LUMEN_STREAM_SUBTITLE) continue;
+                lumen_frame_t frame;
+                while (!stop_requested && !state->seek_requested && ss->dec_vt->drain(ss->dec_ctx, &frame) == 0) {
+                    if (route_frame(session, &vq, &frame, ss->dec_vt, vout, aout, state, out_stats)) stop_requested = 1;
+                }
+            }
+            eof = 1;
+            reset_pkt(&pkt);
+            continue;
+        }
 
         if (pkt.stream_index < 0 || pkt.stream_index >= LUMEN_MAX_STREAMS || !streams[pkt.stream_index].in_use) {
             dmx->packet_free(&pkt);
-            memset(&pkt, 0, sizeof(pkt));
+            reset_pkt(&pkt);
             continue;
         }
         stream_state_t *ss = &streams[pkt.stream_index];
@@ -669,29 +821,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                                     frame.subtitle.end_ms, frame.subtitle.text);
             ss->dec_vt->frame_free(&frame);
         } else if (drc == 0) {
-            if (route_frame(&frame, vout, session->vout_ctx, aout, session->aout_ctx, state, out_stats)) stop_requested = 1;
-            ss->dec_vt->frame_free(&frame);
+            if (route_frame(session, &vq, &frame, ss->dec_vt, vout, aout, state, out_stats)) stop_requested = 1;
         } else if (drc < 0) {
             out_stats->frames_failed++;
         }
         dmx->packet_free(&pkt);
-        memset(&pkt, 0, sizeof(pkt));
+        reset_pkt(&pkt);
     }
 
-    if (!stop_requested) {
-        for (int i = 0; i < LUMEN_MAX_STREAMS; i++) {
-            stream_state_t *ss = &streams[i];
-            if (!ss->in_use || !ss->dec_vt->drain || ss->type == LUMEN_STREAM_SUBTITLE) continue;
-            lumen_frame_t frame;
-            while (!stop_requested && ss->dec_vt->drain(ss->dec_ctx, &frame) == 0) {
-                if (route_frame(&frame, vout, session->vout_ctx, aout, session->aout_ctx, state, out_stats)) stop_requested = 1;
-                ss->dec_vt->frame_free(&frame);
-            }
-        }
-    }
-
-    printf("lumen: done -- %d video frame(s), %d audio frame(s), %d failed%s\n",
-           out_stats->video_frames, out_stats->audio_frames, out_stats->frames_failed,
+    vq_clear(&vq);   /* frames not shown (stopped early) -- before their decoders close */
+    printf("lumen: done -- %d video frame(s) (%d dropped as late), %d audio frame(s), %d failed%s\n",
+           out_stats->video_frames, out_stats->video_dropped, out_stats->audio_frames, out_stats->frames_failed,
            stop_requested ? " (stopped by output)" : "");
 
     /* Note: deliberately NOT closing vout/aout here -- the session owns

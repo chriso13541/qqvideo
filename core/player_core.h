@@ -33,6 +33,7 @@ typedef struct {
     int video_frames;
     int audio_frames;
     int frames_failed;
+    int video_dropped;    /* video frames skipped for arriving too late vs. the audio clock */
     /* Set if playback stopped because the user clicked File > Open
      * File... (not a real quit) -- the caller's loop uses this to
      * decide whether to prompt for a new file and play it, vs. going

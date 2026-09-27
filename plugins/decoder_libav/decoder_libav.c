@@ -44,6 +44,7 @@ struct lumen_decoder_ctx {
     int             output_frame_counter; /* audio fallback when no timestamps */
     double          frame_duration_ms;    /* video: fallback spacing for frames with no pts */
     int64_t         last_pts_ms;          /* last emitted pts, for the no-pts fallback */
+    int64_t         samples_out;          /* audio: samples emitted, for the no-pts fallback */
 
     struct SwsContext *sws;               /* video: lazily created, only if needed */
     SwrContext        *swr;               /* audio: lazily created on first frame */
@@ -240,9 +241,12 @@ static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, 
     }
     if (ts != AV_NOPTS_VALUE) {
         out->pts = ts + (sr > 0 ? (int64_t)skip_samples * 1000 / sr : 0);
-    } else {
-        out->pts = ctx->output_frame_counter;   /* no timestamps: frame index, as before */
+    } else if (sr > 0) {
+        /* No timestamps (raw ADTS .aac): time from samples emitted. This
+         * used to be a frame INDEX, which is meaningless as a clock. */
+        out->pts = ctx->samples_out * 1000 / sr;
     }
+    ctx->samples_out += out->audio.nb_samples;
     ctx->output_frame_counter++;
     return 0;
 }
@@ -392,6 +396,7 @@ static void libav_flush(lumen_decoder_ctx_t *ctx, int64_t resume_at_ms) {
     (void)resume_at_ms;       /* real timestamps resume on their own now */
     ctx->last_pts_ms = -1;
     ctx->output_frame_counter = 0;
+    ctx->samples_out = 0;
 }
 
 static void libav_close(lumen_decoder_ctx_t *ctx) {

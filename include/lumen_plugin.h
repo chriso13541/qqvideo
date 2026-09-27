@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 16
+#define LUMEN_ABI_VERSION 17
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -382,6 +382,12 @@ typedef struct {
      * loads the file, adds + selects the track, then clears the flag. */
     char subtitle_add_path[512];
     int  subtitle_add_requested;
+
+    /* v17. Set by player_core.c before each video present(): 1 = the core
+     * already waited for this frame's moment on the audio clock, so show it
+     * immediately; 0 = no audio clock (silent file / audio not started yet),
+     * pace against the wall clock as before. */
+    int  video_sync_external;
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */
@@ -573,6 +579,20 @@ typedef struct {
 
     /* Tears down for real -- only on app exit, not between files. */
     void (*close)(lumen_output_ctx_t *ctx);
+
+    /* v17, optional. The AUDIO CLOCK: the presentation time (ms, same
+     * timeline as frame pts) of the sound coming out of the speakers right
+     * now, plus how much audio is queued but not yet heard. Returns 1 if
+     * the clock is valid, 0 if not (nothing queued since load/seek).
+     *
+     * player_core.c times video frames against this instead of the wall
+     * clock ("audio master clock", as every real player does): video waits
+     * for audio, never the other way round. That keeps lip sync through
+     * pauses, stalls and sound-card clock drift, and it's how audio-only
+     * files get paced at all -- without it nothing slowed the loop down
+     * and a whole album decoded into RAM in seconds. */
+    int  (*get_clock)(lumen_output_ctx_t *ctx, int64_t *clock_ms, int *buffered_ms);
+
 } lumen_audio_output_vtable_t;
 
 /* ---------------------------------------------------------------------- */

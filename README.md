@@ -74,6 +74,15 @@ FFmpegs coexist (different sonames, e.g. `libavcodec.so.59` vs `.61`); a
 qqvideo binary stays on the one it was built against until rebuilt.
 `sudo make uninstall` in the FFmpeg tree reverts to the distro version.
 
+**Subtitles.** The Subtitles menu lists every subtitle track in the file
+(labeled from the container's language/title tags) plus **None**, which is
+the default for each new file. **Add Subtitle Track...** loads an external
+`.srt`, `.ass`, `.ssa` or `.vtt` and selects it; `V` cycles tracks.
+Text formats are supported (SubRip, ASS/SSA, WebVTT, MP4 timed text):
+styling tags are stripped and text is drawn outlined at the bottom of the
+picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
+VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
+
 **What changes about the security model.** A distro `libavcodec.so`
 contains every decoder the distro enabled, so "not installed = not
 mapped into the process" no longer holds. What holds instead is "not

@@ -1,5 +1,6 @@
 #include "player_core.h"
 #include "plugin_loader.h"
+#include "subtitles.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +64,133 @@ typedef struct {
     lumen_loaded_plugin_t decoder_plugin;
     const lumen_decoder_vtable_t *dec_vt;
     lumen_decoder_ctx_t *dec_ctx;
+    int sub_track;      /* subtitle streams: index into the file's track list */
 } stream_state_t;
+
+/* ---- Subtitles ------------------------------------------------------- */
+
+static const char *lang_name(const char *code) {
+    static const char *map[][2] = {
+        {"eng","English"}, {"spa","Spanish"}, {"fre","French"}, {"fra","French"},
+        {"ger","German"}, {"deu","German"}, {"ita","Italian"}, {"por","Portuguese"},
+        {"jpn","Japanese"}, {"chi","Chinese"}, {"zho","Chinese"}, {"kor","Korean"},
+        {"rus","Russian"}, {"dut","Dutch"}, {"nld","Dutch"}, {"swe","Swedish"},
+        {"nor","Norwegian"}, {"dan","Danish"}, {"fin","Finnish"}, {"pol","Polish"},
+        {"tur","Turkish"}, {"ara","Arabic"}, {"heb","Hebrew"}, {"hin","Hindi"},
+        {"gre","Greek"}, {"ell","Greek"}, {"cze","Czech"}, {"ces","Czech"},
+        {"hun","Hungarian"}, {"rum","Romanian"}, {"ron","Romanian"}, {"tha","Thai"},
+        {"vie","Vietnamese"}, {"ind","Indonesian"}, {"ukr","Ukrainian"},
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (strcmp(map[i][0], code) == 0) return map[i][1];
+    return code;
+}
+
+/* "English (SDH) [SRT]", "Spanish - forced [ASS]", "Track 3 [PGS]" */
+static void make_track_label(const lumen_stream_desc_t *sd, int number, char *out, size_t n) {
+    char base[80];
+    if (sd->title[0])          snprintf(base, sizeof(base), "%s", sd->title);
+    else if (sd->language[0])  snprintf(base, sizeof(base), "%s", lang_name(sd->language));
+    else                       snprintf(base, sizeof(base), "Track %d", number);
+    snprintf(out, n, "%s%s [%s]", base, sd->is_forced ? " - forced" : "", sd->codec_fourcc);
+}
+
+static const char *path_basename(const char *p) {
+    const char *a = strrchr(p, '/'), *b = strrchr(p, '\\');
+    const char *s = a > b ? a : b;
+    return s ? s + 1 : p;
+}
+
+/* Adds a track entry to the UI list; returns its index or -1 if full. */
+static int add_track_entry(lumen_playback_state_t *st, const char *label, int available, int external) {
+    if (st->subtitle_track_count >= LUMEN_MAX_SUB_TRACKS) return -1;
+    int i = st->subtitle_track_count++;
+    snprintf(st->subtitle_tracks[i].label, sizeof(st->subtitle_tracks[i].label), "%s", label);
+    st->subtitle_tracks[i].available = available;
+    st->subtitle_tracks[i].external = external;
+    return i;
+}
+
+/* "Add Subtitle Track...": open a standalone subtitle file with whatever
+ * demuxer claims its extension (demux_libav claims .srt/.ass/.ssa/.vtt),
+ * decode every cue up front -- the whole file is a few KB -- then close
+ * it. The new track is selected immediately, which is what a user who
+ * just picked a file expects. */
+static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_state_t *st,
+                                    lumen_sub_track_t *tracks, const char *path) {
+    const char *err = NULL;
+    const lumen_registry_entry_t *de = lumen_registry_find_demuxer_by_ext(reg, file_ext(path));
+    if (!de) {
+        snprintf(st->error_msg, sizeof(st->error_msg),
+                 "Can't read subtitle files of type '%s'.\nSupported: .srt .ass .ssa .vtt", file_ext(path));
+        return;
+    }
+    lumen_loaded_plugin_t dp;
+    if (lumen_load_plugin(de->library_path, &dp, &err) != 0) return;
+    const lumen_demuxer_vtable_t *dmx = dp.desc->vtable.demuxer;
+
+    const char *allowed[128];
+    int allowed_count = 0;
+    for (int i = 0; i < reg->count; i++)
+        if (reg->entries[i].kind == LUMEN_PLUGIN_DECODER)
+            for (int j = 0; j < reg->entries[i].fourcc_count && allowed_count < 128; j++)
+                allowed[allowed_count++] = reg->entries[i].fourccs[j];
+
+    lumen_demuxer_ctx_t *dctx = NULL;
+    lumen_stream_table_t table;
+    int rc = dmx->open_ex ? dmx->open_ex(&dctx, path, &table, allowed, allowed_count)
+                          : dmx->open(&dctx, path, &table);
+    if (rc != 0) {
+        snprintf(st->error_msg, sizeof(st->error_msg), "Couldn't open subtitle file:\n%s", path_basename(path));
+        lumen_unload_plugin(&dp);
+        return;
+    }
+
+    int cues = 0, track = -1;
+    for (int i = 0; i < table.stream_count && track < 0; i++) {
+        const lumen_stream_desc_t *sd = &table.streams[i];
+        if (sd->type != LUMEN_STREAM_SUBTITLE) continue;
+        const lumen_registry_entry_t *ce = lumen_registry_find_decoder_by_fourcc(reg, sd->codec_fourcc);
+        if (!ce) continue;
+        lumen_loaded_plugin_t cp;
+        if (lumen_load_plugin(ce->library_path, &cp, &err) != 0) continue;
+        const lumen_decoder_vtable_t *dec = cp.desc->vtable.decoder;
+        lumen_decoder_ctx_t *cctx = NULL;
+        if (dec->open(&cctx, sd) == 0) {
+            track = add_track_entry(st, path_basename(path), 1, 1);
+            lumen_packet_t pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            while (track >= 0 && dmx->read_packet(dctx, &pkt) == 0) {
+                lumen_frame_t f;
+                if (pkt.stream_index == sd->stream_index && dec->decode(cctx, &pkt, &f) == 0) {
+                    cues += lumen_sub_track_add(&tracks[track], f.subtitle.start_ms, f.subtitle.end_ms, f.subtitle.text);
+                    dec->frame_free(&f);
+                }
+                dmx->packet_free(&pkt);
+                memset(&pkt, 0, sizeof(pkt));
+            }
+            dec->close(cctx);
+        }
+        lumen_unload_plugin(&cp);
+    }
+    dmx->close(dctx);
+    lumen_unload_plugin(&dp);
+
+    if (track < 0 || cues == 0) {
+        if (track >= 0) st->subtitle_track_count--;   /* nothing usable: drop the entry */
+        snprintf(st->error_msg, sizeof(st->error_msg), "No subtitles found in:\n%s", path_basename(path));
+        return;
+    }
+    st->subtitle_selected = track;
+    printf("lumen: loaded %d subtitle cue(s) from '%s' as track %d\n", cues, path, track);
+}
+
+static void reset_subtitle_state(lumen_playback_state_t *st) {
+    st->subtitle_track_count = 0;
+    st->subtitle_selected = -1;
+    st->subtitle_text[0] = '\0';
+    st->subtitle_add_requested = 0;
+}
 
 /* The persistent part of the player -- video/audio outputs opened ONCE
  * and reused across as many files as get played in this session,
@@ -227,6 +354,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     state->position_ms = 0;
     state->duration_ms = 0;
     state->has_file = 0;
+    reset_subtitle_state(state);   /* None is the default for every new file */
 
     const lumen_registry_entry_t *demux_entry = lumen_registry_find_demuxer_by_ext(reg, file_ext(path));
     if (!demux_entry) {
@@ -271,13 +399,56 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
 
     stream_state_t streams[LUMEN_MAX_STREAMS];
     memset(streams, 0, sizeof(streams));
+    lumen_sub_track_t sub_tracks[LUMEN_MAX_SUB_TRACKS];
+    memset(sub_tracks, 0, sizeof(sub_tracks));
+    int sub_number = 0;
 
     for (int i = 0; i < table.stream_count; i++) {
         const lumen_stream_desc_t *sd = &table.streams[i];
-        const char *type_name = (sd->type == LUMEN_STREAM_VIDEO) ? "video" : "audio";
+        const char *type_name = (sd->type == LUMEN_STREAM_VIDEO) ? "video"
+                              : (sd->type == LUMEN_STREAM_AUDIO) ? "audio" : "subtitle";
 
         if (sd->stream_index < 0 || sd->stream_index >= LUMEN_MAX_STREAMS) {
             fprintf(stderr, "lumen: stream %d index out of range, skipping\n", i);
+            continue;
+        }
+
+        /* Subtitle streams: always LISTED in the menu; decoded only if a
+         * decoder claims the codec and no Playback Rule blocks it. Image
+         * subtitles (PGS/VobSub) show up grayed out instead of vanishing. */
+        if (sd->type == LUMEN_STREAM_SUBTITLE) {
+            char label[96];
+            make_track_label(sd, ++sub_number, label, sizeof(label));
+            const lumen_registry_entry_t *se = lumen_registry_find_decoder_by_fourcc(reg, sd->codec_fourcc);
+            int ok = se && !rule_blocks(state, demux_entry, se, sd->codec_fourcc);
+            stream_state_t *ss = &streams[sd->stream_index];
+            if (ok && lumen_load_plugin(se->library_path, &ss->decoder_plugin, &err) == 0) {
+                ss->dec_vt = ss->decoder_plugin.desc->vtable.decoder;
+                if (ss->dec_vt->open(&ss->dec_ctx, sd) == 0) {
+                    ss->in_use = 1;
+                    ss->type = LUMEN_STREAM_SUBTITLE;
+                } else {
+                    lumen_unload_plugin(&ss->decoder_plugin);
+                    ok = 0;
+                }
+            } else {
+                ok = 0;
+            }
+            if (!ok) {
+                size_t l = strlen(label);
+                int image = !strcmp(sd->codec_fourcc, "PGS") || !strcmp(sd->codec_fourcc, "VOBS") ||
+                            !strcmp(sd->codec_fourcc, "DVBS");
+                snprintf(label + l, sizeof(label) - l, "%s",
+                         se ? " (disabled)" : image ? " (image-based, not supported yet)" : " (not supported)");
+            }
+            ss->sub_track = add_track_entry(state, label, ok, 0);
+            if (ss->sub_track < 0 && ss->in_use) {   /* list full: stop decoding it */
+                ss->dec_vt->close(ss->dec_ctx);
+                lumen_unload_plugin(&ss->decoder_plugin);
+                ss->in_use = 0;
+            }
+            printf("lumen: stream %d (subtitle, codec='%s') -> %s\n", sd->stream_index,
+                   sd->codec_fourcc, ok ? "listed + decoding" : "listed, not decodable");
             continue;
         }
 
@@ -417,6 +588,22 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             break;
         }
 
+        /* Subtitles: load a newly added file, then publish what's on
+         * screen now. Done before the pause check so picking a track
+         * while paused shows its text immediately. */
+        if (state->subtitle_add_requested) {
+            state->subtitle_add_requested = 0;
+            load_external_subtitles(reg, state, sub_tracks, state->subtitle_add_path);
+        }
+        {
+            int sel = state->subtitle_selected;
+            if (sel >= 0 && sel < state->subtitle_track_count && state->subtitle_tracks[sel].available)
+                lumen_sub_track_text_at(&sub_tracks[sel], state->position_ms,
+                                        state->subtitle_text, sizeof(state->subtitle_text));
+            else
+                state->subtitle_text[0] = '\0';
+        }
+
         if (state->seek_requested) {
             if (dmx->seek) {
                 if (dmx->seek(dctx, state->seek_target_ms) == 0) {
@@ -455,7 +642,14 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         stream_state_t *ss = &streams[pkt.stream_index];
         lumen_frame_t frame;
         int drc = ss->dec_vt->decode(ss->dec_ctx, &pkt, &frame);
-        if (drc == 0) {
+        if (drc == 0 && ss->type == LUMEN_STREAM_SUBTITLE) {
+            /* Every decodable track is collected, not just the selected
+             * one, so switching tracks mid-movie shows text immediately. */
+            if (ss->sub_track >= 0)
+                lumen_sub_track_add(&sub_tracks[ss->sub_track], frame.subtitle.start_ms,
+                                    frame.subtitle.end_ms, frame.subtitle.text);
+            ss->dec_vt->frame_free(&frame);
+        } else if (drc == 0) {
             if (route_frame(&frame, vout, session->vout_ctx, aout, session->aout_ctx, state, out_stats)) stop_requested = 1;
             ss->dec_vt->frame_free(&frame);
         } else if (drc < 0) {
@@ -468,7 +662,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     if (!stop_requested) {
         for (int i = 0; i < LUMEN_MAX_STREAMS; i++) {
             stream_state_t *ss = &streams[i];
-            if (!ss->in_use || !ss->dec_vt->drain) continue;
+            if (!ss->in_use || !ss->dec_vt->drain || ss->type == LUMEN_STREAM_SUBTITLE) continue;
             lumen_frame_t frame;
             while (!stop_requested && ss->dec_vt->drain(ss->dec_ctx, &frame) == 0) {
                 if (route_frame(&frame, vout, session->vout_ctx, aout, session->aout_ctx, state, out_stats)) stop_requested = 1;
@@ -491,6 +685,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     }
     dmx->close(dctx);
     lumen_unload_plugin(&demux_plugin);
+    for (int i = 0; i < LUMEN_MAX_SUB_TRACKS; i++) lumen_sub_track_free(&sub_tracks[i]);
+    reset_subtitle_state(state);
 
     state->has_file = 0;     /* back to idle rendering once the caller goes there */
     state->position_ms = 0;  /* reset so seek bar and timers show 0:00 in idle */

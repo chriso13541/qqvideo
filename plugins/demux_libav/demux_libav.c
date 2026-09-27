@@ -33,12 +33,25 @@
  * ("mov,mp4,m4a,3gp,3g2,mj2" is one demuxer whose name is that whole
  * list; "matroska,webm" likewise.) */
 static const char *FORMAT_WHITELIST =
-    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,ogg,flac,mp3,aac";
+    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,ogg,flac,mp3,aac,"
+    "srt,ass,webvtt";   /* standalone subtitle files ("Add Subtitle Track...") */
 
 struct lumen_demuxer_ctx {
     AVFormatContext *fmt_ctx;
     AVPacket        *avpkt;
+    /* Timeline origin for pts_ms/duration_ms, in AV_TIME_BASE units:
+     * the video stream's start time, because decoder_libav numbers video
+     * frames from 0 at the FIRST video frame. Subtracting it puts subtitle
+     * cues on the same clock as position_ms (matters for MPEG-TS, whose
+     * timestamps start at ~1.4s, and MP4s with edit lists). */
+    int64_t          origin_us;
 };
+
+static int is_wanted(const AVStream *st) {
+    enum AVMediaType t = st->codecpar->codec_type;
+    if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) return 0; /* cover art */
+    return t == AVMEDIA_TYPE_VIDEO || t == AVMEDIA_TYPE_AUDIO || t == AVMEDIA_TYPE_SUBTITLE;
+}
 
 static int libav_probe(const uint8_t *header_bytes, size_t header_len, const char *file_ext) {
     (void)header_bytes; (void)header_len; (void)file_ext;
@@ -62,12 +75,13 @@ static int fill_stream_table(AVFormatContext *fmt_ctx, lumen_stream_table_t *out
     for (unsigned i = 0; i < fmt_ctx->nb_streams && i < LUMEN_MAX_STREAMS; i++) {
         AVStream *st = fmt_ctx->streams[i];
         AVCodecParameters *cp = st->codecpar;
-        if (cp->codec_type != AVMEDIA_TYPE_VIDEO && cp->codec_type != AVMEDIA_TYPE_AUDIO) continue;
-        if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue; /* cover art, not a video track */
+        if (!is_wanted(st)) continue;
 
         lumen_stream_desc_t *sd = &out_table->streams[n++];
         sd->stream_index = (int)i;
-        sd->type = (cp->codec_type == AVMEDIA_TYPE_VIDEO) ? LUMEN_STREAM_VIDEO : LUMEN_STREAM_AUDIO;
+        sd->type = cp->codec_type == AVMEDIA_TYPE_VIDEO ? LUMEN_STREAM_VIDEO
+                 : cp->codec_type == AVMEDIA_TYPE_AUDIO ? LUMEN_STREAM_AUDIO
+                 : LUMEN_STREAM_SUBTITLE;
 
         const lumen_libav_codec_t *c = lumen_libav_by_id(cp->codec_id);
         strncpy(sd->codec_fourcc, c ? c->fourcc : "UNKN", sizeof(sd->codec_fourcc) - 1);
@@ -78,16 +92,34 @@ static int fill_stream_table(AVFormatContext *fmt_ctx, lumen_stream_table_t *out
             double fps = av_q2d(st->avg_frame_rate);
             if (fps <= 0.0 || fps > 1000.0) fps = av_q2d(st->r_frame_rate);
             sd->frame_rate = (fps > 0.0 && fps <= 1000.0) ? fps : 0.0;
-        } else {
+        } else if (sd->type == LUMEN_STREAM_AUDIO) {
             sd->sample_rate = cp->sample_rate;
             sd->channels = cp->ch_layout.nb_channels;
         }
         sd->extradata = cp->extradata;
         sd->extradata_size = cp->extradata_size;
+
+        const AVDictionaryEntry *lang  = av_dict_get(st->metadata, "language", NULL, 0);
+        const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
+        if (lang && strcmp(lang->value, "und") != 0)
+            strncpy(sd->language, lang->value, sizeof(sd->language) - 1);
+        if (title) strncpy(sd->title, title->value, sizeof(sd->title) - 1);
+        sd->is_default = (st->disposition & AV_DISPOSITION_DEFAULT) ? 1 : 0;
+        sd->is_forced  = (st->disposition & AV_DISPOSITION_FORCED) ? 1 : 0;
     }
     out_table->stream_count = n;
     out_table->duration_sec = (fmt_ctx->duration > 0) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
     return n;
+}
+
+static int64_t compute_origin_us(AVFormatContext *fmt_ctx) {
+    int vi = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (vi >= 0) {
+        AVStream *vs = fmt_ctx->streams[vi];
+        if (vs->start_time != AV_NOPTS_VALUE)
+            return av_rescale_q(vs->start_time, vs->time_base, AV_TIME_BASE_Q);
+    }
+    return fmt_ctx->start_time != AV_NOPTS_VALUE ? fmt_ctx->start_time : 0;
 }
 
 static int libav_open_ex(lumen_demuxer_ctx_t **out_ctx, const char *path,
@@ -124,6 +156,7 @@ static int libav_open_ex(lumen_demuxer_ctx_t **out_ctx, const char *path,
     lumen_demuxer_ctx_t *ctx = (lumen_demuxer_ctx_t *)calloc(1, sizeof(*ctx));
     ctx->fmt_ctx = fmt_ctx;
     ctx->avpkt = av_packet_alloc();
+    ctx->origin_us = compute_origin_us(fmt_ctx);
     *out_ctx = ctx;
     fill_stream_table(fmt_ctx, out_table);
     return 0;
@@ -144,8 +177,7 @@ static int libav_read_packet(lumen_demuxer_ctx_t *ctx, lumen_packet_t *out_pkt) 
         int si = ctx->avpkt->stream_index;
         AVStream *st = ctx->fmt_ctx->streams[si];
         enum AVMediaType t = st->codecpar->codec_type;
-        if ((t != AVMEDIA_TYPE_VIDEO && t != AVMEDIA_TYPE_AUDIO) || si >= LUMEN_MAX_STREAMS ||
-            (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        if (si >= LUMEN_MAX_STREAMS || !is_wanted(st)) {
             av_packet_unref(ctx->avpkt);
             continue;
         }
@@ -156,6 +188,17 @@ static int libav_read_packet(lumen_demuxer_ctx_t *ctx, lumen_packet_t *out_pkt) 
         out_pkt->pts = ctx->avpkt->pts;
         out_pkt->stream_index = si;
         out_pkt->keyframe = (ctx->avpkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+
+        /* Millisecond timing on the video frame clock (see origin_us). */
+        int64_t ts = ctx->avpkt->pts != AV_NOPTS_VALUE ? ctx->avpkt->pts : ctx->avpkt->dts;
+        out_pkt->pts_ms = -1;
+        out_pkt->duration_ms = -1;
+        if (ts != AV_NOPTS_VALUE) {
+            int64_t us = av_rescale_q(ts, st->time_base, AV_TIME_BASE_Q) - ctx->origin_us;
+            out_pkt->pts_ms = us / 1000;
+        }
+        if (ctx->avpkt->duration > 0)
+            out_pkt->duration_ms = av_rescale_q(ctx->avpkt->duration, st->time_base, (AVRational){1, 1000});
 
         if (t == AVMEDIA_TYPE_AUDIO) {
             /* Priming samples (MP4 AAC encoder delay) and trailing padding

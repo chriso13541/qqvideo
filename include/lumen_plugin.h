@@ -35,9 +35,13 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 15
+#define LUMEN_ABI_VERSION 16
 
-#define LUMEN_MAX_STREAMS 8
+/* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
+ * 10-20 subtitle streams; with 8, every stream past index 7 was silently
+ * dropped by the demuxer. */
+#define LUMEN_MAX_STREAMS 32
+#define LUMEN_MAX_SUB_TRACKS 32
 #define LUMEN_PENDING_QUEUE_MAX 16
 #define LUMEN_MAX_PLUGIN_INFOS  48
 #define LUMEN_MAX_DISABLED_PAIRS 32   /* max codec-per-container blocks */
@@ -51,7 +55,8 @@ typedef enum {
 
 typedef enum {
     LUMEN_STREAM_VIDEO = 1,
-    LUMEN_STREAM_AUDIO = 2
+    LUMEN_STREAM_AUDIO = 2,
+    LUMEN_STREAM_SUBTITLE = 3   /* v16 */
 } lumen_stream_type_t;
 
 typedef enum {
@@ -96,6 +101,14 @@ typedef struct {
      * on a 2.0s test file versus ffmpeg's reference decode). Same
      * zero-default convention as skip_samples_start. */
     int       skip_samples_end;
+    /* v16. Presentation time and duration in MILLISECONDS on the same
+     * timeline the video decoder's frame pts use (0 = first video frame),
+     * or -1 if unknown. `pts` above stays in raw container ticks for
+     * backward compatibility; these exist because a decoder never learns
+     * the stream's time_base. Currently only consumed for subtitle
+     * packets, whose cue timing comes straight from the container. */
+    int64_t   pts_ms;
+    int64_t   duration_ms;
 } lumen_packet_t;
 
 /* One entry per elementary stream a demuxer found in the file. A typical
@@ -129,6 +142,12 @@ typedef struct {
      * which happens after every decoder is already done with it. */
     const uint8_t       *extradata;
     int                   extradata_size;
+    /* v16. From container metadata where present (Matroska/MP4 tags),
+     * else empty. Used to label tracks in the Subtitles menu. */
+    char                  language[8];   /* ISO 639-2, e.g. "eng" */
+    char                  title[64];     /* e.g. "English (SDH)" */
+    int                   is_default;    /* container's "default track" flag */
+    int                   is_forced;     /* "forced" subtitles (foreign dialogue only) */
 } lumen_stream_desc_t;
 
 typedef struct {
@@ -158,6 +177,13 @@ typedef struct {
             int      sample_fmt; /* lumen_samplefmt_t */
             int      nb_samples; /* samples per channel in this buffer */
         } audio;
+        /* v16. One subtitle cue. Plain UTF-8, lines separated by '\n',
+         * styling/override tags already stripped by the decoder. */
+        struct {
+            char    *text;
+            int64_t  start_ms;
+            int64_t  end_ms;     /* -1 = until the next cue replaces it */
+        } subtitle;
     };
 } lumen_frame_t;
 
@@ -333,10 +359,28 @@ typedef struct {
 #define LUMEN_PKG_UI_DEMUXER    0   /* container reader  */
 #define LUMEN_PKG_UI_VIDEO      1   /* video decoder     */
 #define LUMEN_PKG_UI_AUDIO      2   /* audio decoder     */
+#define LUMEN_PKG_UI_SUBTITLE   3   /* subtitle decoder (v16) */
     lumen_pkg_ui_entry_t pkg_entries[LUMEN_PKG_UI_MAX];
     int                  pkg_entry_count;
     /* Set by Package Manager after Install -- main.c rescans and refreshes pkg_entries */
     int                  rescan_packages_requested;
+
+    /* ---- Subtitles (v16) ----
+     * player_core.c owns the cues. It publishes the track list and the
+     * text to show RIGHT NOW (for the selected track at position_ms), so
+     * an output plugin only ever reads subtitle_text and draws it. */
+    struct {
+        char label[96];   /* "English (SDH) [SRT]", "movie.en.srt" */
+        int  available;   /* 0 = listed but can't be shown (image-based) */
+        int  external;    /* 1 = added via "Add Subtitle Track..." */
+    } subtitle_tracks[LUMEN_MAX_SUB_TRACKS];
+    int  subtitle_track_count;
+    int  subtitle_selected;          /* index into subtitle_tracks, -1 = None. UI writes. */
+    char subtitle_text[1024];        /* current on-screen text, "" = nothing. Core writes. */
+    /* UI sets these after the "Add Subtitle Track..." dialog; the core
+     * loads the file, adds + selects the track, then clears the flag. */
+    char subtitle_add_path[512];
+    int  subtitle_add_requested;
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */
@@ -396,6 +440,7 @@ typedef struct lumen_decoder_ctx lumen_decoder_ctx_t; /* opaque, plugin-owned */
 
 #define LUMEN_PROBE_VIDEO 1
 #define LUMEN_PROBE_AUDIO 2
+#define LUMEN_PROBE_SUBTITLE 3
 
 typedef struct {
     /* Returns 0 if this decoder cannot handle the fourcc. Nonzero means

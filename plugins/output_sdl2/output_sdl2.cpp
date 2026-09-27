@@ -90,7 +90,8 @@ struct lumen_output_ctx {
     SDL_atomic_t dialog_running;       /* 1 while the dialog is open */
     SDL_atomic_t dialog_result_ready;  /* 1 when thread has a path waiting */
     char         dialog_result_path[512];
-    int          dialog_purpose;       /* 0 = add_to_queue, 1 = open_file */
+    int          dialog_purpose;       /* 0 = add_to_queue, 1 = open_file, 2 = add subtitle track */
+    ImFont      *sub_font;             /* large font for subtitles; NULL = use the UI font */
     float        volume_before_mute;   /* saved for the mute/unmute toggle */
 
     /* ---- Package Manager (second system window) ---- */
@@ -115,15 +116,23 @@ struct lumen_output_ctx {
 static int SDLCALL file_dialog_thread(void *userdata) {
     lumen_output_ctx_t *ctx = (lumen_output_ctx_t *)userdata;
 
-    static const char *patterns[] = {
+    static const char *media_patterns[] = {
         "*.mp4", "*.m4v", "*.mov", "*.m4a",
         "*.mkv", "*.webm", "*.avi",
         "*.h264", "*.264", "*.aac"
     };
-    char *picked = tinyfd_openFileDialog(
-        "qqvideo -- Add to Queue", "",
-        (int)(sizeof(patterns) / sizeof(patterns[0])),
-        patterns, "Media files", 0);
+    static const char *sub_patterns[] = { "*.srt", "*.ass", "*.ssa", "*.vtt" };
+    char *picked;
+    if (ctx->dialog_purpose == 2) {
+        picked = tinyfd_openFileDialog("qqvideo -- Add Subtitle Track", "",
+            (int)(sizeof(sub_patterns) / sizeof(sub_patterns[0])),
+            sub_patterns, "Subtitle files", 0);
+    } else {
+        picked = tinyfd_openFileDialog(
+            ctx->dialog_purpose == 1 ? "qqvideo -- Open File" : "qqvideo -- Add to Queue", "",
+            (int)(sizeof(media_patterns) / sizeof(media_patterns[0])),
+            media_patterns, "Media files", 0);
+    }
 
     /* Immediate stack copy from tinyfd's static buffer -- narrows the
      * race window with any concurrent tinyfd call to single-instruction width. */
@@ -222,6 +231,15 @@ static int handle_events(lumen_output_ctx_t *ctx) {
             }
             if (e.key.keysym.scancode == SDL_SCANCODE_F || e.key.keysym.scancode == SDL_SCANCODE_F11) {
                 toggle_fullscreen(ctx);
+            }
+            /* V: cycle None -> each available subtitle track -> None (VLC's key) */
+            if (e.key.keysym.scancode == SDL_SCANCODE_V &&
+                !ImGui::GetIO().WantCaptureKeyboard &&
+                ctx->state && ctx->state->has_file) {
+                lumen_playback_state_t *st = ctx->state;
+                int next = st->subtitle_selected + 1;
+                while (next < st->subtitle_track_count && !st->subtitle_tracks[next].available) next++;
+                st->subtitle_selected = (next < st->subtitle_track_count) ? next : -1;
             }
             if (e.key.keysym.scancode == SDL_SCANCODE_SPACE &&
                 !ImGui::GetIO().WantCaptureKeyboard &&
@@ -452,10 +470,10 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
                 int count = state ? state->pkg_entry_count : 0;
 
                 /* Section headers */
-                const int TYPES[] = {LUMEN_PKG_UI_DEMUXER, LUMEN_PKG_UI_VIDEO, LUMEN_PKG_UI_AUDIO};
-                const char *LABELS[] = {"Demuxers (container readers)", "Video Decoders", "Audio Decoders"};
+                const int TYPES[] = {LUMEN_PKG_UI_DEMUXER, LUMEN_PKG_UI_VIDEO, LUMEN_PKG_UI_AUDIO, LUMEN_PKG_UI_SUBTITLE};
+                const char *LABELS[] = {"Demuxers (container readers)", "Video Decoders", "Audio Decoders", "Subtitle Decoders"};
 
-                for (int ti = 0; ti < 3; ti++) {
+                for (int ti = 0; ti < 4; ti++) {
                     /* Section header row */
                     ImGui::TableNextRow(ImGuiTableRowFlags_None, 20.0f);
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(210,215,230,220));
@@ -474,7 +492,7 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
 
                         ImGui::TableSetColumnIndex(1);
                         ImGui::TextDisabled("%s",
-                            ti==0 ? "Demuxer" : ti==1 ? "Video" : "Audio");
+                            ti==0 ? "Demuxer" : ti==1 ? "Video" : ti==2 ? "Audio" : "Subtitle");
 
                         /* Empty dir_path = provided by the system FFmpeg
                          * (see push_pkg_entries_system in main.c): there is
@@ -553,11 +571,13 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
                         ImGui::Indent(12.f);
                         for (int ci = 0; ci < count; ci++) {
                             const lumen_pkg_ui_entry_t &k = state->pkg_entries[ci];
-                            if ((k.type != LUMEN_PKG_UI_VIDEO && k.type != LUMEN_PKG_UI_AUDIO)
+                            if ((k.type != LUMEN_PKG_UI_VIDEO && k.type != LUMEN_PKG_UI_AUDIO &&
+                                 k.type != LUMEN_PKG_UI_SUBTITLE)
                                 || !k.installed) continue;
                             bool blocked = pkg_is_disabled(ctx, d.plugin, k.plugin);
                             ImVec4 col = blocked ? ImVec4(0.85f,0.55f,0.0f,1.f) : col_inst;
-                            const char *kind = (k.type==LUMEN_PKG_UI_VIDEO)?"Video":"Audio";
+                            const char *kind = (k.type==LUMEN_PKG_UI_VIDEO)?"Video":
+                                               (k.type==LUMEN_PKG_UI_AUDIO)?"Audio":"Subtitle";
                             ImGui::PushStyleColor(ImGuiCol_Text, col);
                             ImGui::Text("[%s] %s -- %s", kind,
                                 k.name[0]?k.name:k.plugin, blocked?"DISABLED":"enabled");
@@ -603,15 +623,13 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *state = ctx->state;
     if (!state) return;
 
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            bool dialog_open = SDL_AtomicGet(&ctx->dialog_running) != 0;
+    bool dialog_open = SDL_AtomicGet(&ctx->dialog_running) != 0;
 
-            /* Both "Open File" and "Add to Queue" use the same background
-             * thread so the decode/render loop keeps running while the user
-             * picks a file. dialog_purpose distinguishes how the result is
-             * used in pump_ui (0 = append to queue, 1 = replace queue). */
-            auto spawn_dialog = [ctx](int purpose) {
+    /* Every file picker (Open File, Add to Queue, Add Subtitle Track) uses
+     * the same background thread so the decode/render loop keeps running
+     * while the user picks a file. dialog_purpose tells pump_ui how to use
+     * the result (0 = append to queue, 1 = replace queue, 2 = subtitle). */
+    auto spawn_dialog = [ctx](int purpose) {
                 if (ctx->dialog_thread) {
                     SDL_WaitThread(ctx->dialog_thread, NULL);
                     ctx->dialog_thread = NULL;
@@ -624,7 +642,10 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
                     fprintf(stderr, "lumen: SDL_CreateThread failed: %s\n", SDL_GetError());
                     SDL_AtomicSet(&ctx->dialog_running, 0);
                 }
-            };
+    };
+
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
 
             if (ImGui::MenuItem("Open File...", NULL, false, !dialog_open)) {
                 spawn_dialog(1); /* purpose 1: replace queue with selected file */
@@ -638,6 +659,32 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             ImGui::Separator();
             if (ImGui::MenuItem("Quit")) {
                 state->quit_requested = 1;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Subtitles")) {
+            bool has_file = state->has_file != 0;
+            if (ImGui::MenuItem("Add Subtitle Track...", NULL, false, has_file && !dialog_open)) {
+                spawn_dialog(2);
+            }
+            if (!has_file) ImGui::SetItemTooltip("Open a video first");
+            else if (dialog_open) ImGui::SetItemTooltip("Waiting for file picker...");
+
+            if (ImGui::BeginMenu("Subtitle Track", has_file)) {
+                if (ImGui::MenuItem("None", NULL, state->subtitle_selected < 0)) {
+                    state->subtitle_selected = -1;
+                }
+                if (state->subtitle_track_count > 0) ImGui::Separator();
+                for (int i = 0; i < state->subtitle_track_count; i++) {
+                    char item[128];
+                    /* ##id suffix keeps two tracks with the same label distinct */
+                    snprintf(item, sizeof(item), "%s##sub%d", state->subtitle_tracks[i].label, i);
+                    if (ImGui::MenuItem(item, NULL, state->subtitle_selected == i,
+                                        state->subtitle_tracks[i].available != 0)) {
+                        state->subtitle_selected = i;
+                    }
+                }
+                ImGui::EndMenu();
             }
             ImGui::EndMenu();
         }
@@ -904,6 +951,104 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     ImGui::End();
 }
 
+/* Where the video picture lands in the window (letterboxed, aspect kept).
+ * Shared by the texture blit and the subtitle renderer so text always sits
+ * on the picture itself, not on the black bars. Returns false if there's
+ * no video to place. */
+static bool video_dest_rect(lumen_output_ctx_t *ctx, int win_w, int win_h,
+                            float menu_h, float ctrl_h, SDL_Rect *dest) {
+    if (!ctx->texture || ctx->width <= 0 || ctx->height <= 0 || !ctx->state || !ctx->state->has_file)
+        return false;
+    /* Fullscreen: fill the whole screen, bars overlay the video.
+     * Windowed: inset below the menu bar and above the control bar. */
+    int area_y, area_h;
+    if (ctx->fullscreen) {
+        area_y = 0;
+        area_h = win_h;
+    } else {
+        area_y = (int)menu_h;
+        area_h = win_h - (int)menu_h - (int)ctrl_h;
+    }
+    if (area_h < 1) area_h = 1;
+
+    double video_aspect = (double)ctx->width / (double)ctx->height;
+    double area_aspect  = (double)win_w / (double)area_h;
+    if (area_aspect > video_aspect) {
+        dest->h = area_h;
+        dest->w = (int)(area_h * video_aspect);
+        dest->x = (win_w - dest->w) / 2;
+        dest->y = area_y;
+    } else {
+        dest->w = win_w;
+        dest->h = (int)(win_w / video_aspect);
+        dest->x = 0;
+        dest->y = area_y + (area_h - dest->h) / 2;
+    }
+    return true;
+}
+
+/* Subtitles: white text with a black outline, centered near the bottom of
+ * the picture, sized relative to the picture height (so it scales with the
+ * window and fullscreen), word-wrapped at 90% of the picture width. Drawn
+ * on ImGui's background draw list: that renders after the video texture
+ * but beneath every menu, popup and panel. */
+static void draw_subtitles(lumen_output_ctx_t *ctx, const SDL_Rect &v, int win_h,
+                           bool controls_shown, float ctrl_h) {
+    const char *text = ctx->state->subtitle_text;
+    if (!text[0]) return;
+
+    ImFont *font = ctx->sub_font ? ctx->sub_font : ImGui::GetFont();
+    float size = (float)v.h * 0.055f;
+    if (size < 16.0f) size = 16.0f;
+    if (size > 72.0f) size = 72.0f;
+    float scale = size / font->FontSize;
+    float wrap_w = (float)v.w * 0.90f;
+
+    /* Split on explicit newlines, then word-wrap each piece. */
+    struct { const char *b, *e; } lines[48];
+    int n = 0;
+    const char *p = text;
+    while (*p && n < 48) {
+        const char *eol = strchr(p, '\n');
+        if (!eol) eol = p + strlen(p);
+        const char *b = p;
+        while (b < eol && n < 48) {
+            const char *brk = font->CalcWordWrapPositionA(scale, b, eol, wrap_w);
+            if (brk <= b) brk = eol;                  /* single overlong word */
+            const char *e = brk;
+            while (e > b && e[-1] == ' ') e--;        /* no trailing spaces */
+            lines[n].b = b; lines[n].e = e; n++;
+            b = brk;
+            while (b < eol && *b == ' ') b++;         /* no leading spaces */
+        }
+        if (b == p && n < 48) { lines[n].b = p; lines[n].e = p; n++; } /* blank line */
+        p = (*eol == '\n') ? eol + 1 : eol;
+    }
+
+    float line_h = size * 1.15f;
+    float bottom = (float)(v.y + v.h) - (float)v.h * 0.06f;
+    /* Fullscreen with the control bar showing: lift text above the bar
+     * instead of hiding it underneath. */
+    if (controls_shown && bottom > (float)win_h - ctrl_h - 8.0f)
+        bottom = (float)win_h - ctrl_h - 8.0f;
+    float y = bottom - line_h * (float)n;
+
+    ImDrawList *dl = ImGui::GetBackgroundDrawList();
+    float o = size * 0.06f;
+    if (o < 1.5f) o = 1.5f;
+    const ImU32 outline = IM_COL32(0, 0, 0, 230), fill = IM_COL32(255, 255, 255, 255);
+    static const float dirs[8][2] = {{-1,-1},{0,-1},{1,-1},{-1,0},{1,0},{-1,1},{0,1},{1,1}};
+    for (int i = 0; i < n; i++, y += line_h) {
+        if (lines[i].b == lines[i].e) continue;
+        float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, lines[i].b, lines[i].e).x;
+        ImVec2 pos((float)v.x + ((float)v.w - w) * 0.5f, y);
+        for (int d = 0; d < 8; d++)
+            dl->AddText(font, size, ImVec2(pos.x + dirs[d][0] * o, pos.y + dirs[d][1] * o),
+                        outline, lines[i].b, lines[i].e);
+        dl->AddText(font, size, pos, fill, lines[i].b, lines[i].e);
+    }
+}
+
 static void maybe_redraw(lumen_output_ctx_t *ctx) {
     Uint64 now = SDL_GetTicks64();
     if (ctx->have_last_redraw && (now - ctx->last_ui_redraw_ticks) < LUMEN_UI_REDRAW_INTERVAL_MS) {
@@ -982,10 +1127,13 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
         }
     }
 
-    ImGui::Render();
-
     int win_w, win_h;
     SDL_GetWindowSize(ctx->window, &win_w, &win_h);
+    SDL_Rect dest;
+    bool have_video = video_dest_rect(ctx, win_w, win_h, menu_h, ctrl_h, &dest);
+    if (have_video) draw_subtitles(ctx, dest, win_h, ctx->fullscreen && show_controls, ctrl_h);
+
+    ImGui::Render();
 
     /* Window title update (unchanged) */
     lumen_playback_state_t *state = ctx->state;
@@ -1006,41 +1154,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     SDL_SetRenderDrawColor(ctx->renderer, 0, 0, 0, 255);
     SDL_RenderClear(ctx->renderer);
 
-    if (ctx->texture && ctx->width > 0 && ctx->height > 0
-            && ctx->state && ctx->state->has_file) {
-        /* Video rect:
-         * - Fullscreen: fill the ENTIRE screen. The overlay bars are drawn
-         *   on top of the video (semi-transparent ImGui windows). The user
-         *   asked for this behaviour -- no wasted border space.
-         * - Windowed: inset below the menu bar and above the control bar,
-         *   same as before, so the bars never cover the video. */
-        int area_y, area_h;
-        if (ctx->fullscreen) {
-            area_y = 0;
-            area_h = win_h;
-        } else {
-            area_y = (int)menu_h;
-            area_h = win_h - (int)menu_h - (int)ctrl_h;
-        }
-        if (area_h < 1) area_h = 1;
-
-        double video_aspect = (double)ctx->width  / (double)ctx->height;
-        double area_aspect  = (double)win_w        / (double)area_h;
-
-        SDL_Rect dest;
-        if (area_aspect > video_aspect) {
-            dest.h = area_h;
-            dest.w = (int)(area_h * video_aspect);
-            dest.x = (win_w - dest.w) / 2;
-            dest.y = area_y;
-        } else {
-            dest.w = win_w;
-            dest.h = (int)(win_w / video_aspect);
-            dest.x = 0;
-            dest.y = area_y + (area_h - dest.h) / 2;
-        }
-        SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
-    }
+    if (have_video) SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
 
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ctx->renderer);
     SDL_RenderPresent(ctx->renderer);
@@ -1145,6 +1259,26 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
         if (!font) {
             fprintf(stderr, "lumen: failed to load embedded Roboto font -- falling back to ProggyClean\n");
             IM_FREE(font_copy);  /* only free on failure; success means ImGui owns it */
+        } else {
+            /* Second, large copy of Roboto just for subtitles. Rasterized at
+             * 48px so it stays crisp when scaled to video size, with extra
+             * glyph ranges subtitles actually use: accented Latin (Latin
+             * Extended-A) and General Punctuation -- curly quotes, em dashes,
+             * ellipses -- which the UI font's default range lacks and would
+             * otherwise render as '?'. */
+            static const ImWchar sub_ranges[] = {
+                0x0020, 0x00FF,   /* Basic Latin + Latin-1 */
+                0x0100, 0x017F,   /* Latin Extended-A */
+                0x2010, 0x205E,   /* General Punctuation */
+                0x266A, 0x266B,   /* music notes (lyrics) -- used if the font has them */
+                0,
+            };
+            void *sub_copy = IM_ALLOC(lumen_font_size);
+            if (sub_copy) {
+                memcpy(sub_copy, lumen_font_data, lumen_font_size);
+                ctx->sub_font = io.Fonts->AddFontFromMemoryTTF(sub_copy, (int)lumen_font_size, 48.0f, NULL, sub_ranges);
+                if (!ctx->sub_font) IM_FREE(sub_copy);
+            }
         }
     } else {
         fprintf(stderr, "lumen: failed to allocate font buffer -- falling back to ProggyClean\n");
@@ -1249,7 +1383,14 @@ static int sdl2_pump_ui(lumen_output_ctx_t *ctx, lumen_playback_state_t *state) 
     if (SDL_AtomicGet(&ctx->dialog_result_ready) && state) {
         SDL_LockMutex(ctx->dialog_mutex);
         bool has_path = ctx->dialog_result_path[0] != '\0';
-        if (ctx->dialog_purpose == 1) {
+        if (ctx->dialog_purpose == 2) {
+            /* Add Subtitle Track: the core loads it on its next loop pass */
+            if (has_path) {
+                strncpy(state->subtitle_add_path, ctx->dialog_result_path, 511);
+                state->subtitle_add_path[511] = '\0';
+                state->subtitle_add_requested = 1;
+            }
+        } else if (ctx->dialog_purpose == 1) {
             /* Open File: write path for main.c and signal it to switch files.
              * On cancel (empty path) we do nothing -- playback continues. */
             if (has_path) {

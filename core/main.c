@@ -319,7 +319,8 @@ static void print_system_codecs(void) {
     for (int i = 0; i < sys_codec_count; i++) {
         const sys_codec_t *c = &sys_codecs[i];
         printf("  [%s] %-5s %s\n", c->available ? "OK  " : "----", c->fourcc,
-               c->available ? (c->kind == LUMEN_PROBE_AUDIO ? "audio" : "video")
+               c->available ? (c->kind == LUMEN_PROBE_AUDIO ? "audio" :
+                            c->kind == LUMEN_PROBE_SUBTITLE ? "subtitle" : "video")
                             : "not in system FFmpeg");
     }
 }
@@ -357,7 +358,9 @@ static void push_pkg_entries_system(lumen_session_t *session, const lumen_regist
         strncpy(e->plugin, c->fourcc, sizeof(e->plugin) - 1);
         /* Unavailable codecs have kind 0; the manifest order puts video
          * first, but don't guess -- file unknowns under video. */
-        e->type = (c->kind == LUMEN_PROBE_AUDIO) ? LUMEN_PKG_UI_AUDIO : LUMEN_PKG_UI_VIDEO;
+        e->type = (c->kind == LUMEN_PROBE_AUDIO)    ? LUMEN_PKG_UI_AUDIO
+                : (c->kind == LUMEN_PROBE_SUBTITLE) ? LUMEN_PKG_UI_SUBTITLE
+                : LUMEN_PKG_UI_VIDEO;
         e->installed = c->available;
     }
 }

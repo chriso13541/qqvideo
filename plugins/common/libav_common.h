@@ -33,26 +33,40 @@
 typedef struct {
     const char     *fourcc;   /* what demuxers report / manifests claim */
     enum AVCodecID  id;
-    int             kind;     /* LUMEN_PROBE_VIDEO / LUMEN_PROBE_AUDIO */
+    int             kind;     /* 1 video, 2 audio, 3 subtitle (LUMEN_PROBE_*) */
+    int             bitmap;   /* subtitle rendered as images, not text: known
+                                 (so tracks get a real label) but decoder_libav
+                                 won't claim it until there's a bitmap renderer */
 } lumen_libav_codec_t;
 
 static const lumen_libav_codec_t LUMEN_LIBAV_CODECS[] = {
     /* video */
-    { "H264", AV_CODEC_ID_H264,       1 },
-    { "HEVC", AV_CODEC_ID_HEVC,       1 },
-    { "AV01", AV_CODEC_ID_AV1,        1 },
-    { "VP09", AV_CODEC_ID_VP9,        1 },
-    { "VP08", AV_CODEC_ID_VP8,        1 },
-    { "MPG2", AV_CODEC_ID_MPEG2VIDEO, 1 },
-    { "MP4V", AV_CODEC_ID_MPEG4,      1 },
+    { "H264", AV_CODEC_ID_H264,       1, 0 },
+    { "HEVC", AV_CODEC_ID_HEVC,       1, 0 },
+    { "AV01", AV_CODEC_ID_AV1,        1, 0 },
+    { "VP09", AV_CODEC_ID_VP9,        1, 0 },
+    { "VP08", AV_CODEC_ID_VP8,        1, 0 },
+    { "MPG2", AV_CODEC_ID_MPEG2VIDEO, 1, 0 },
+    { "MP4V", AV_CODEC_ID_MPEG4,      1, 0 },
     /* audio */
-    { "AAC",  AV_CODEC_ID_AAC,        2 },
-    { "MP3",  AV_CODEC_ID_MP3,        2 },
-    { "OPUS", AV_CODEC_ID_OPUS,       2 },
-    { "VORB", AV_CODEC_ID_VORBIS,     2 },
-    { "FLAC", AV_CODEC_ID_FLAC,       2 },
-    { "AC3",  AV_CODEC_ID_AC3,        2 },
-    { "EAC3", AV_CODEC_ID_EAC3,       2 },
+    { "AAC",  AV_CODEC_ID_AAC,        2, 0 },
+    { "MP3",  AV_CODEC_ID_MP3,        2, 0 },
+    { "OPUS", AV_CODEC_ID_OPUS,       2, 0 },
+    { "VORB", AV_CODEC_ID_VORBIS,     2, 0 },
+    { "FLAC", AV_CODEC_ID_FLAC,       2, 0 },
+    { "AC3",  AV_CODEC_ID_AC3,        2, 0 },
+    { "EAC3", AV_CODEC_ID_EAC3,       2, 0 },
+    /* subtitles: text-based (decoded to plain text) */
+    { "SRT",  AV_CODEC_ID_SUBRIP,     3, 0 },
+    { "ASS",  AV_CODEC_ID_ASS,        3, 0 },
+    { "SSA",  AV_CODEC_ID_SSA,        3, 0 },
+    { "WVTT", AV_CODEC_ID_WEBVTT,     3, 0 },
+    { "TX3G", AV_CODEC_ID_MOV_TEXT,   3, 0 },   /* MP4 timed text */
+    { "TEXT", AV_CODEC_ID_TEXT,       3, 0 },
+    /* subtitles: image-based (listed, not yet decodable) */
+    { "PGS",  AV_CODEC_ID_HDMV_PGS_SUBTITLE, 3, 1 },  /* Blu-ray */
+    { "VOBS", AV_CODEC_ID_DVD_SUBTITLE,      3, 1 },  /* DVD */
+    { "DVBS", AV_CODEC_ID_DVB_SUBTITLE,      3, 1 },  /* broadcast */
 };
 #define LUMEN_LIBAV_CODEC_COUNT (int)(sizeof(LUMEN_LIBAV_CODECS) / sizeof(LUMEN_LIBAV_CODECS[0]))
 

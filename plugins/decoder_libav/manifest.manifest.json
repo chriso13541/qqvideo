@@ -3,6 +3,27 @@
   "kind": "decoder",
   "version": "0.3.0",
   "library": "decoder_libav",
-  "claims": { "fourccs": ["H264", "HEVC", "AV01", "VP09", "VP08", "MPG2", "MP4V",
-                          "AAC", "MP3", "OPUS", "VORB", "FLAC", "AC3", "EAC3"] }
+  "claims": {
+    "fourccs": [
+      "H264",
+      "HEVC",
+      "AV01",
+      "VP09",
+      "VP08",
+      "MPG2",
+      "MP4V",
+      "AAC",
+      "MP3",
+      "OPUS",
+      "VORB",
+      "FLAC",
+      "AC3",
+      "EAC3",
+      "SRT",
+      "ASS",
+      "WVTT",
+      "TX3G",
+      "TEXT"
+    ]
+  }
 }

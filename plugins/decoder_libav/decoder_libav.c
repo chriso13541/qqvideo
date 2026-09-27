@@ -54,6 +54,7 @@ struct lumen_decoder_ctx {
 static int libav_probe(const char *codec_fourcc) {
     const lumen_libav_codec_t *c = lumen_libav_by_fourcc(codec_fourcc);
     if (!c) return 0;                           /* not on the allowlist */
+    if (c->bitmap) return 0;                    /* image subtitles: no renderer yet */
     if (!avcodec_find_decoder(c->id)) return 0; /* system FFmpeg built without it */
     return c->kind;
 }
@@ -74,7 +75,13 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
     ctx->avctx = avcodec_alloc_context3(codec);
     if (!ctx->avctx) { free(ctx); return -1; }
 
-    if (c->kind == LUMEN_PROBE_VIDEO) {
+    if (c->kind == LUMEN_PROBE_SUBTITLE) {
+        if (c->bitmap) { avcodec_free_context(&ctx->avctx); free(ctx); return -1; }
+        /* The demuxer hands us pts_ms/duration_ms, so tell libavcodec the
+         * packet clock is milliseconds: it then fills AVSubtitle.pts and
+         * end_display_time (from packet duration) on that same clock. */
+        ctx->avctx->pkt_timebase = (AVRational){1, 1000};
+    } else if (c->kind == LUMEN_PROBE_VIDEO) {
         double fps = (stream->frame_rate > 0.0) ? stream->frame_rate : 30.0;
         ctx->frame_duration_ms = 1000.0 / fps;
     } else {
@@ -216,9 +223,102 @@ static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, 
     return 0;
 }
 
+/* ---- subtitles: libavcodec ASS events -> plain text ---------------- */
+
+/* Every text subtitle decoder in libavcodec (SubRip, WebVTT, mov_text,
+ * ASS itself) outputs ASS "Dialogue" events:
+ *     ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+ * so one converter handles all of them. The Text field can contain:
+ *   {\i1}, {\an8}, {\c&H00FF00&} ...  override tags  -> dropped
+ *   \N / \n                            line breaks     -> '\n'
+ *   \h                                  hard space      -> ' '
+ *   {\p1} m 0 0 l 100 0 ... {\p0}      vector drawing  -> skipped entirely
+ *     (without that last rule, typesetting in anime/fansub ASS files would
+ *      show up as lines of raw drawing coordinates) */
+static void append_plain(const char *ass, char *out, size_t cap, size_t *len) {
+    const char *t = ass;
+    for (int commas = 0; *t && commas < 8; t++)
+        if (*t == ',') commas++;
+
+    int drawing = 0;
+    size_t start_len = *len;
+    while (*t && *len + 1 < cap) {
+        if (*t == '{') {
+            const char *close = strchr(t, '}');
+            if (!close) break;
+            for (const char *q = t; q < close; q++) {        /* look for \pN */
+                if (q[0] == '\\' && q[1] == 'p' && q[2] >= '0' && q[2] <= '9')
+                    drawing = (q[2] != '0');
+            }
+            t = close + 1;
+            continue;
+        }
+        if (t[0] == '\\' && (t[1] == 'N' || t[1] == 'n')) { if (!drawing) out[(*len)++] = '\n'; t += 2; continue; }
+        if (t[0] == '\\' && t[1] == 'h')                   { if (!drawing) out[(*len)++] = ' ';  t += 2; continue; }
+        if (!drawing && *t != '\r') out[(*len)++] = *t;
+        t++;
+    }
+    /* trim trailing whitespace/newlines this event added */
+    while (*len > start_len && (out[*len - 1] == '\n' || out[*len - 1] == ' ')) (*len)--;
+    out[*len] = '\0';
+}
+
+static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
+    AVSubtitle sub;
+    int got = 0;
+    ctx->avpkt->data = pkt->data;
+    ctx->avpkt->size = (int)pkt->size;
+    ctx->avpkt->pts = pkt->pts_ms >= 0 ? pkt->pts_ms : AV_NOPTS_VALUE;
+    ctx->avpkt->duration = pkt->duration_ms > 0 ? pkt->duration_ms : 0;
+    if (avcodec_decode_subtitle2(ctx->avctx, &sub, &got, ctx->avpkt) < 0) return -1;
+    if (!got) return 1;
+
+    char text[1024];
+    size_t len = 0;
+    text[0] = '\0';
+    for (unsigned i = 0; i < sub.num_rects; i++) {
+        const AVSubtitleRect *r = sub.rects[i];
+        const char *src = (r->type == SUBTITLE_ASS) ? r->ass : (r->type == SUBTITLE_TEXT ? r->text : NULL);
+        if (!src || !*src) continue;
+        if (len > 0 && len + 1 < sizeof(text)) text[len++] = '\n';
+        if (r->type == SUBTITLE_ASS) {
+            append_plain(src, text, sizeof(text), &len);
+        } else {
+            size_t n = strlen(src);
+            if (len + n >= sizeof(text)) n = sizeof(text) - len - 1;
+            memcpy(text + len, src, n);
+            len += n;
+            text[len] = '\0';
+        }
+    }
+
+    int64_t base = (sub.pts != AV_NOPTS_VALUE) ? sub.pts / 1000 : pkt->pts_ms;
+    int64_t start = base + sub.start_display_time;
+    int64_t end = -1;
+    if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX)
+        end = base + sub.end_display_time;
+    else if (pkt->duration_ms > 0)
+        end = start + pkt->duration_ms;
+    avsubtitle_free(&sub);
+
+    /* Empty events are "clear the screen" markers (mov_text uses them
+     * between lines); with end times on every real cue, nothing to emit. */
+    if (len == 0 || base < 0) return 1;
+
+    memset(out, 0, sizeof(*out));
+    out->type = LUMEN_STREAM_SUBTITLE;
+    out->pts = start;
+    out->subtitle.text = strdup(text);
+    out->subtitle.start_ms = start;
+    out->subtitle.end_ms = end;
+    return out->subtitle.text ? 0 : -1;
+}
+
 /* ---- vtable -------------------------------------------------------- */
 
 static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
+    if (ctx->kind == LUMEN_PROBE_SUBTITLE) return decode_subtitle(ctx, pkt, out);
+
     ctx->avpkt->data = pkt->data;
     ctx->avpkt->size = (int)pkt->size;
     /* Audio pts is our own emit counter, and we don't know the stream
@@ -238,6 +338,7 @@ static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lum
 }
 
 static int libav_drain(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
+    if (ctx->kind == LUMEN_PROBE_SUBTITLE) return 1;  /* subtitle decoders don't buffer */
     if (!ctx->flush_sent) {
         avcodec_send_packet(ctx->avctx, NULL);
         ctx->flush_sent = 1;
@@ -253,6 +354,9 @@ static int libav_drain(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
 static void libav_frame_free(lumen_frame_t *frame) {
     if (frame->type == LUMEN_STREAM_VIDEO) {
         for (int p = 0; p < 4; p++) { free(frame->video.planes[p]); frame->video.planes[p] = NULL; }
+    } else if (frame->type == LUMEN_STREAM_SUBTITLE) {
+        free(frame->subtitle.text);
+        frame->subtitle.text = NULL;
     } else {
         free(frame->audio.data);
         frame->audio.data = NULL;

@@ -46,10 +46,31 @@ struct lumen_decoder_ctx {
     int64_t         last_pts_ms;          /* last emitted pts, for the no-pts fallback */
     int64_t         samples_out;          /* audio: samples emitted, for the no-pts fallback */
 
+    uint8_t        *pad_buf;              /* packet copy + zeroed padding, see padded() */
+    size_t          pad_cap;
     struct SwsContext *sws;               /* video: lazily created, only if needed */
     SwrContext        *swr;               /* audio: lazily created on first frame */
     int                channels;
 };
+
+/* libavcodec needs AV_INPUT_BUFFER_PADDING_SIZE zero bytes after every
+ * packet (decoders over-read for speed; text subtitle decoders need the 0
+ * to find the end of the string -- without it, SRT cues picked up stale
+ * heap bytes: "arrest him.>!"). The Lumen ABI never promised padding, so
+ * rather than trust each demuxer, copy into our own padded buffer. The
+ * copy is tiny next to decoding the packet. */
+static uint8_t *padded(lumen_decoder_ctx_t *ctx, const uint8_t *data, size_t size) {
+    size_t need = size + AV_INPUT_BUFFER_PADDING_SIZE;
+    if (need > ctx->pad_cap) {
+        uint8_t *n = (uint8_t *)realloc(ctx->pad_buf, need);
+        if (!n) return NULL;
+        ctx->pad_buf = n;
+        ctx->pad_cap = need;
+    }
+    if (size) memcpy(ctx->pad_buf, data, size);
+    memset(ctx->pad_buf + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    return ctx->pad_buf;
+}
 
 /* ---- probe --------------------------------------------------------- */
 
@@ -294,7 +315,8 @@ static void append_plain(const char *ass, char *out, size_t cap, size_t *len) {
 static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
     AVSubtitle sub;
     int got = 0;
-    ctx->avpkt->data = pkt->data;
+    ctx->avpkt->data = padded(ctx, pkt->data, pkt->size);
+    if (!ctx->avpkt->data) return -1;
     ctx->avpkt->size = (int)pkt->size;
     ctx->avpkt->pts = pkt->pts_ms >= 0 ? pkt->pts_ms : AV_NOPTS_VALUE;
     ctx->avpkt->duration = pkt->duration_ms > 0 ? pkt->duration_ms : 0;
@@ -347,7 +369,8 @@ static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, 
 static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
     if (ctx->kind == LUMEN_PROBE_SUBTITLE) return decode_subtitle(ctx, pkt, out);
 
-    ctx->avpkt->data = pkt->data;
+    ctx->avpkt->data = padded(ctx, pkt->data, pkt->size);
+    if (!ctx->avpkt->data) return -1;
     ctx->avpkt->size = (int)pkt->size;
     /* Millisecond timestamps from the demuxer (v16 pts_ms), with
      * pkt_timebase = 1/1000 set at open, so frames come out in ms. */
@@ -403,6 +426,7 @@ static void libav_close(lumen_decoder_ctx_t *ctx) {
     if (!ctx) return;
     if (ctx->swr) swr_free(&ctx->swr);
     if (ctx->sws) sws_freeContext(ctx->sws);
+    free(ctx->pad_buf);
     av_frame_free(&ctx->avframe);
     av_packet_free(&ctx->avpkt);
     avcodec_free_context(&ctx->avctx);

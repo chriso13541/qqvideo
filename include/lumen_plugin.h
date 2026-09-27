@@ -109,6 +109,9 @@ typedef struct {
      * packets, whose cue timing comes straight from the container. */
     int64_t   pts_ms;
     int64_t   duration_ms;
+    /* Demuxer authors: FFmpeg-based decoders need 64 zeroed bytes after
+     * `size` (AV_INPUT_BUFFER_PADDING_SIZE). demux_libav provides them and
+     * decoder_libav re-pads defensively; don't assume either elsewhere. */
 } lumen_packet_t;
 
 /* One entry per elementary stream a demuxer found in the file. A typical

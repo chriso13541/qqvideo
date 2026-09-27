@@ -182,8 +182,15 @@ static int libav_read_packet(lumen_demuxer_ctx_t *ctx, lumen_packet_t *out_pkt) 
             continue;
         }
 
-        out_pkt->data = (uint8_t *)malloc(ctx->avpkt->size);
+        /* libavcodec requires AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes
+         * after every packet -- decoders read past the end for speed, and
+         * text subtitle decoders rely on hitting a 0 to find the end of the
+         * string. Without it, the SRT decoder ran on into stale heap bytes
+         * and cues came out as "arrest him.>!" / "arrest him.not...". */
+        out_pkt->data = (uint8_t *)malloc((size_t)ctx->avpkt->size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!out_pkt->data) { av_packet_unref(ctx->avpkt); return -1; }
         memcpy(out_pkt->data, ctx->avpkt->data, ctx->avpkt->size);
+        memset(out_pkt->data + ctx->avpkt->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         out_pkt->size = ctx->avpkt->size;
         out_pkt->pts = ctx->avpkt->pts;
         out_pkt->stream_index = si;

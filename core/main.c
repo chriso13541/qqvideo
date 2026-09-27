@@ -218,6 +218,47 @@ static void push_pkg_entries(lumen_session_t *session,
 }
 
 #ifdef LUMEN_SYSTEM_FFMPEG
+#if !defined(_WIN32)
+  #include <sys/stat.h>
+#endif
+
+/* Where plugins live, relative to the executable's directory, once
+ * installed with `cmake --install` (e.g. bin/ -> ../lib/qqvideo/plugins).
+ * CMakeLists.txt computes this from GNUInstallDirs so it stays right on
+ * multiarch layouts too. */
+#ifndef LUMEN_PLUGIN_RELDIR
+  #define LUMEN_PLUGIN_RELDIR "../lib/qqvideo/plugins"
+#endif
+
+static int dir_exists(const char *p) {
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* Plugin directory search order:
+ *   1. $QQVIDEO_PLUGIN_DIR           -- explicit override, handy for testing
+ *   2. <exe_dir>/plugins             -- running straight from build/bin
+ *   3. <exe_dir>/LUMEN_PLUGIN_RELDIR -- an installed copy (/usr/local/bin/qqvideo)
+ * /proc/self/exe already resolves symlinks, so a symlink to the binary in
+ * ~/.local/bin still finds the real install's plugins. */
+static void resolve_plugins_dir(const char *exe_dir, char *out, size_t n) {
+    const char *env = getenv("QQVIDEO_PLUGIN_DIR");
+    if (env && env[0]) { snprintf(out, n, "%s", env); return; }
+
+    snprintf(out, n, "%s/plugins", exe_dir);
+    if (dir_exists(out)) return;
+
+    char installed[1200];
+    snprintf(installed, sizeof(installed), "%s/%s", exe_dir, LUMEN_PLUGIN_RELDIR);
+    if (dir_exists(installed)) { snprintf(out, n, "%s", installed); return; }
+    /* Neither exists: leave the build-tree path so the error names it. */
+}
+
 /* ---- System-FFmpeg mode (Linux) -------------------------------------
  *
  * Codecs come from whatever FFmpeg the system has -- apt/dnf/pacman's,
@@ -345,8 +386,8 @@ int main(int argc, char **argv) {
     memset(&pkgs, 0, sizeof(pkgs));
 
 #ifdef LUMEN_SYSTEM_FFMPEG
-    char plugins_dir[1100];
-    snprintf(plugins_dir, sizeof(plugins_dir), "%s/plugins", exe_dir);
+    char plugins_dir[1200];
+    resolve_plugins_dir(exe_dir, plugins_dir, sizeof(plugins_dir));
     if (lumen_registry_scan(plugins_dir, &reg) < 0) {
         fprintf(stderr, "lumen: plugins directory not found: %s\n", plugins_dir);
     }

@@ -27,6 +27,20 @@ mkdir build && cd build && cmake .. && make -j$(nproc)
 ./bin/qqvideo --list        # which codecs your FFmpeg actually provides
 ```
 
+To install it system-wide so it shows up in your app launcher (search
+"qqvideo") and under "Open With" for video files:
+
+```
+sudo cmake --install build                  # to /usr/local by default
+sudo cmake --build build --target uninstall # removes exactly what was installed
+```
+
+That installs `bin/qqvideo`, the plugins to `lib/qqvideo/plugins/`, a
+`.desktop` entry, and the icon. Running `./build/bin/qqvideo` straight
+from the build tree keeps working too; the binary checks
+`<exe dir>/plugins` first, then the installed location, and
+`QQVIDEO_PLUGIN_DIR` overrides both.
+
 Minimum is FFmpeg 5.1 (Debian 12). Nothing else to configure: at startup
 qqvideo asks the loaded libavcodec which allowlisted decoders it has, and
 logs exactly which FFmpeg it's running
@@ -43,7 +57,17 @@ git clone https://github.com/FFmpeg/FFmpeg.git && cd FFmpeg && git checkout n7.1
 make -j$(nproc) && sudo make install && sudo ldconfig
 ```
 
-then re-run cmake and rebuild qqvideo. pkg-config searches `/usr/local`
+then re-run cmake and rebuild qqvideo. For any other prefix (say you
+keep several FFmpeg builds side by side), point the build at it:
+
+```
+cmake -S . -B build -DLUMEN_FFMPEG_PREFIX=/opt/ffmpeg-9
+```
+
+The plugins get an RPATH to that prefix, so both the build-tree and the
+installed copy load that FFmpeg with no `LD_LIBRARY_PATH`.
+
+For `/usr/local` none of that is needed: pkg-config searches `/usr/local`
 before `/usr` on Debian/Ubuntu, so the build picks it up automatically,
 and the runtime linker finds it via `/etc/ld.so.conf.d/libc.conf`. Both
 FFmpegs coexist (different sonames, e.g. `libavcodec.so.59` vs `.61`); a

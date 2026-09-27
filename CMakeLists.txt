@@ -46,6 +46,25 @@ else()
 endif()
 option(LUMEN_SYSTEM_FFMPEG "Use the system FFmpeg via pkg-config" ${_lumen_sys_default})
 
+# Optional: use an FFmpeg installed somewhere pkg-config doesn't look by
+# default (e.g. a source build in /opt/ffmpeg-9 or ~/ffmpeg-install).
+# Not needed for /usr/local -- that's searched automatically.
+#   cmake -S . -B build -DLUMEN_FFMPEG_PREFIX=/opt/ffmpeg-9
+set(LUMEN_FFMPEG_PREFIX "" CACHE PATH "FFmpeg install prefix to build against (empty = system default)")
+if (LUMEN_FFMPEG_PREFIX)
+  set(ENV{PKG_CONFIG_PATH}
+      "${LUMEN_FFMPEG_PREFIX}/lib/pkgconfig:${LUMEN_FFMPEG_PREFIX}/lib64/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+endif()
+
+if (UNIX)
+  include(GNUInstallDirs)
+  # Installed plugins keep an RPATH to any non-system library dir they
+  # linked against, so a custom-prefix FFmpeg is still found at runtime
+  # after `cmake --install` -- no LD_LIBRARY_PATH needed. System dirs
+  # (/usr/lib/...) are never added.
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+endif()
+
 # ---- Detect optional build dependencies ---------------------------------
 find_package(PkgConfig QUIET)
 if (PkgConfig_FOUND)
@@ -144,10 +163,64 @@ if (LUMEN_SYSTEM_FFMPEG)
     add_dependencies(qqvideo ${_p})
   endforeach()
 
+  # ---- Install (Linux): sudo cmake --install build ----------------------
+  #   <prefix>/bin/qqvideo
+  #   <prefix>/<libdir>/qqvideo/plugins/   decoder_libav, demux_libav + manifests
+  #   <prefix>/share/applications/qqvideo.desktop
+  #   <prefix>/share/icons/hicolor/64x64/apps/qqvideo.png
+  # Default prefix is /usr/local, which app launchers already search.
+  if (UNIX)
+    set(_lumen_plugin_install_dir "${CMAKE_INSTALL_LIBDIR}/qqvideo/plugins")
+    # Path from bin/ to the plugin dir, baked into main.c so an installed
+    # binary finds its plugins (and still works under `--prefix X`).
+    file(RELATIVE_PATH _lumen_plugin_reldir
+         "${CMAKE_INSTALL_FULL_BINDIR}"
+         "${CMAKE_INSTALL_FULL_LIBDIR}/qqvideo/plugins")
+    target_compile_definitions(qqvideo PRIVATE "LUMEN_PLUGIN_RELDIR=\"${_lumen_plugin_reldir}\"")
+
+    install(TARGETS qqvideo RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(TARGETS decoder_libav demux_libav LIBRARY DESTINATION "${_lumen_plugin_install_dir}")
+    foreach(_p decoder_libav demux_libav)
+      install(FILES "plugins/${_p}/manifest.manifest.json"
+              DESTINATION "${_lumen_plugin_install_dir}"
+              RENAME "${_p}.manifest.json")
+    endforeach()
+    install(FILES resources/qqvideo.desktop
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+    install(FILES resources/qqvideo_64.png
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/64x64/apps"
+            RENAME qqvideo.png)
+
+    # Refresh launcher + icon caches so qqvideo shows up immediately.
+    # Skipped for staged installs (DESTDIR), e.g. when building a .deb.
+    install(CODE "set(_lumen_datadir \"${CMAKE_INSTALL_DATADIR}\")")
+    install(CODE [[
+      if ("$ENV{DESTDIR}" STREQUAL "")
+        find_program(_lumen_udd update-desktop-database)
+        if (_lumen_udd)
+          execute_process(COMMAND "${_lumen_udd}" -q "${CMAKE_INSTALL_PREFIX}/${_lumen_datadir}/applications")
+        endif()
+        find_program(_lumen_gic gtk-update-icon-cache)
+        if (_lumen_gic)
+          execute_process(COMMAND "${_lumen_gic}" -q -t -f "${CMAKE_INSTALL_PREFIX}/${_lumen_datadir}/icons/hicolor"
+                          ERROR_QUIET)
+        endif()
+      endif()
+    ]])
+
+    add_custom_target(uninstall
+        COMMAND ${CMAKE_COMMAND} -DMANIFEST=${CMAKE_BINARY_DIR}/install_manifest.txt
+                -P ${CMAKE_SOURCE_DIR}/cmake/uninstall.cmake
+        COMMENT "Uninstalling qqvideo")
+  endif()
+
   message(STATUS "")
   message(STATUS "  FFmpeg: system (pkg-config)")
   message(STATUS "    libavcodec  ${LIBAV_libavcodec_VERSION}  (${LIBAV_libavcodec_PREFIX})")
   message(STATUS "    libavformat ${LIBAV_libavformat_VERSION}")
+  if (UNIX)
+    message(STATUS "  Install: ${CMAKE_INSTALL_PREFIX}  (plugins -> ${_lumen_plugin_install_dir})")
+  endif()
   message(STATUS "")
 endif()
 

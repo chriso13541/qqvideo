@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=qqvideo
+GenericName=Media Player
+Comment=Play video and audio files with per-codec control
+Exec=qqvideo %f
+TryExec=qqvideo
+Icon=qqvideo
+Terminal=false
+Categories=AudioVideo;Video;Audio;Player;
+Keywords=video;movie;player;media;mp4;mkv;
+MimeType=video/mp4;video/x-m4v;video/quicktime;video/3gpp;video/x-matroska;video/webm;video/x-msvideo;video/mp2t;video/ogg;audio/mp4;audio/x-matroska;audio/webm;audio/ogg;audio/opus;audio/flac;audio/mpeg;audio/aac;

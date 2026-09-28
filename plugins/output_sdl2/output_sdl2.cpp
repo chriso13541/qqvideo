@@ -80,7 +80,9 @@ struct lumen_output_ctx {
     Uint64        pause_started_ticks;
     Uint64        last_mouse_move_ticks; /* for fullscreen auto-hide (3s timeout) */
     int           controls_visible;      /* 1 = draw chrome/cursor; 0 = hidden (fullscreen idle) */
-    int           last_queue_pos;        /* detect queue-position changes to update window title */
+    int           last_queue_pos;        /* (unused since the title compares text; kept for layout) */
+    char          last_title[512];       /* window title currently set */
+    int           applied_scale_smooth;  /* texture scale mode last applied (-1 = none) */
 
     /* Async "Add to Queue" dialog -- runs on a background thread so the
      * decode/render/audio loop keeps going while the user picks a file.
@@ -111,6 +113,9 @@ struct lumen_output_ctx {
     SDL_Window   *pref_window;
     SDL_Renderer *pref_renderer;
     int           pref_window_open;
+    int           pref_page;              /* section shown in the sidebar */
+    char          audio_devs[16][128];    /* output devices, listed when the window opens */
+    int           audio_dev_count;
 
     /* Per-container codec disable list. Each entry blocks one (demuxer, decoder)
      * pair: e.g., {"mp4-demuxer", "h264-decoder"} means H.264 is disabled only
@@ -262,7 +267,8 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 lumen_playback_state_t *st = ctx->state;
                 int fwd = e.key.keysym.scancode == SDL_SCANCODE_RIGHT;
                 int64_t base = st->seek_requested ? st->seek_target_ms : st->position_ms;
-                int64_t target = base + (fwd ? 10000 : -10000);
+                int64_t step = (int64_t)(st->pref_seek_step_s > 0 ? st->pref_seek_step_s : 10) * 1000;
+                int64_t target = base + (fwd ? step : -step);
                 if (target < 0) target = 0;
                 if (st->duration_ms > 0 && target > st->duration_ms) target = st->duration_ms;
                 st->seek_target_ms = target;
@@ -274,11 +280,13 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 lumen_playback_state_t *st = ctx->state;
                 /* Whole percent steps, clamped: 97% + 5 -> 100%, 3% - 5 -> 0%. */
                 int pct = (int)lroundf(st->volume * 100.0f);
-                pct += (e.key.keysym.scancode == SDL_SCANCODE_UP) ? 5 : -5;
+                int vstep = st->pref_volume_step > 0 ? st->pref_volume_step : 5;
+                pct += (e.key.keysym.scancode == SDL_SCANCODE_UP) ? vstep : -vstep;
                 if (pct > 100) pct = 100;
                 if (pct < 0) pct = 0;
                 st->volume = (float)pct / 100.0f;
                 st->muted = 0;       /* like dragging the slider: changing volume unmutes */
+                if (st->pref_remember_volume) st->prefs_dirty = 1;
             }
             /* V: cycle None -> each available subtitle track -> None (VLC's key) */
             if (e.key.keysym.scancode == SDL_SCANCODE_V &&
@@ -413,14 +421,24 @@ static void pkg_open(lumen_output_ctx_t *ctx) {
 
 /* ---- Preferences window ------------------------------------------------ */
 
+static void prefs_list_audio_devices(lumen_output_ctx_t *ctx) {
+    int n = SDL_GetNumAudioDevices(0);
+    ctx->audio_dev_count = 0;
+    for (int i = 0; i < n && ctx->audio_dev_count < 16; i++) {
+        const char *name = SDL_GetAudioDeviceName(i, 0);
+        if (name) snprintf(ctx->audio_devs[ctx->audio_dev_count++], 128, "%s", name);
+    }
+}
+
 static void prefs_open(lumen_output_ctx_t *ctx) {
+    prefs_list_audio_devices(ctx);   /* devices come and go (headsets): refresh on open */
     if (ctx->pref_window) {
         SDL_ShowWindow(ctx->pref_window);
         SDL_RaiseWindow(ctx->pref_window);
         ctx->pref_window_open = 1;
         return;
     }
-    if (!aux_window_create(ctx, "qqvideo Preferences", 500, 560,
+    if (!aux_window_create(ctx, "qqvideo Preferences", 660, 520,
                            &ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx))
         return;
     ctx->pref_window_open = 1;
@@ -434,6 +452,174 @@ static void pref_note(const char *text) {
     ImGui::PopStyleColor();
     ImGui::Unindent(24.0f);
     ImGui::Spacing();
+}
+
+extern "C" const char *lumen_language_name(const char *code);   /* core/sidecar.c */
+
+/* Controls that save as soon as they change / when released. */
+static void pref_check(const char *label, int *v, lumen_playback_state_t *st) {
+    bool b = *v != 0;
+    if (ImGui::Checkbox(label, &b)) { *v = b; st->prefs_dirty = 1; }
+}
+static void pref_slider(const char *label, int *v, int lo, int hi, const char *fmt, lumen_playback_state_t *st) {
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SliderInt(label, v, lo, hi, fmt);
+    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;   /* save on release, not every frame */
+}
+
+static void prefs_page_general(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    (void)ctx;
+    ImGui::SeparatorText("Window");
+    pref_check("Only one qqvideo window", &st->pref_single_instance, st);
+#if defined(_WIN32)
+    pref_note("Not available on Windows yet -- every launch opens its own window.");
+#else
+    pref_note("Opening a video while qqvideo is running (from a file manager or the "
+              "command line) hands it to the running window instead of starting another.");
+#endif
+    ImGui::BeginDisabled(!st->pref_single_instance);
+    ImGui::Indent(24.0f);
+    if (ImGui::RadioButton("Play it right away", st->pref_instance_enqueue == 0)) { st->pref_instance_enqueue = 0; st->prefs_dirty = 1; }
+    if (ImGui::RadioButton("Add it to the queue", st->pref_instance_enqueue == 1)) { st->pref_instance_enqueue = 1; st->prefs_dirty = 1; }
+    ImGui::Unindent(24.0f);
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    pref_check("Resize the window to fit each video", &st->pref_resize_window, st);
+    pref_note("Off: the window keeps the size you gave it.");
+
+    ImGui::SeparatorText("Startup");
+    pref_check("Remember the volume", &st->pref_remember_volume, st);
+    pref_note("Start at the volume you last used instead of 100%.");
+}
+
+static void prefs_page_playback(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    ImGui::SeparatorText("Seeking");
+    pref_check("Precise seeking", &st->precise_seek, st);
+    pref_note("Seeks land on the exact time you pick. Off: jump to the nearest "
+              "keyframe instead -- instant, but up to several seconds away.");
+    pref_slider("Left/Right arrow jump", &st->pref_seek_step_s, 1, 60, "%d s", st);
+
+    ImGui::SeparatorText("Buffering");
+    pref_check("Buffer ahead", &st->pref_buffer_enabled, st);
+    pref_note("Decode ahead into memory before playback starts and after seeking, and "
+              "stop to refill if it runs dry instead of stuttering. Smooths out heavy "
+              "scenes; it can't make a CPU that's too slow on average keep up.");
+    ImGui::BeginDisabled(!st->pref_buffer_enabled);
+    ImGui::Indent(24.0f);
+    pref_slider("Buffer size", &st->pref_buffer_seconds, 1, 60, "%d s", st);
+    int ram_mb = SDL_GetSystemRAM();
+    int max_mb = ram_mb > 0 ? ram_mb / 2 : 4096;
+    if (max_mb < 256) max_mb = 256;
+    if (st->pref_buffer_mb > max_mb) st->pref_buffer_mb = max_mb;
+    pref_slider("Memory limit", &st->pref_buffer_mb, 64, max_mb, "%d MB", st);
+    if (st->has_file && ctx->width > 0 && ctx->height > 0) {
+        double frame_mb = (double)ctx->width * ctx->height * 1.5 / (1024.0 * 1024.0);
+        double fps = st->video_fps > 0 ? st->video_fps : 24.0;
+        int frames = (int)(st->pref_buffer_mb / frame_mb);
+        double secs = frames / fps;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("This video (%dx%d) is %.1f MB per frame: %d MB holds %d frames (%.1fs). "
+                           "The %s limit applies first.", ctx->width, ctx->height, frame_mb,
+                           st->pref_buffer_mb, frames, secs, secs < st->pref_buffer_seconds ? "memory" : "time");
+        ImGui::PopStyleColor();
+        if (st->buffering) ImGui::Text("Buffering... %d%%", st->buffer_fill_pct);
+        else if (st->pref_buffer_enabled) ImGui::Text("Decoded ahead: %.1f s", st->buffer_ahead_ms / 1000.0);
+    }
+    ImGui::Unindent(24.0f);
+    ImGui::EndDisabled();
+    if (st->has_file && st->decode_speed_pct > 0) {
+        ImGui::Text("Decoding speed for this video: %.2fx real time", st->decode_speed_pct / 100.0);
+        pref_note(st->decode_speed_pct >= 110 ? "Faster than playback: a buffer builds up and absorbs heavy scenes."
+                : st->decode_speed_pct >= 95  ? "About real time: buffering helps with heavy scenes."
+                : "Slower than playback on average: buffering can only turn stutter into pauses.");
+    }
+}
+
+static void prefs_page_video(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    (void)ctx;
+    ImGui::SeparatorText("Decoding");
+    pref_check("Adaptive frame skipping", &st->pref_frameskip, st);
+    pref_note("When video falls behind, skip frames nothing else depends on (then the "
+              "deblocking filter) so more frames arrive on time. Audio always comes first.");
+    int cores = SDL_GetCPUCount();
+    char cur[32];
+    if (st->pref_decode_threads == 0) snprintf(cur, sizeof(cur), "Automatic (%d)", cores);
+    else snprintf(cur, sizeof(cur), "%d", st->pref_decode_threads);
+    ImGui::SetNextItemWidth(220.0f);
+    if (ImGui::BeginCombo("Decoding threads", cur)) {
+        if (ImGui::Selectable("Automatic", st->pref_decode_threads == 0)) { st->pref_decode_threads = 0; st->prefs_dirty = 1; }
+        for (int n = 1; n <= (cores > 16 ? 16 : cores); n++) {
+            char l[8];
+            snprintf(l, sizeof(l), "%d", n);
+            if (ImGui::Selectable(l, st->pref_decode_threads == n)) { st->pref_decode_threads = n; st->prefs_dirty = 1; }
+        }
+        ImGui::EndCombo();
+    }
+    pref_note("Takes effect with the next video. 1 = single-threaded, for troubleshooting.");
+
+    ImGui::SeparatorText("Display");
+    ImGui::TextUnformatted("Scaling:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Smooth", st->pref_scale_smooth == 1)) { st->pref_scale_smooth = 1; st->prefs_dirty = 1; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Sharp (pixelated)", st->pref_scale_smooth == 0)) { st->pref_scale_smooth = 0; st->prefs_dirty = 1; }
+    pref_note("How the picture is resized to the window. Sharp suits pixel art and low-res video.");
+    pref_check("Keep aspect ratio", &st->pref_keep_aspect, st);
+    pref_note("Off: stretch the picture to fill the window.");
+}
+
+static void prefs_page_audio(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    ImGui::SeparatorText("Output");
+    const char *cur = st->pref_audio_device[0] ? st->pref_audio_device : "System default";
+    ImGui::SetNextItemWidth(320.0f);
+    if (ImGui::BeginCombo("Device", cur)) {
+        if (ImGui::Selectable("System default", st->pref_audio_device[0] == '\0')) {
+            st->pref_audio_device[0] = '\0';
+            st->prefs_dirty = 1;
+        }
+        for (int i = 0; i < ctx->audio_dev_count; i++) {
+            if (ImGui::Selectable(ctx->audio_devs[i], strcmp(st->pref_audio_device, ctx->audio_devs[i]) == 0)) {
+                snprintf(st->pref_audio_device, sizeof(st->pref_audio_device), "%s", ctx->audio_devs[i]);
+                st->prefs_dirty = 1;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    pref_note("Takes effect with the next video. If the device is missing, the default is used.");
+
+    ImGui::SeparatorText("Volume");
+    pref_slider("Up/Down arrow step", &st->pref_volume_step, 1, 25, "%d%%", st);
+
+    ImGui::SeparatorText("Sync");
+    pref_slider("Audio delay", &st->pref_av_offset_ms, -1000, 1000, "%+d ms", st);
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) { st->pref_av_offset_ms = 0; st->prefs_dirty = 1; }
+    pref_note("If voices don't match lips: + makes the sound later than the picture, "
+              "- earlier. Bluetooth headphones often need about +150 to +250 ms. "
+              "Applies immediately.");
+}
+
+static void prefs_page_subtitles(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    (void)ctx;
+    ImGui::SeparatorText("Finding subtitles");
+    pref_check("Load subtitle files found next to the video", &st->pref_sub_autoload, st);
+    pref_note("Movie.srt, Movie.en.srt, and files in a Subs/ folder. Takes effect with the next video.");
+
+    ImGui::SeparatorText("Choosing a track");
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::InputTextWithHint("Auto-select language", "e.g. English", st->pref_sub_lang, sizeof(st->pref_sub_lang));
+    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;
+    if (st->pref_sub_lang[0]) {
+        const char *name = lumen_language_name(st->pref_sub_lang);
+        ImGui::SameLine();
+        if (name) ImGui::TextDisabled("-> %s", name);
+        else      ImGui::TextDisabled("(not a known language -- matched as typed)");
+    }
+    pref_note("When a video opens, turn on its first subtitle track in this language "
+              "(\"English\", \"eng\" or \"en\"). Empty: subtitles start off (None).");
+
+    ImGui::SeparatorText("Appearance");
+    pref_slider("Text size", &st->pref_sub_scale_pct, 50, 250, "%d%%", st);
 }
 
 static void prefs_render(lumen_output_ctx_t *ctx) {
@@ -452,83 +638,28 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
     ImGui::Begin("##prefs", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
-    /* ---- Playback ---- */
-    ImGui::SeparatorText("Playback");
-    bool precise = st->precise_seek != 0;
-    if (ImGui::Checkbox("Precise seeking", &precise)) { st->precise_seek = precise; st->prefs_dirty = 1; }
-    pref_note("Seeks land on the exact time you pick. Off: jump to the nearest "
-              "keyframe instead -- instant, but up to several seconds away.");
+    static const char *PAGES[] = { "General", "Playback", "Video", "Audio", "Subtitles" };
+    const float footer_h = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
 
-    bool skip = st->pref_frameskip != 0;
-    if (ImGui::Checkbox("Adaptive frame skipping", &skip)) { st->pref_frameskip = skip; st->prefs_dirty = 1; }
-    pref_note("When video falls behind, skip frames nothing else depends on (and "
-              "then the deblocking filter) so more frames arrive on time. Audio "
-              "always comes first either way; video that falls far behind jumps "
-              "ahead to the next keyframe.");
+    /* Sidebar */
+    ImGui::BeginChild("##nav", ImVec2(130.0f, -footer_h), ImGuiChildFlags_Borders);
+    for (int i = 0; i < 5; i++)
+        if (ImGui::Selectable(PAGES[i], ctx->pref_page == i, 0, ImVec2(0, 26.0f))) ctx->pref_page = i;
+    ImGui::EndChild();
+    ImGui::SameLine();
 
-    /* ---- Buffering ---- */
-    ImGui::SeparatorText("Buffering");
-    bool buf = st->pref_buffer_enabled != 0;
-    if (ImGui::Checkbox("Buffer ahead", &buf)) { st->pref_buffer_enabled = buf; st->prefs_dirty = 1; }
-    pref_note("Decode ahead into memory before playback starts and after seeking, "
-              "and stop to refill if it runs dry instead of stuttering. Smooths "
-              "out heavy scenes; it can't make a CPU that's too slow on average "
-              "keep up -- then it just turns stutter into short pauses.");
-
-    ImGui::BeginDisabled(!buf);
-    ImGui::Indent(24.0f);
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::SliderInt("Buffer size", &st->pref_buffer_seconds, 1, 60, "%d s");
-    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;   /* save on release, not every frame */
-
-    /* Memory cap: up to half the machine's RAM. */
-    int ram_mb = SDL_GetSystemRAM();
-    int max_mb = ram_mb > 0 ? ram_mb / 2 : 4096;
-    if (max_mb < 256) max_mb = 256;
-    if (st->pref_buffer_mb > max_mb) st->pref_buffer_mb = max_mb;
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::SliderInt("Memory limit", &st->pref_buffer_mb, 64, max_mb, "%d MB");
-    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;
-
-    /* What those limits mean for the video that's open right now:
-     * decoded frames are big (a 4K frame is ~12 MB). */
-    if (st->has_file && ctx->width > 0 && ctx->height > 0) {
-        double frame_mb = (double)ctx->width * ctx->height * 1.5 / (1024.0 * 1024.0);
-        double fps = st->video_fps > 0 ? st->video_fps : 24.0;
-        int frames = (int)(st->pref_buffer_mb / frame_mb);
-        double secs = frames / fps;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("This video (%dx%d) is %.1f MB per frame: %d MB holds %d frames (%.1fs). "
-                           "The %s limit applies first.",
-                           ctx->width, ctx->height, frame_mb, st->pref_buffer_mb, frames, secs,
-                           secs < st->pref_buffer_seconds ? "memory" : "time");
-        ImGui::PopStyleColor();
-        if (st->buffering)
-            ImGui::Text("Buffering... %d%%", st->buffer_fill_pct);
-        else if (buf)
-            ImGui::Text("Decoded ahead: %.1f s", st->buffer_ahead_ms / 1000.0);
+    /* Section */
+    ImGui::BeginChild("##page", ImVec2(0, -footer_h));
+    switch (ctx->pref_page) {
+        case 0:  prefs_page_general(ctx, st);   break;
+        case 1:  prefs_page_playback(ctx, st);  break;
+        case 2:  prefs_page_video(ctx, st);     break;
+        case 3:  prefs_page_audio(ctx, st);     break;
+        default: prefs_page_subtitles(ctx, st); break;
     }
-    ImGui::Unindent(24.0f);
-    ImGui::EndDisabled();
+    ImGui::EndChild();
 
-    /* Measured decoding speed: the honest answer to "will buffering help?" */
-    if (st->has_file && st->decode_speed_pct > 0) {
-        ImGui::Indent(24.0f);
-        ImGui::Text("Decoding speed for this video: %.2fx real time", st->decode_speed_pct / 100.0);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        if (st->decode_speed_pct >= 110)
-            ImGui::TextWrapped("Faster than playback: a buffer builds up and absorbs heavy scenes.");
-        else if (st->decode_speed_pct >= 95)
-            ImGui::TextWrapped("About real time: buffering helps with heavy scenes, but keep an eye on it.");
-        else
-            ImGui::TextWrapped("Slower than playback on average: buffering can only turn stutter into "
-                               "pauses. Frame skipping, keyframe seeking or a lower resolution will help more.");
-        ImGui::PopStyleColor();
-        ImGui::Unindent(24.0f);
-    }
-
-    /* ---- footer ---- */
-    ImGui::Spacing();
+    /* Footer */
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     if (st->prefs_path[0]) ImGui::TextWrapped("Saved automatically to %s", st->prefs_path);
@@ -1227,6 +1358,7 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
         /* Dragging the slider while muted implicitly unmutes */
         if (state->muted) state->muted = 0;
     }
+    if (ImGui::IsItemDeactivatedAfterEdit() && state->pref_remember_volume) state->prefs_dirty = 1;
 
     ImGui::End();
 }
@@ -1251,6 +1383,10 @@ static bool video_dest_rect(lumen_output_ctx_t *ctx, int win_w, int win_h,
     }
     if (area_h < 1) area_h = 1;
 
+    if (!ctx->state->pref_keep_aspect) {          /* Preferences > Video: stretch to fill */
+        dest->x = 0; dest->y = area_y; dest->w = win_w; dest->h = area_h;
+        return true;
+    }
     double video_aspect = (double)ctx->width / (double)ctx->height;
     double area_aspect  = (double)win_w / (double)area_h;
     if (area_aspect > video_aspect) {
@@ -1278,9 +1414,11 @@ static void draw_subtitles(lumen_output_ctx_t *ctx, const SDL_Rect &v, int win_h
     if (!text[0]) return;
 
     ImFont *font = ctx->sub_font ? ctx->sub_font : ImGui::GetFont();
+    float scale_pct = ctx->state->pref_sub_scale_pct > 0 ? ctx->state->pref_sub_scale_pct / 100.0f : 1.0f;
     float size = (float)v.h * 0.055f;
     if (size < 16.0f) size = 16.0f;
     if (size > 72.0f) size = 72.0f;
+    size *= scale_pct;                             /* Preferences > Subtitles > size */
     float scale = size / font->FontSize;
     float wrap_w = (float)v.w * 0.90f;
 
@@ -1434,23 +1572,33 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     /* Window title update (unchanged) */
     lumen_playback_state_t *state = ctx->state;
     if (state) {
+        /* Compare the TEXT, not the queue position: File > Open replaces
+         * the queue, so the new file is also at position 0 and a
+         * position check never noticed the change -- the old title stuck. */
         int qpos = state->queue_position;
-        if (qpos != ctx->last_queue_pos) {
-            ctx->last_queue_pos = qpos;
-            if (state->queue_names && qpos >= 0 && qpos < state->queue_count) {
-                char title[512];
-                snprintf(title, sizeof(title), "%s - qqvideo", state->queue_names[qpos]);
-                SDL_SetWindowTitle(ctx->window, title);
-            } else {
-                SDL_SetWindowTitle(ctx->window, "qqvideo");
-            }
+        char title[512];
+        if (state->queue_names && qpos >= 0 && qpos < state->queue_count && state->queue_names[qpos])
+            snprintf(title, sizeof(title), "%s - qqvideo", state->queue_names[qpos]);
+        else
+            snprintf(title, sizeof(title), "qqvideo");
+        if (strcmp(title, ctx->last_title) != 0) {
+            snprintf(ctx->last_title, sizeof(ctx->last_title), "%s", title);
+            SDL_SetWindowTitle(ctx->window, title);
         }
     }
 
     SDL_SetRenderDrawColor(ctx->renderer, 0, 0, 0, 255);
     SDL_RenderClear(ctx->renderer);
 
-    if (have_video) SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
+    if (have_video) {
+        /* Preferences > Video > scaling: smooth (linear) or sharp (nearest). */
+        int smooth = ctx->state ? ctx->state->pref_scale_smooth : 1;
+        if (smooth != ctx->applied_scale_smooth) {
+            SDL_SetTextureScaleMode(ctx->texture, smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+            ctx->applied_scale_smooth = smooth;
+        }
+        SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
+    }
 
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ctx->renderer);
     SDL_RenderPresent(ctx->renderer);
@@ -1608,6 +1756,7 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
     }
     ctx->width = width;
     ctx->have_frame = 0;
+    ctx->applied_scale_smooth = -1;       /* new texture: re-apply the scale mode */
     ctx->height = height;
 
     /* Skip resizing if the window is in any expanded state. There are two
@@ -1628,9 +1777,11 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
      * In both cases the letterbox rect in maybe_redraw() adapts to any
      * window size, so skipping the resize loses nothing visually. */
     Uint32 wflags = SDL_GetWindowFlags(ctx->window);
+    int keep_size = ctx->state && !ctx->state->pref_resize_window;   /* Preferences > General */
     int skip_resize = ctx->fullscreen
                    || (wflags & SDL_WINDOW_FULLSCREEN)  /* SDL fullscreen (any mode) */
-                   || (wflags & SDL_WINDOW_MAXIMIZED);  /* OS title-bar maximize */
+                   || (wflags & SDL_WINDOW_MAXIMIZED)   /* OS title-bar maximize */
+                   || keep_size;
 
     if (!skip_resize) {
         int target_w = width > 0 ? width : LUMEN_IDLE_WINDOW_W;
@@ -1658,7 +1809,8 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
         printf("  [sdl2-video] loaded stream %dx%d, window resized to %dx%d\n", width, height, target_w, target_h);
     } else {
         const char *reason = ctx->fullscreen            ? "SDL fullscreen"      :
-                             (wflags & SDL_WINDOW_FULLSCREEN) ? "SDL fullscreen (flags)" : "OS maximized";
+                             (wflags & SDL_WINDOW_FULLSCREEN) ? "SDL fullscreen (flags)" :
+                             keep_size ? "resize off in Preferences" : "OS maximized";
         printf("  [sdl2-video] loaded stream %dx%d, window kept (%s)\n", width, height, reason);
     }
 
@@ -1679,6 +1831,12 @@ static void sdl2_bind_state(lumen_output_ctx_t *ctx, lumen_playback_state_t *sta
 }
 
 static int sdl2_pump_ui(lumen_output_ctx_t *ctx, lumen_playback_state_t *state) {
+    /* Another launch handed us a file (single instance): come to the front. */
+    if (state && state->raise_window_requested) {
+        state->raise_window_requested = 0;
+        SDL_RestoreWindow(ctx->window);
+        SDL_RaiseWindow(ctx->window);
+    }
     /* Check whether the background "Add to Queue" dialog thread has a result.
      * We do this here (main thread) rather than in the dialog thread so that
      * pending_add_paths is only ever written from the main thread -- no sync

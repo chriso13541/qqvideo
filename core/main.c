@@ -27,6 +27,8 @@
 #include "packages.h"
 #include "player_core.h"
 #include "plugin_loader.h"
+#include "prefs.h"
+#include "instance.h"
 #include "../third_party/tinyfiledialogs/tinyfiledialogs.h"
 #include <stdio.h>
 #include <string.h>
@@ -372,15 +374,29 @@ int main(int argc, char **argv) {
     get_exe_dir(exe_dir, sizeof(exe_dir));
     snprintf(auto_packages_dir, sizeof(auto_packages_dir), "%s/packages", exe_dir);
 
-    const char *cli_file = NULL;
+    const char *cli_files[64];
+    int         n_cli = 0;
     int         list_only = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--list") == 0) {
             list_only = 1;
-        } else if (argv[i][0] != '-') {
-            cli_file = argv[i];
+        } else if (argv[i][0] != '-' && n_cli < 64) {
+            cli_files[n_cli++] = argv[i];
         }
+    }
+
+    /* Preferences > General > single instance: if qqvideo is already
+     * running, hand it the files (or just bring it forward) and exit --
+     * before loading plugins or opening a window. */
+    if (!list_only) {
+        lumen_playback_state_t early;
+        memset(&early, 0, sizeof(early));
+        lumen_prefs_defaults(&early);
+        lumen_prefs_load(&early);
+        if (early.pref_single_instance &&
+            lumen_instance_forward(cli_files, n_cli, early.pref_instance_enqueue))
+            return 0;
     }
 
     lumen_registry_t reg;
@@ -491,9 +507,8 @@ int main(int argc, char **argv) {
 
     /* If a file was given on the command line, pre-load the queue with
      * it so the first idle loop iteration immediately starts playing. */
-    if (cli_file) {
-        queue_append(cli_file);
-    }
+    /* Every file on the command line, in order ("qqvideo a.mkv b.mkv"). */
+    for (int i = 0; i < n_cli; i++) queue_append(cli_files[i]);
 
     int rc = 0;
 

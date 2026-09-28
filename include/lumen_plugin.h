@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 21
+#define LUMEN_ABI_VERSION 22
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -377,6 +377,7 @@ typedef struct {
         int  available;   /* 0 = listed but can't be shown (image-based) */
         int  external;    /* 1 = separate file (found next to the movie, or added) */
         char file[128];   /* external: the file's name, shown as a tooltip */
+        char lang[24];    /* v22: language name ("English") if known, for auto-select */
     } subtitle_tracks[LUMEN_MAX_SUB_TRACKS];
     int  subtitle_track_count;
     int  subtitle_selected;          /* index into subtitle_tracks, -1 = None. UI writes. */
@@ -419,6 +420,29 @@ typedef struct {
     int    buffer_ahead_ms;      /* decoded video ready ahead of the playhead */
     double video_fps;            /* current file's frame rate (0 = unknown / no video) */
     int    decode_speed_pct;     /* measured decoding speed, % of real time (0 = not yet known) */
+
+    /* ---- More preferences (v22), grouped as in the Preferences window ---- */
+    /* General */
+    int  pref_single_instance;   /* opening a file while qqvideo runs hands it to that window */
+    int  pref_instance_enqueue;  /* ...0 = play it now, 1 = add it to the queue */
+    int  pref_remember_volume;   /* restore the last volume at startup */
+    int  pref_resize_window;     /* resize the window to each video's size */
+    /* Playback */
+    int  pref_seek_step_s;       /* Left/Right arrow jump, seconds */
+    /* Video */
+    int  pref_decode_threads;    /* 0 = automatic (one per core) */
+    int  pref_scale_smooth;      /* 1 = smooth (linear) scaling, 0 = sharp (nearest) */
+    int  pref_keep_aspect;       /* 0 = stretch to fill the window */
+    /* Audio */
+    char pref_audio_device[128]; /* "" = system default */
+    int  pref_volume_step;       /* Up/Down arrow step, percent */
+    int  pref_av_offset_ms;      /* audio delay: + = sound later than the picture */
+    /* Subtitles */
+    int  pref_sub_autoload;      /* list subtitle files found next to the video */
+    char pref_sub_lang[32];      /* auto-select the first track in this language ("" = off) */
+    int  pref_sub_scale_pct;     /* subtitle text size, % */
+
+    int  raise_window_requested; /* another launch handed us a file: come to the front */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

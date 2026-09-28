@@ -68,7 +68,14 @@ static int sdl2_audio_load_stream(lumen_output_ctx_t *ctx, int sample_rate, int 
     wanted.channels = (Uint8)(channels > 0 ? channels : 2);
     wanted.samples = 4096;
 
-    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &wanted, &obtained, 0);
+    /* Preferences > Audio > output device ("" = system default). If the
+     * chosen device is gone (unplugged headset), fall back to the default. */
+    const char *devname = (ctx->state && ctx->state->pref_audio_device[0]) ? ctx->state->pref_audio_device : NULL;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(devname, 0, &wanted, &obtained, 0);
+    if (!dev && devname) {
+        fprintf(stderr, "lumen: audio device '%s' unavailable (%s) -- using the default\n", devname, SDL_GetError());
+        dev = SDL_OpenAudioDevice(NULL, 0, &wanted, &obtained, 0);
+    }
     if (dev == 0) {
         fprintf(stderr, "lumen: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return -1;

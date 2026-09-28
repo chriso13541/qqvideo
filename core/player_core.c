@@ -3,6 +3,7 @@
 #include "subtitles.h"
 #include "sidecar.h"
 #include "prefs.h"
+#include "instance.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,6 +85,8 @@ static void reset_pkt(lumen_packet_t *pkt) {
     pkt->duration_ms = -1;
 }
 
+static int g_threads_env_external;   /* QQVIDEO_DECODE_THREADS was set at launch */
+
 /* ---- Subtitles ------------------------------------------------------- */
 
 /* "English (SDH) [SRT]", "Spanish - forced [ASS]", "Track 3 [PGS]" */
@@ -111,6 +114,7 @@ static int add_track_entry(lumen_playback_state_t *st, const char *label, int av
     st->subtitle_tracks[i].available = available;
     st->subtitle_tracks[i].external = external;
     st->subtitle_tracks[i].file[0] = '\0';
+    st->subtitle_tracks[i].lang[0] = '\0';
     return i;
 }
 
@@ -125,7 +129,7 @@ static char g_ext_paths[LUMEN_MAX_SUB_TRACKS][512];
  * just picked a file expects. */
 static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_state_t *st,
                                     lumen_sub_track_t *tracks, const char *path,
-                                    const char *label, int select, int quiet) {
+                                    const char *label, const char *lang, int select, int quiet) {
     const char *err = NULL;
     for (int i = 0; i < st->subtitle_track_count; i++) {
         if (st->subtitle_tracks[i].external && strcmp(g_ext_paths[i], path) == 0) {
@@ -203,6 +207,7 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
     }
     snprintf(g_ext_paths[track], sizeof(g_ext_paths[track]), "%s", path);
     snprintf(st->subtitle_tracks[track].file, sizeof(st->subtitle_tracks[track].file), "%s", path_basename(path));
+    snprintf(st->subtitle_tracks[track].lang, sizeof(st->subtitle_tracks[track].lang), "%s", lang ? lang : "");
     if (select) st->subtitle_selected = track;
     printf("lumen: loaded %d subtitle cue(s) from '%s' as track %d\n", cues, path, track);
 }
@@ -244,6 +249,10 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
     session->state.volume = 1.0f;
     lumen_prefs_defaults(&session->state);
     lumen_prefs_load(&session->state);
+    if (!session->state.pref_remember_volume) session->state.volume = 1.0f;
+    /* Decoding threads: a QQVIDEO_DECODE_THREADS set by the user at launch
+     * wins over the preference (it's how you'd troubleshoot). */
+    g_threads_env_external = getenv("QQVIDEO_DECODE_THREADS") != NULL;
     if (session->state.prefs_path[0])
         printf("lumen: preferences: %s\n", session->state.prefs_path);
 
@@ -296,6 +305,7 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
 lumen_idle_result_t lumen_session_idle(lumen_session_t *session) {
     session->state.has_file = 0;
     while (1) {
+        lumen_instance_poll(&session->state);     /* files handed over by another launch */
         if (session->state.prefs_dirty) {
             session->state.prefs_dirty = 0;
             lumen_prefs_save(&session->state);
@@ -359,13 +369,20 @@ void lumen_session_close(lumen_session_t *session) {
 static int audio_clock(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
                        int64_t *clock_ms, int *buffered_ms) {
     if (!aout || !aout->get_clock) return 0;
-    return aout->get_clock(session->aout_ctx, clock_ms, buffered_ms);
+    if (!aout->get_clock(session->aout_ctx, clock_ms, buffered_ms)) return 0;
+    /* Preferences > Audio > Audio delay: + means the sound should come
+     * LATER than the picture, i.e. show each frame that much earlier
+     * relative to what's being heard. Fixes a constant lip-sync offset
+     * from the sound system's own latency (Bluetooth, PipeWire, HDMI). */
+    *clock_ms += session->state.pref_av_offset_ms;
+    return 1;
 }
 
 /* Pumps both outputs' UI and checks for anything that ends playback of
  * this file. Returns 1 (and fills out_stats) if playback must stop. */
 static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
                           lumen_playback_state_t *state, lumen_play_stats_t *out_stats) {
+    lumen_instance_poll(state);                 /* files handed over by another launch */
     if (state->prefs_dirty) {                   /* Preferences changed in the UI */
         state->prefs_dirty = 0;
         if (lumen_prefs_save(state) != 0)
@@ -1024,6 +1041,19 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     state->duration_ms = (int64_t)(table.duration_sec * 1000.0);
     printf("lumen: demuxer found %d stream(s), duration=%.1fs\n", table.stream_count, table.duration_sec);
 
+    /* Preferences > Video > Decoding threads. decoder_libav reads this at
+     * open time (the plugin ABI has no settings channel), so set it before
+     * the decoders below are opened. */
+    if (!g_threads_env_external) {
+        char n[16];
+        snprintf(n, sizeof(n), "%d", state->pref_decode_threads);
+#if defined(_WIN32)
+        _putenv_s("QQVIDEO_DECODE_THREADS", n);
+#else
+        setenv("QQVIDEO_DECODE_THREADS", n, 1);
+#endif
+    }
+
     stream_state_t streams[LUMEN_MAX_STREAMS];
     memset(streams, 0, sizeof(streams));
     lumen_sub_track_t sub_tracks[LUMEN_MAX_SUB_TRACKS];
@@ -1069,6 +1099,11 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                          se ? " (disabled)" : image ? " (image-based, not supported yet)" : " (not supported)");
             }
             ss->sub_track = add_track_entry(state, label, ok, 0);
+            if (ss->sub_track >= 0 && sd->language[0]) {
+                const char *ln = lumen_language_name(sd->language);
+                snprintf(state->subtitle_tracks[ss->sub_track].lang, sizeof(state->subtitle_tracks[0].lang),
+                         "%s", ln ? ln : sd->language);
+            }
             if (ss->sub_track < 0 && ss->in_use) {   /* list full: stop decoding it */
                 ss->dec_vt->close(ss->dec_ctx);
                 lumen_unload_plugin(&ss->decoder_plugin);
@@ -1137,12 +1172,34 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     /* Subtitle files that live next to the movie (or in Subs/): listed
      * after the embedded tracks, loaded now (a few KB each), NOT selected
      * -- None stays the default until the user picks one. */
-    {
+    if (state->pref_sub_autoload) {             /* Preferences > Subtitles */
         static lumen_sidecar_t found[LUMEN_SIDECAR_MAX];
         int nfound = lumen_find_sidecar_subs(path, found, LUMEN_SIDECAR_MAX);
+        char stem[256];
+        snprintf(stem, sizeof(stem), "%s", path_basename(path));
+        char *sdot = strrchr(stem, '.');
+        if (sdot) *sdot = '\0';
         for (int i = 0; i < nfound; i++)
-            load_external_subtitles(reg, state, sub_tracks, found[i].path, found[i].label, 0, 1);
+            load_external_subtitles(reg, state, sub_tracks, found[i].path, found[i].label,
+                                    lumen_sidecar_language(found[i].file, stem), 0, 1);
         if (nfound) printf("lumen: %d subtitle file(s) found next to the movie\n", nfound);
+    }
+    /* Preferences > Subtitles > auto-select: the first usable track in the
+     * preferred language (embedded tracks come first in the list). Accepts
+     * "English", "eng" or "en". Otherwise None stays the default. */
+    if (state->pref_sub_lang[0]) {
+        const char *want = lumen_language_name(state->pref_sub_lang);
+        if (!want) want = state->pref_sub_lang;
+        for (int i = 0; i < state->subtitle_track_count; i++) {
+            const char *have = state->subtitle_tracks[i].lang;
+            if (!state->subtitle_tracks[i].available || !have[0]) continue;
+            const char *hn = lumen_language_name(have);
+            if (!strcasecmp(hn ? hn : have, want)) {
+                state->subtitle_selected = i;
+                printf("lumen: auto-selected subtitle track %d (%s)\n", i, state->subtitle_tracks[i].label);
+                break;
+            }
+        }
     }
 
     /* Reconfigure the SESSION's already-open outputs for this file via
@@ -1237,7 +1294,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             char label[96];
             lumen_sidecar_label(path_basename(state->subtitle_add_path), NULL, label, sizeof(label));
             pthread_mutex_lock(&e->lock);
-            load_external_subtitles(reg, state, sub_tracks, state->subtitle_add_path, label, 1, 0);
+            load_external_subtitles(reg, state, sub_tracks, state->subtitle_add_path, label,
+                                    lumen_sidecar_language(path_basename(state->subtitle_add_path), NULL), 1, 0);
             pthread_mutex_unlock(&e->lock);
         }
         {

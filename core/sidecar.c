@@ -147,6 +147,22 @@ static int cand_cmp(const void *a, const void *b) {
 
 /* ---- labels ----------------------------------------------------------- */
 
+const char *lumen_sidecar_language(const char *file_name, const char *stem) {
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s", file_name);
+    char *dot = strrchr(tmp, '.');
+    if (dot) *dot = '\0';
+    const char *rest = (stem && name_matches(file_name, stem)) ? tmp + strlen(stem) : tmp;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", rest);
+    const char *lang = NULL;
+    for (char *tok = strtok(buf, "._- []()"); tok && !lang; tok = strtok(NULL, "._- []()")) {
+        if (!strcasecmp(tok, "forced") || !strcasecmp(tok, "sdh") || !strcasecmp(tok, "cc")) continue;
+        lang = lumen_language_name(tok);
+    }
+    return lang;
+}
+
 void lumen_sidecar_label(const char *file_name, const char *stem, char *out, size_t n) {
     char base[128];
     snprintf(base, sizeof(base), "%s", file_name);

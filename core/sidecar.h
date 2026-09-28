@@ -30,6 +30,10 @@ int lumen_find_sidecar_subs(const char *media_path, lumen_sidecar_t *out, int ma
  * movie's file name without extension (NULL if unknown). */
 void lumen_sidecar_label(const char *file_name, const char *stem, char *out, size_t n);
 
+/* Language parsed from an external subtitle file's name ("Movie.en.srt" ->
+ * "English"), or NULL. */
+const char *lumen_sidecar_language(const char *file_name, const char *stem);
+
 /* "eng"/"en"/"english" -> "English". NULL if not recognized. */
 const char *lumen_language_name(const char *code);
 

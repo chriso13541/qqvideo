@@ -89,6 +89,11 @@ styling tags are stripped and text is drawn outlined at the bottom of the
 picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
 VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
 
+**Single instance** (Preferences > General, Linux): with "Only one qqvideo
+window" on, launching `qqvideo file.mkv` while it's running hands the file
+to the running window (play now or add to the queue) and exits, via a
+per-user socket in `$XDG_RUNTIME_DIR`.
+
 **Preferences** (Tools > Preferences, saved to
 `~/.config/qqvideo/preferences.ini`, or `%APPDATA%\qqvideo\` on Windows):
 precise seeking, adaptive frame skipping, and **Buffer ahead** -- decode

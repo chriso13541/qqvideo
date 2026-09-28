@@ -16,6 +16,20 @@ void lumen_prefs_defaults(lumen_playback_state_t *st) {
     st->pref_buffer_enabled = 0;
     st->pref_buffer_seconds = 10;
     st->pref_buffer_mb = 512;
+    st->pref_single_instance = 0;
+    st->pref_instance_enqueue = 0;
+    st->pref_remember_volume = 1;
+    st->pref_resize_window = 1;
+    st->pref_seek_step_s = 10;
+    st->pref_decode_threads = 0;
+    st->pref_scale_smooth = 1;
+    st->pref_keep_aspect = 1;
+    st->pref_audio_device[0] = '\0';
+    st->pref_volume_step = 5;
+    st->pref_av_offset_ms = 0;
+    st->pref_sub_autoload = 1;
+    st->pref_sub_lang[0] = '\0';
+    st->pref_sub_scale_pct = 100;
 }
 
 /* Builds the config directory path; creates it if `create`. */
@@ -56,16 +70,34 @@ void lumen_prefs_load(lumen_playback_state_t *st) {
 #endif
     FILE *f = fopen(st->prefs_path, "r");
     if (!f) return;                               /* first run: defaults */
-    char line[256];
+    char line[512];
     while (fgets(line, sizeof(line), f)) {
-        char key[64];
-        int v;
-        if (line[0] == '#' || sscanf(line, " %63[^= ] = %d", key, &v) != 2) continue;
+        char key[64], sval[256] = "";
+        int v = 0;
+        if (line[0] == '#') continue;
+        /* strings first ("key = anything to end of line"), then numbers */
+        if (sscanf(line, " %63[^= ] = %255[^\r\n]", key, sval) < 1) continue;
+        if (!strcmp(key, "audio_device")) { snprintf(st->pref_audio_device, sizeof(st->pref_audio_device), "%s", sval); continue; }
+        if (!strcmp(key, "subtitle_language")) { snprintf(st->pref_sub_lang, sizeof(st->pref_sub_lang), "%s", sval); continue; }
+        if (sscanf(sval, "%d", &v) != 1) continue;
         if      (!strcmp(key, "precise_seek"))    st->precise_seek = v != 0;
         else if (!strcmp(key, "frame_skipping"))  st->pref_frameskip = v != 0;
         else if (!strcmp(key, "buffer_enabled"))  st->pref_buffer_enabled = v != 0;
         else if (!strcmp(key, "buffer_seconds"))  st->pref_buffer_seconds = clampi(v, 1, 120);
         else if (!strcmp(key, "buffer_mb"))       st->pref_buffer_mb = clampi(v, 64, 16384);
+        else if (!strcmp(key, "single_instance")) st->pref_single_instance = v != 0;
+        else if (!strcmp(key, "instance_enqueue")) st->pref_instance_enqueue = v != 0;
+        else if (!strcmp(key, "remember_volume")) st->pref_remember_volume = v != 0;
+        else if (!strcmp(key, "volume"))          st->volume = (float)clampi(v, 0, 100) / 100.0f;
+        else if (!strcmp(key, "resize_window"))   st->pref_resize_window = v != 0;
+        else if (!strcmp(key, "seek_step"))       st->pref_seek_step_s = clampi(v, 1, 300);
+        else if (!strcmp(key, "decode_threads"))  st->pref_decode_threads = clampi(v, 0, 64);
+        else if (!strcmp(key, "smooth_scaling"))  st->pref_scale_smooth = v != 0;
+        else if (!strcmp(key, "keep_aspect"))     st->pref_keep_aspect = v != 0;
+        else if (!strcmp(key, "volume_step"))     st->pref_volume_step = clampi(v, 1, 25);
+        else if (!strcmp(key, "audio_delay_ms"))  st->pref_av_offset_ms = clampi(v, -2000, 2000);
+        else if (!strcmp(key, "subtitle_autoload")) st->pref_sub_autoload = v != 0;
+        else if (!strcmp(key, "subtitle_size"))   st->pref_sub_scale_pct = clampi(v, 50, 250);
     }
     fclose(f);
 }
@@ -83,6 +115,21 @@ int lumen_prefs_save(const lumen_playback_state_t *st) {
     fprintf(f, "buffer_enabled = %d\n", st->pref_buffer_enabled ? 1 : 0);
     fprintf(f, "buffer_seconds = %d\n", st->pref_buffer_seconds);
     fprintf(f, "buffer_mb = %d\n", st->pref_buffer_mb);
+    fprintf(f, "single_instance = %d\n", st->pref_single_instance ? 1 : 0);
+    fprintf(f, "instance_enqueue = %d\n", st->pref_instance_enqueue ? 1 : 0);
+    fprintf(f, "remember_volume = %d\n", st->pref_remember_volume ? 1 : 0);
+    fprintf(f, "volume = %d\n", (int)(st->volume * 100.0f + 0.5f));
+    fprintf(f, "resize_window = %d\n", st->pref_resize_window ? 1 : 0);
+    fprintf(f, "seek_step = %d\n", st->pref_seek_step_s);
+    fprintf(f, "decode_threads = %d\n", st->pref_decode_threads);
+    fprintf(f, "smooth_scaling = %d\n", st->pref_scale_smooth ? 1 : 0);
+    fprintf(f, "keep_aspect = %d\n", st->pref_keep_aspect ? 1 : 0);
+    fprintf(f, "audio_device = %s\n", st->pref_audio_device);
+    fprintf(f, "volume_step = %d\n", st->pref_volume_step);
+    fprintf(f, "audio_delay_ms = %d\n", st->pref_av_offset_ms);
+    fprintf(f, "subtitle_autoload = %d\n", st->pref_sub_autoload ? 1 : 0);
+    fprintf(f, "subtitle_language = %s\n", st->pref_sub_lang);
+    fprintf(f, "subtitle_size = %d\n", st->pref_sub_scale_pct);
     if (fclose(f) != 0) return -1;
     /* write-then-rename, so a crash mid-save can't leave a truncated file */
 #if defined(_WIN32)

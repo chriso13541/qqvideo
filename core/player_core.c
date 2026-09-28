@@ -437,6 +437,90 @@ static int vq_present_due(lumen_session_t *session, vq_t *q,
     return 0;
 }
 
+/* ---- Adaptive decode skipping ------------------------------------------
+ *
+ * One loop decodes both video and audio, so when video decoding can't keep
+ * up, audio starves too and everything slows down together (measured: an
+ * overloaded CPU played 1080p60 HEVC at ~0.45x speed). Dropping late frames
+ * after decoding them saves nothing; the time goes into decoding. So when
+ * we're falling behind, ask the decoder to skip work (set_skip): first the
+ * frames nothing depends on, then the deblocking filter. Back off once
+ * there's a comfortable margin again. Needs an audio clock to judge by. */
+
+typedef struct {
+    int     level;        /* 0..2, current set_skip level */
+    int     behind;       /* consecutive decoded frames that arrived (nearly) late */
+    int     warmup;       /* frames to ignore after start/seek while buffers refill */
+    int64_t hold_until;   /* pts: after a level change, give it time to take effect */
+    int64_t comfy_since;  /* pts where the current comfortable stretch began, -1 = none */
+    int64_t comfy_ms;     /* how long a comfortable stretch must last to step down */
+    int64_t last_down;    /* pts of the last step down, -1 = none */
+} skip_state_t;
+
+#define SKIP_HOLD_MS        500   /* after a change, let it take effect before judging */
+#define SKIP_COMFY_MS      3000   /* initial comfortable stretch needed to step down */
+#define SKIP_COMFY_MAX_MS 60000
+#define SKIP_REGRET_MS    10000   /* behind again this soon after stepping down = premature */
+
+static void skip_reset(skip_state_t *k) {
+    if (k->comfy_ms <= 0) k->comfy_ms = SKIP_COMFY_MS;
+    k->behind = 0;
+    k->warmup = 30;
+    k->hold_until = -1;
+    k->comfy_since = -1;
+}
+
+static void skip_change(stream_state_t *ss, skip_state_t *k, int level, int64_t pts) {
+    k->level = level;
+    k->behind = 0;
+    k->comfy_since = -1;
+    k->hold_until = pts + SKIP_HOLD_MS;
+    ss->dec_vt->set_skip(ss->dec_ctx, level);
+}
+
+static void skip_policy(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
+                        stream_state_t *ss, skip_state_t *k, int64_t pts) {
+    static int disabled = -1;          /* QQVIDEO_FRAMESKIP=0: always decode everything */
+    if (disabled < 0) { const char *e = getenv("QQVIDEO_FRAMESKIP"); disabled = e && e[0] == '0'; }
+    if (disabled || !ss->dec_vt->set_skip) return;
+    if (k->warmup > 0) { k->warmup--; return; }
+    if (pts < k->hold_until) return;   /* a level change is still taking effect */
+    int64_t clk;
+    int buf;
+    if (!audio_clock(session, aout, &clk, &buf)) return;
+    int64_t slack = pts - clk;   /* how early this frame is, fresh out of the decoder */
+
+    if (buf < 150 || slack < 40) {                  /* falling behind */
+        k->comfy_since = -1;
+        if (++k->behind >= 6 && k->level < 2) {
+            /* Stepped down recently and already behind again: that step
+             * was premature. Require twice the calm next time (exponential
+             * backoff), so the level settles instead of flapping 1-0-1-0
+             * with a stutter at every flip. */
+            if (k->last_down >= 0 && pts - k->last_down < SKIP_REGRET_MS && k->comfy_ms < SKIP_COMFY_MAX_MS)
+                k->comfy_ms *= 2;
+            skip_change(ss, k, k->level + 1, pts);
+            printf("lumen: decoding can't keep up -- %s\n", k->level == 1
+                   ? "skipping non-reference frames (level 1)"
+                   : "also skipping the deblocking filter (level 2)");
+        }
+        return;
+    }
+    k->behind = 0;
+    if (k->level == 0) return;
+    /* Step down only after a clearly comfortable stretch, measured in
+     * playback time (skipping means fewer frames, so counting frames made
+     * the back-off take ~17 s). The in-between zone neither resets nor
+     * advances the stretch, so a healthy but not lavish margin doesn't
+     * keep us skipping forever. */
+    if (buf >= 300 && slack >= 120 && k->comfy_since < 0) k->comfy_since = pts;
+    if (k->comfy_since >= 0 && pts - k->comfy_since >= k->comfy_ms) {
+        skip_change(ss, k, k->level - 1, pts);
+        k->last_down = pts;
+        printf("lumen: decoding keeping up -- skip level %d\n", k->level);
+    }
+}
+
 /* Routes one decoded audio/video frame. Video goes into the queue (the
  * queue takes ownership); audio goes straight to the audio device.
  * Returns 1 if playback must stop. */
@@ -692,6 +776,10 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     reset_pkt(&pkt);
     static vq_t vq;           /* static: ~24 frames' worth of structs, keep off the stack */
     memset(&vq, 0, sizeof(vq));
+    skip_state_t skip;
+    memset(&skip, 0, sizeof(skip));
+    skip.last_down = -1;
+    skip_reset(&skip);
 
     while (!stop_requested) {
         /* Pumping the session's video output EVERY iteration keeps the SDL
@@ -729,6 +817,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                         }
                     }
                     vq_clear(&vq);    /* queued frames are from before the seek */
+                    skip_reset(&skip);   /* keep the level: the hardware didn't change */
                     state->position_ms = state->seek_target_ms;
                     state->seek_generation++;
                     eof = 0;   /* seeking back from the very end works too */
@@ -821,9 +910,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                                     frame.subtitle.end_ms, frame.subtitle.text);
             ss->dec_vt->frame_free(&frame);
         } else if (drc == 0) {
+            if (ss->type == LUMEN_STREAM_VIDEO) skip_policy(session, aout, ss, &skip, frame.pts);
             if (route_frame(session, &vq, &frame, ss->dec_vt, vout, aout, state, out_stats)) stop_requested = 1;
         } else if (drc < 0) {
             out_stats->frames_failed++;
+        }
+        /* A packet can produce more than one frame: collect them all. */
+        if (drc >= 0 && ss->type != LUMEN_STREAM_SUBTITLE && ss->dec_vt->receive) {
+            while (!stop_requested && ss->dec_vt->receive(ss->dec_ctx, &frame) == 0) {
+                if (ss->type == LUMEN_STREAM_VIDEO) skip_policy(session, aout, ss, &skip, frame.pts);
+                if (route_frame(session, &vq, &frame, ss->dec_vt, vout, aout, state, out_stats)) stop_requested = 1;
+            }
         }
         dmx->packet_free(&pkt);
         reset_pkt(&pkt);

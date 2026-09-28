@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 17
+#define LUMEN_ABI_VERSION 18
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -494,6 +494,24 @@ typedef struct {
     void (*flush)(lumen_decoder_ctx_t *ctx, int64_t resume_at_ms);
 
     void (*close)(lumen_decoder_ctx_t *ctx);
+
+    /* v18, optional. Returns another frame produced by input already given
+     * to decode(), without new input: 0 = frame in *out, 1 = none left.
+     * The core calls it after every decode() until it returns 1, so a
+     * packet that yields several frames never loses any. (decode() alone
+     * can only hand back one frame per packet.) */
+    int  (*receive)(lumen_decoder_ctx_t *ctx, lumen_frame_t *out);
+
+    /* v18, optional. Speed/quality trade-off the core applies when decoding
+     * can't keep up with playback:
+     *   0 = decode everything (default)
+     *   1 = skip frames no other frame depends on (non-reference/B-frames):
+     *       lower frame rate, no quality loss on the frames that remain
+     *   2 = also skip the in-loop deblocking filter: much faster, blockier
+     * Keeping up matters more than every frame: falling behind stalls the
+     * audio too, since one loop decodes both. */
+    void (*set_skip)(lumen_decoder_ctx_t *ctx, int level);
+
 } lumen_decoder_vtable_t;
 
 /* ---------------------------------------------------------------------- */

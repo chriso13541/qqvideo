@@ -46,6 +46,9 @@ struct lumen_decoder_ctx {
     int64_t         last_pts_ms;          /* last emitted pts, for the no-pts fallback */
     int64_t         samples_out;          /* audio: samples emitted, for the no-pts fallback */
 
+    AVPacket       *pending;              /* packet libavcodec refused with EAGAIN (frames
+                                           * were waiting); resent from receive() */
+    int             skip_start, skip_end; /* sample trimming for the next frame out */
     uint8_t        *pad_buf;              /* packet copy + zeroed padding, see padded() */
     size_t          pad_cap;
     struct SwsContext *sws;               /* video: lazily created, only if needed */
@@ -124,12 +127,24 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
         ctx->avctx->extradata_size = stream->extradata_size;
     }
 
+    if (c->kind == LUMEN_PROBE_VIDEO) {
+        /* Multithreaded decoding: frame threads (several frames in flight)
+         * plus slice threads where the codec supports them. 0 = one thread
+         * per CPU core, chosen by libavcodec. Roughly doubles decode speed
+         * on a dual core. QQVIDEO_DECODE_THREADS=N overrides (1 = off), for
+         * troubleshooting. Audio stays single-threaded: it's cheap, and
+         * frame threads add latency. */
+        const char *env = getenv("QQVIDEO_DECODE_THREADS");
+        ctx->avctx->thread_count = env ? atoi(env) : 0;
+        ctx->avctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
     if (avcodec_open2(ctx->avctx, codec, NULL) < 0) {
         avcodec_free_context(&ctx->avctx);
         free(ctx);
         return -1;
     }
     ctx->avpkt = av_packet_alloc();
+    ctx->pending = av_packet_alloc();
     ctx->avframe = av_frame_alloc();
     *out_ctx = ctx;
     return 0;
@@ -366,6 +381,35 @@ static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, 
 
 /* ---- vtable -------------------------------------------------------- */
 
+/* FFmpeg's decode contract: after sending a packet, keep calling
+ * receive_frame until it says EAGAIN -- a packet may produce zero, one or
+ * several frames. And send_packet itself may answer EAGAIN ("collect my
+ * frames first"); the old code ignored that and the packet was lost.
+ * libav_receive() is the one place frames come out. */
+static int libav_receive(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
+    if (ctx->kind == LUMEN_PROBE_SUBTITLE) return 1;
+    for (;;) {
+        int rc = avcodec_receive_frame(ctx->avctx, ctx->avframe);
+        if (rc == 0) {
+            /* Trimming info belongs to the packet just sent: apply it to
+             * the first frame out, then clear it. */
+            int e = emit(ctx, out, ctx->skip_start, ctx->skip_end);
+            ctx->skip_start = ctx->skip_end = 0;
+            if (e == 1) continue;            /* whole frame trimmed away */
+            return e < 0 ? -1 : 0;
+        }
+        if (rc == AVERROR(EAGAIN) && ctx->pending->data) {
+            /* Room again: send the packet that was refused earlier. */
+            int s = avcodec_send_packet(ctx->avctx, ctx->pending);
+            if (s == AVERROR(EAGAIN)) return 1;
+            av_packet_unref(ctx->pending);
+            if (s < 0) return -1;
+            continue;
+        }
+        return (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) ? 1 : -1;
+    }
+}
+
 static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
     if (ctx->kind == LUMEN_PROBE_SUBTITLE) return decode_subtitle(ctx, pkt, out);
 
@@ -377,19 +421,35 @@ static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lum
     ctx->avpkt->pts = pkt->pts_ms >= 0 ? pkt->pts_ms : AV_NOPTS_VALUE;
     ctx->avpkt->dts = AV_NOPTS_VALUE;
     ctx->avpkt->flags = pkt->keyframe ? AV_PKT_FLAG_KEY : 0;
+    ctx->skip_start = pkt->skip_samples_start;
+    ctx->skip_end = pkt->skip_samples_end;
 
     int send_rc = avcodec_send_packet(ctx->avctx, ctx->avpkt);
-    if (send_rc < 0 && send_rc != AVERROR(EAGAIN)) return -1;
+    if (send_rc == AVERROR(EAGAIN)) {
+        /* Frames are waiting. Keep a (refcounted) copy of this packet --
+         * our padded buffer is reused -- and resend it from receive(). */
+        if (ctx->pending->data) av_packet_unref(ctx->pending);
+        if (av_packet_ref(ctx->pending, ctx->avpkt) < 0) return -1;
+    } else if (send_rc < 0) {
+        return -1;
+    }
+    return libav_receive(ctx, out);
+}
 
-    int recv_rc = avcodec_receive_frame(ctx->avctx, ctx->avframe);
-    if (recv_rc == AVERROR(EAGAIN) || recv_rc == AVERROR_EOF) return 1;
-    if (recv_rc < 0) return -1;
-    return emit(ctx, out, pkt->skip_samples_start, pkt->skip_samples_end);
+static void libav_set_skip(lumen_decoder_ctx_t *ctx, int level) {
+    if (ctx->kind != LUMEN_PROBE_VIDEO) return;
+    /* Read per frame by libavcodec, frame threads included. */
+    ctx->avctx->skip_frame       = level >= 1 ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+    ctx->avctx->skip_loop_filter = level >= 2 ? AVDISCARD_ALL    : AVDISCARD_DEFAULT;
 }
 
 static int libav_drain(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
     if (ctx->kind == LUMEN_PROBE_SUBTITLE) return 1;  /* subtitle decoders don't buffer */
     if (!ctx->flush_sent) {
+        if (ctx->pending->data) {                     /* never lose a held packet */
+            avcodec_send_packet(ctx->avctx, ctx->pending);
+            av_packet_unref(ctx->pending);
+        }
         avcodec_send_packet(ctx->avctx, NULL);
         ctx->flush_sent = 1;
     }
@@ -415,6 +475,8 @@ static void libav_frame_free(lumen_frame_t *frame) {
 
 static void libav_flush(lumen_decoder_ctx_t *ctx, int64_t resume_at_ms) {
     avcodec_flush_buffers(ctx->avctx);
+    av_packet_unref(ctx->pending);
+    ctx->skip_start = ctx->skip_end = 0;
     ctx->flush_sent = 0;
     (void)resume_at_ms;       /* real timestamps resume on their own now */
     ctx->last_pts_ms = -1;
@@ -429,6 +491,7 @@ static void libav_close(lumen_decoder_ctx_t *ctx) {
     free(ctx->pad_buf);
     av_frame_free(&ctx->avframe);
     av_packet_free(&ctx->avpkt);
+    av_packet_free(&ctx->pending);
     avcodec_free_context(&ctx->avctx);
     free(ctx);
 }
@@ -441,6 +504,8 @@ static const lumen_decoder_vtable_t VTABLE = {
     .drain = libav_drain,
     .flush = libav_flush,
     .close = libav_close,
+    .receive = libav_receive,
+    .set_skip = libav_set_skip,
 };
 
 static lumen_plugin_descriptor_t DESCRIPTOR = {

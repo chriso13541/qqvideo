@@ -35,7 +35,8 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 22
+#define LUMEN_ABI_VERSION 23
+#define LUMEN_MAX_AUDIO_TRACKS 16
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -443,6 +444,18 @@ typedef struct {
     int  pref_sub_scale_pct;     /* subtitle text size, % */
 
     int  raise_window_requested; /* another launch handed us a file: come to the front */
+
+    /* ---- Audio tracks (v23). Exactly one plays; the core lists them all.
+     * The UI writes audio_selected; the core notices the change, switches
+     * the decoder and audio output, and resumes from the current position. */
+    struct {
+        char label[96];          /* "English - Commentary (5.1, AC3)" */
+        int  available;          /* 0 = listed but can't be decoded */
+        char lang[24];           /* language name if known, for auto-select */
+    } audio_tracks[LUMEN_MAX_AUDIO_TRACKS];
+    int  audio_track_count;
+    int  audio_selected;         /* index into audio_tracks, -1 = none */
+    char pref_audio_lang[32];    /* Preferences > Audio: start with a track in this language */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

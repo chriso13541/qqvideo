@@ -288,6 +288,16 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 st->muted = 0;       /* like dragging the slider: changing volume unmutes */
                 if (st->pref_remember_volume) st->prefs_dirty = 1;
             }
+            /* B: next audio track (VLC's key), skipping unsupported ones */
+            if (e.key.keysym.scancode == SDL_SCANCODE_B &&
+                !ImGui::GetIO().WantCaptureKeyboard &&
+                ctx->state && ctx->state->has_file && ctx->state->audio_track_count > 1) {
+                lumen_playback_state_t *st = ctx->state;
+                for (int k = 1; k < st->audio_track_count; k++) {
+                    int t = (st->audio_selected + k) % st->audio_track_count;
+                    if (st->audio_tracks[t].available) { st->audio_selected = t; break; }
+                }
+            }
             /* V: cycle None -> each available subtitle track -> None (VLC's key) */
             if (e.key.keysym.scancode == SDL_SCANCODE_V &&
                 !ImGui::GetIO().WantCaptureKeyboard &&
@@ -585,7 +595,21 @@ static void prefs_page_audio(lumen_output_ctx_t *ctx, lumen_playback_state_t *st
         }
         ImGui::EndCombo();
     }
-    pref_note("Takes effect with the next video. If the device is missing, the default is used.");
+    pref_note("Switches immediately (same as Audio > Audio Device). If the device is "
+              "missing when a video opens, the default is used.");
+
+    ImGui::SeparatorText("Tracks");
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::InputTextWithHint("Preferred language", "e.g. English", st->pref_audio_lang, sizeof(st->pref_audio_lang));
+    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;
+    if (st->pref_audio_lang[0]) {
+        const char *name = lumen_language_name(st->pref_audio_lang);
+        ImGui::SameLine();
+        if (name) ImGui::TextDisabled("-> %s", name);
+        else      ImGui::TextDisabled("(not a known language -- matched as typed)");
+    }
+    pref_note("When a video has several audio tracks, start with one in this language. "
+              "Empty: the file's default track. Switch any time with Audio > Audio Track or B.");
 
     ImGui::SeparatorText("Volume");
     pref_slider("Up/Down arrow step", &st->pref_volume_step, 1, 25, "%d%%", st);
@@ -972,6 +996,50 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             ImGui::Separator();
             if (ImGui::MenuItem("Quit")) {
                 state->quit_requested = 1;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Audio")) {
+            bool has_file = state->has_file != 0;
+            /* Audio Track: every audio stream in the file; exactly one plays. */
+            if (ImGui::BeginMenu("Audio Track", has_file && state->audio_track_count > 0)) {
+                for (int i = 0; i < state->audio_track_count; i++) {
+                    char item[128];
+                    snprintf(item, sizeof(item), "%s%s##aud%d", state->audio_tracks[i].label,
+                             state->audio_tracks[i].available ? "" : " (not supported)", i);
+                    if (ImGui::MenuItem(item, NULL, state->audio_selected == i,
+                                        state->audio_tracks[i].available != 0))
+                        state->audio_selected = i;
+                }
+                ImGui::EndMenu();
+            }
+            if (has_file && state->audio_track_count == 0) ImGui::SetItemTooltip("This file has no audio");
+            /* Audio Device: where the sound goes. Switches immediately, and
+             * is the same setting as Preferences > Audio > Device. The list
+             * is refreshed each time the submenu opens (headsets come and go). */
+            if (ImGui::BeginMenu("Audio Device")) {
+                if (ImGui::IsWindowAppearing()) {
+                    int n = SDL_GetNumAudioDevices(0);
+                    ctx->audio_dev_count = 0;
+                    for (int i = 0; i < n && ctx->audio_dev_count < 16; i++) {
+                        const char *name = SDL_GetAudioDeviceName(i, 0);
+                        if (name) snprintf(ctx->audio_devs[ctx->audio_dev_count++], 128, "%s", name);
+                    }
+                }
+                if (ImGui::MenuItem("System default", NULL, state->pref_audio_device[0] == '\0')) {
+                    state->pref_audio_device[0] = '\0';
+                    state->prefs_dirty = 1;
+                }
+                if (ctx->audio_dev_count > 0) ImGui::Separator();
+                for (int i = 0; i < ctx->audio_dev_count; i++) {
+                    char item[160];
+                    snprintf(item, sizeof(item), "%s##dev%d", ctx->audio_devs[i], i);
+                    if (ImGui::MenuItem(item, NULL, strcmp(state->pref_audio_device, ctx->audio_devs[i]) == 0)) {
+                        snprintf(state->pref_audio_device, sizeof(state->pref_audio_device), "%s", ctx->audio_devs[i]);
+                        state->prefs_dirty = 1;
+                    }
+                }
+                ImGui::EndMenu();
             }
             ImGui::EndMenu();
         }

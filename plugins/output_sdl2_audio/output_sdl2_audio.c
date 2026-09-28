@@ -40,6 +40,10 @@ struct lumen_output_ctx {
     int64_t last_pulled;        /* queued_end_pts - queued at the last pull */
     Uint64  pulled_ticks;       /* when that pull was first seen */
     Uint64  frozen_elapsed;     /* interpolation progress captured at pause */
+    /* What's open now, so a device change (Audio > Audio Device) can reopen
+     * the same format on the new device immediately. */
+    int     cur_rate, cur_channels;
+    char    cur_device[128];
 };
 
 static int sdl2_audio_open(lumen_output_ctx_t **out_ctx) {
@@ -71,6 +75,9 @@ static int sdl2_audio_load_stream(lumen_output_ctx_t *ctx, int sample_rate, int 
     /* Preferences > Audio > output device ("" = system default). If the
      * chosen device is gone (unplugged headset), fall back to the default. */
     const char *devname = (ctx->state && ctx->state->pref_audio_device[0]) ? ctx->state->pref_audio_device : NULL;
+    ctx->cur_rate = sample_rate;
+    ctx->cur_channels = channels;
+    snprintf(ctx->cur_device, sizeof(ctx->cur_device), "%s", devname ? devname : "");
     SDL_AudioDeviceID dev = SDL_OpenAudioDevice(devname, 0, &wanted, &obtained, 0);
     if (!dev && devname) {
         fprintf(stderr, "lumen: audio device '%s' unavailable (%s) -- using the default\n", devname, SDL_GetError());
@@ -97,6 +104,22 @@ static void sdl2_audio_bind_state(lumen_output_ctx_t *ctx, lumen_playback_state_
 
 static int sdl2_audio_pump_ui(lumen_output_ctx_t *ctx, lumen_playback_state_t *state) {
     if (!state || !ctx->device) return 0;
+
+    /* Audio > Audio Device (or Preferences) picked another device: move to
+     * it NOW, same format. What was queued on the old device (~0.25 s) is
+     * lost; the audio clock restarts with the next audio queued, and video
+     * stays in sync with it. */
+    if (ctx->cur_rate > 0 && strcmp(state->pref_audio_device, ctx->cur_device) != 0) {
+        int was_paused = ctx->device_paused;
+        printf("  [sdl2-audio] switching output to '%s'\n",
+               state->pref_audio_device[0] ? state->pref_audio_device : "system default");
+        if (sdl2_audio_load_stream(ctx, ctx->cur_rate, ctx->cur_channels, LUMEN_SAMPLEFMT_S16) != 0 || !ctx->device)
+            return 0;
+        if (was_paused || state->paused) {                    /* keep a paused player paused */
+            SDL_PauseAudioDevice(ctx->device, 1);
+            ctx->device_paused = 1;
+        }
+    }
 
     if (state->paused != ctx->device_paused) {
         /* Pausing the device stops playback immediately AND keeps the

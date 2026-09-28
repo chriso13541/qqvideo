@@ -30,6 +30,7 @@ void lumen_prefs_defaults(lumen_playback_state_t *st) {
     st->pref_sub_autoload = 1;
     st->pref_sub_lang[0] = '\0';
     st->pref_sub_scale_pct = 100;
+    st->pref_audio_lang[0] = '\0';
 }
 
 /* Builds the config directory path; creates it if `create`. */
@@ -79,6 +80,7 @@ void lumen_prefs_load(lumen_playback_state_t *st) {
         if (sscanf(line, " %63[^= ] = %255[^\r\n]", key, sval) < 1) continue;
         if (!strcmp(key, "audio_device")) { snprintf(st->pref_audio_device, sizeof(st->pref_audio_device), "%s", sval); continue; }
         if (!strcmp(key, "subtitle_language")) { snprintf(st->pref_sub_lang, sizeof(st->pref_sub_lang), "%s", sval); continue; }
+        if (!strcmp(key, "audio_language")) { snprintf(st->pref_audio_lang, sizeof(st->pref_audio_lang), "%s", sval); continue; }
         if (sscanf(sval, "%d", &v) != 1) continue;
         if      (!strcmp(key, "precise_seek"))    st->precise_seek = v != 0;
         else if (!strcmp(key, "frame_skipping"))  st->pref_frameskip = v != 0;
@@ -130,6 +132,7 @@ int lumen_prefs_save(const lumen_playback_state_t *st) {
     fprintf(f, "subtitle_autoload = %d\n", st->pref_sub_autoload ? 1 : 0);
     fprintf(f, "subtitle_language = %s\n", st->pref_sub_lang);
     fprintf(f, "subtitle_size = %d\n", st->pref_sub_scale_pct);
+    fprintf(f, "audio_language = %s\n", st->pref_audio_lang);
     if (fclose(f) != 0) return -1;
     /* write-then-rename, so a crash mid-save can't leave a truncated file */
 #if defined(_WIN32)

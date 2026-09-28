@@ -56,6 +56,17 @@ static const lumen_libav_codec_t LUMEN_LIBAV_CODECS[] = {
     { "FLAC", AV_CODEC_ID_FLAC,       2, 0 },
     { "AC3",  AV_CODEC_ID_AC3,        2, 0 },
     { "EAC3", AV_CODEC_ID_EAC3,       2, 0 },
+    /* Common on Blu-ray / 4K releases: DTS (incl. DTS-HD MA: the dca decoder
+     * handles the lossless extension), Dolby TrueHD, uncompressed PCM, ALAC */
+    { "DTS",  AV_CODEC_ID_DTS,        2, 0 },
+    { "TRHD", AV_CODEC_ID_TRUEHD,     2, 0 },
+    { "ALAC", AV_CODEC_ID_ALAC,       2, 0 },
+    { "S16L", AV_CODEC_ID_PCM_S16LE,  2, 0 },
+    { "S24L", AV_CODEC_ID_PCM_S24LE,  2, 0 },
+    { "S32L", AV_CODEC_ID_PCM_S32LE,  2, 0 },
+    { "S16B", AV_CODEC_ID_PCM_S16BE,  2, 0 },
+    { "S24B", AV_CODEC_ID_PCM_S24BE,  2, 0 },
+    { "F32L", AV_CODEC_ID_PCM_F32LE,  2, 0 },
     /* subtitles: text-based (decoded to plain text) */
     { "SRT",  AV_CODEC_ID_SUBRIP,     3, 0 },
     { "ASS",  AV_CODEC_ID_ASS,        3, 0 },

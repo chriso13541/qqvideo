@@ -89,6 +89,15 @@ styling tags are stripped and text is drawn outlined at the bottom of the
 picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
 VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
 
+**Audio menu** (between File and Subtitles): *Audio Track* lists every
+audio stream -- language, title, channels, codec -- and switches live
+(resuming from the current position; `B` cycles tracks); *Audio Device*
+moves the sound to another output immediately. Preferences > Audio can
+pick a preferred language to start with. Exactly one track plays: the
+selected one's packets are decoded, the others' are dropped unread.
+Supported audio: AAC, MP3, Opus, Vorbis, FLAC, AC-3, E-AC-3, DTS (incl.
+DTS-HD MA), Dolby TrueHD, ALAC and PCM.
+
 **Single instance** (Preferences > General, Linux): with "Only one qqvideo
 window" on, launching `qqvideo file.mkv` while it's running hands the file
 to the running window (play now or add to the queue) and exits, via a

@@ -106,6 +106,36 @@ static const char *path_basename(const char *p) {
     return s ? s + 1 : p;
 }
 
+/* "English - Commentary (5.1, Dolby Digital)" / "Track 2 (Stereo, AAC)" */
+static const char *codec_display_name(const char *fourcc) {
+    static const char *map[][2] = {
+        {"AAC","AAC"}, {"AC3","Dolby Digital"}, {"EAC3","Dolby Digital Plus"}, {"TRHD","Dolby TrueHD"},
+        {"DTS","DTS"}, {"OPUS","Opus"}, {"VORB","Vorbis"}, {"FLAC","FLAC"}, {"MP3","MP3"}, {"ALAC","ALAC"},
+        {"S16L","PCM"}, {"S24L","PCM"}, {"S32L","PCM"}, {"S16B","PCM"}, {"S24B","PCM"}, {"F32L","PCM"},
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (!strcmp(map[i][0], fourcc)) return map[i][1];
+    return fourcc;
+}
+static void make_audio_label(const lumen_stream_desc_t *sd, int number, char *out, size_t n) {
+    const char *lang = sd->language[0] ? lumen_language_name(sd->language) : NULL;
+    if (!lang && sd->language[0]) lang = sd->language;
+    char base[80];
+    if (sd->title[0] && lang && !strstr(sd->title, lang)) snprintf(base, sizeof(base), "%s - %s", lang, sd->title);
+    else if (sd->title[0])                                snprintf(base, sizeof(base), "%s", sd->title);
+    else if (lang)                                        snprintf(base, sizeof(base), "%s", lang);
+    else                                                  snprintf(base, sizeof(base), "Track %d", number);
+    char ch[16];
+    switch (sd->channels) {
+        case 1:  snprintf(ch, sizeof(ch), "Mono");   break;
+        case 2:  snprintf(ch, sizeof(ch), "Stereo"); break;
+        case 6:  snprintf(ch, sizeof(ch), "5.1");    break;
+        case 8:  snprintf(ch, sizeof(ch), "7.1");    break;
+        default: snprintf(ch, sizeof(ch), "%d ch", sd->channels);
+    }
+    snprintf(out, n, "%s (%s, %s)", base, ch, codec_display_name(sd->codec_fourcc));
+}
+
 /* Adds a track entry to the UI list; returns its index or -1 if full. */
 static int add_track_entry(lumen_playback_state_t *st, const char *label, int available, int external) {
     if (st->subtitle_track_count >= LUMEN_MAX_SUB_TRACKS) return -1;
@@ -535,6 +565,8 @@ typedef struct {
     int     catch_discarded;
     int     half_frame_ms;        /* half a video frame: tolerance for "the frame AT the target" */
     pkt_fifo_t afifo, vfifo;      /* decode thread only */
+    int     active_audio;         /* stream index of the audio track that plays (-1 = none);
+                                     main writes it together with a seek, see "audio switch" */
     int     hard_drops;           /* times video jumped to the next keyframe to catch up */
 } engine_t;
 
@@ -829,6 +861,9 @@ static void *decode_thread_main(void *arg) {
     int read_eof = 0, drained = 0;
     int dropping = 0;                 /* skipping video packets until a keyframe */
     e->catch_target = -1;
+    pthread_mutex_lock(&e->lock);
+    int active_audio = e->active_audio;
+    pthread_mutex_unlock(&e->lock);
 
     for (;;) {
         enum { NONE, DEC_AUDIO, DEC_VIDEO, READ, DRAIN } act = NONE;
@@ -866,6 +901,7 @@ static void *decode_thread_main(void *arg) {
             int flags = e->seek_flags;
             int precise = e->seek_precise;
             int serial = e->serial;
+            active_audio = e->active_audio;   /* an audio track switch rides on a seek */
             if (precise) flags = LUMEN_SEEK_BACKWARD;   /* keyframe before, then decode up to the target */
             e->seek_pending = 0;
             pthread_mutex_unlock(&e->lock);
@@ -913,7 +949,11 @@ static void *decode_thread_main(void *arg) {
             if (si < 0 || si >= LUMEN_MAX_STREAMS || !e->streams[si].in_use) {
                 e->dmx->packet_free(&pkt);
             } else if (e->streams[si].type == LUMEN_STREAM_AUDIO) {
-                fifo_push(&e->afifo, &pkt);
+                /* Only the selected track plays: the others' packets are
+                 * dropped unread. (Decoding every track into one output
+                 * mixed them into noise and ran playback at 0.16x.) */
+                if (si == active_audio) fifo_push(&e->afifo, &pkt);
+                else e->dmx->packet_free(&pkt);
             } else if (e->streams[si].type == LUMEN_STREAM_VIDEO) {
                 fifo_push(&e->vfifo, &pkt);
             } else {
@@ -1059,6 +1099,11 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     lumen_sub_track_t sub_tracks[LUMEN_MAX_SUB_TRACKS];
     memset(sub_tracks, 0, sizeof(sub_tracks));
     int sub_number = 0;
+    /* Audio tracks: all listed, one plays. */
+    int audio_stream_of[LUMEN_MAX_AUDIO_TRACKS];   /* track -> stream index */
+    int audio_is_default[LUMEN_MAX_AUDIO_TRACKS];
+    state->audio_track_count = 0;
+    state->audio_selected = -1;
 
     for (int i = 0; i < table.stream_count; i++) {
         const lumen_stream_desc_t *sd = &table.streams[i];
@@ -1068,6 +1113,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         if (sd->stream_index < 0 || sd->stream_index >= LUMEN_MAX_STREAMS) {
             fprintf(stderr, "lumen: stream %d index out of range, skipping\n", i);
             continue;
+        }
+        int atrack = -1;          /* this stream's entry in the Audio > Audio Track menu */
+        if (sd->type == LUMEN_STREAM_AUDIO && state->audio_track_count < LUMEN_MAX_AUDIO_TRACKS) {
+            atrack = state->audio_track_count++;
+            make_audio_label(sd, atrack + 1, state->audio_tracks[atrack].label, sizeof(state->audio_tracks[0].label));
+            const char *ln = sd->language[0] ? lumen_language_name(sd->language) : NULL;
+            snprintf(state->audio_tracks[atrack].lang, sizeof(state->audio_tracks[0].lang), "%s",
+                     ln ? ln : sd->language);
+            state->audio_tracks[atrack].available = 0;     /* until its decoder opens below */
+            audio_stream_of[atrack] = sd->stream_index;
+            audio_is_default[atrack] = sd->is_default;
         }
 
         /* Subtitle streams: always LISTED in the menu; decoded only if a
@@ -1164,10 +1220,33 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         }
         ss->in_use = 1;
         ss->type = sd->type;
+        if (atrack >= 0) state->audio_tracks[atrack].available = 1;
         printf("lumen: stream %d (%s, codec='%s') -> decoder '%s' (%s)\n",
                sd->stream_index, type_name, sd->codec_fourcc,
                ss->decoder_plugin.desc->name, ss->decoder_plugin.desc->version);
     }
+
+    /* Which audio track plays: the preferred language (Preferences >
+     * Audio), else the file's "default" track, else the first that works. */
+    {
+        int pick = -1;
+        if (state->pref_audio_lang[0]) {
+            const char *want = lumen_language_name(state->pref_audio_lang);
+            if (!want) want = state->pref_audio_lang;
+            for (int t = 0; t < state->audio_track_count && pick < 0; t++)
+                if (state->audio_tracks[t].available && !strcasecmp(state->audio_tracks[t].lang, want)) pick = t;
+        }
+        for (int t = 0; t < state->audio_track_count && pick < 0; t++)
+            if (state->audio_tracks[t].available && audio_is_default[t]) pick = t;
+        for (int t = 0; t < state->audio_track_count && pick < 0; t++)
+            if (state->audio_tracks[t].available) pick = t;
+        state->audio_selected = pick;
+        if (state->audio_track_count > 1 && pick >= 0)
+            printf("lumen: %d audio tracks -- playing %d: %s\n", state->audio_track_count, pick,
+                   state->audio_tracks[pick].label);
+    }
+    int cur_audio_track = state->audio_selected;
+    int active_audio_stream = cur_audio_track >= 0 ? audio_stream_of[cur_audio_track] : -1;
 
     /* Subtitle files that live next to the movie (or in Subs/): listed
      * after the embedded tracks, loaded now (a few KB each), NOT selected
@@ -1226,7 +1305,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 fprintf(stderr, "lumen: no video output available -- video will decode but not display\n");
             }
         }
-        if (sd->type == LUMEN_STREAM_AUDIO && !aout) {
+        if (sd->type == LUMEN_STREAM_AUDIO && !aout && sd->stream_index == active_audio_stream) {
             if (session->have_aout) {
                 if (session->aout->load_stream(session->aout_ctx, sd->sample_rate, sd->channels, LUMEN_SAMPLEFMT_S16) == 0) {
                     aout = session->aout;
@@ -1252,8 +1331,9 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     for (int i = 0; i < LUMEN_MAX_STREAMS; i++) {
         if (!streams[i].in_use) continue;
         if (streams[i].type == LUMEN_STREAM_VIDEO) e->has_video = 1;
-        if (streams[i].type == LUMEN_STREAM_AUDIO) e->has_audio = 1;
     }
+    e->active_audio = active_audio_stream;
+    e->has_audio = active_audio_stream >= 0;
     e->half_frame_ms = 20;                       /* ~24-25 fps if the rate is unknown */
     for (int i = 0; i < table.stream_count; i++)
         if (table.streams[i].type == LUMEN_STREAM_VIDEO && table.streams[i].frame_rate > 1.0)
@@ -1307,6 +1387,43 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 pthread_mutex_unlock(&e->lock);
             } else {
                 state->subtitle_text[0] = '\0';
+            }
+        }
+
+        /* Audio > Audio Track: switch tracks. Reconfigure the output for the
+         * new track's format, then re-read from the current position with
+         * the new track active -- a precise seek, like mpv does it -- so its
+         * audio starts exactly where playback is, with no gap or jump. */
+        if (state->audio_selected != cur_audio_track) {
+            int t = state->audio_selected;
+            const lumen_stream_desc_t *nsd = NULL;
+            if (t >= 0 && t < state->audio_track_count && state->audio_tracks[t].available)
+                for (int i = 0; i < table.stream_count; i++)
+                    if (table.streams[i].stream_index == audio_stream_of[t]) nsd = &table.streams[i];
+            if (!nsd) {
+                state->audio_selected = cur_audio_track;      /* not playable: ignore */
+            } else {
+                if (session->have_aout &&
+                    session->aout->load_stream(session->aout_ctx, nsd->sample_rate, nsd->channels, LUMEN_SAMPLEFMT_S16) == 0)
+                    aout = session->aout;
+                pthread_mutex_lock(&e->lock);
+                e->active_audio = nsd->stream_index;
+                e->has_audio = 1;
+                e->seek_pending = 1;
+                e->seek_target = state->position_ms;
+                e->seek_flags = LUMEN_SEEK_BACKWARD;
+                e->seek_precise = 1;
+                e->serial++;
+                e->eof = 0;
+                queues_clear(e);
+                pthread_cond_broadcast(&e->cond);
+                pthread_mutex_unlock(&e->lock);
+                state->seek_generation++;
+                wall_anchor_valid = 0;
+                buffering = state->pref_buffer_enabled;
+                cur_audio_track = t;
+                printf("lumen: audio track -> %d: %s\n", t, state->audio_tracks[t].label);
+                continue;
             }
         }
 
@@ -1521,6 +1638,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     pthread_mutex_destroy(&e->lock);
     state->buffering = 0;
     state->buffer_ahead_ms = 0;
+    state->audio_track_count = 0;
+    state->audio_selected = -1;
     out_stats->frames_decoded = e->frames_decoded;
     out_stats->video_frames = e->video_frames;
     out_stats->audio_frames = e->audio_frames;

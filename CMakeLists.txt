@@ -129,6 +129,10 @@ target_include_directories(qqvideo PRIVATE
     ${SDL2_INCLUDE_DIRS})
 target_compile_definitions(qqvideo PRIVATE LUMEN_BUILTIN)
 target_link_libraries(qqvideo ${SDL2_LIBRARIES})
+# The decode thread (player_core.c). POSIX threads everywhere: glibc on
+# Linux, winpthreads under MinGW-w64/MSYS2 on Windows.
+find_package(Threads REQUIRED)
+target_link_libraries(qqvideo Threads::Threads)
 target_link_directories(qqvideo PRIVATE ${SDL2_LIBRARY_DIRS})
 if (UNIX)
   target_link_libraries(qqvideo dl)

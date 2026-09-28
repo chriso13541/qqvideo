@@ -89,6 +89,15 @@ styling tags are stripped and text is drawn outlined at the bottom of the
 picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
 VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
 
+**Preferences** (Tools > Preferences, saved to
+`~/.config/qqvideo/preferences.ini`, or `%APPDATA%\qqvideo\` on Windows):
+precise seeking, adaptive frame skipping, and **Buffer ahead** -- decode
+into memory ahead of the playhead (a time target within a memory cap),
+start after 2 s, keep filling while playing, and pause to refill rather
+than stutter if it runs dry. It smooths out heavy scenes when decoding
+is faster than real time on average; the window shows the measured
+decoding speed for the open file, since below 1.0x no buffer can keep up.
+
 **What changes about the security model.** A distro `libavcodec.so`
 contains every decoder the distro enabled, so "not installed = not
 mapped into the process" no longer holds. What holds instead is "not

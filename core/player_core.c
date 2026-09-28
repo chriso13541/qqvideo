@@ -2,6 +2,7 @@
 #include "plugin_loader.h"
 #include "subtitles.h"
 #include "sidecar.h"
+#include "prefs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,7 +242,10 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
     lumen_session_t *session = (lumen_session_t *)calloc(1, sizeof(*session));
     session->reg = reg;
     session->state.volume = 1.0f;
-    session->state.precise_seek = 1;
+    lumen_prefs_defaults(&session->state);
+    lumen_prefs_load(&session->state);
+    if (session->state.prefs_path[0])
+        printf("lumen: preferences: %s\n", session->state.prefs_path);
 
     /* Video and audio output are BUILT INTO the executable -- they are not
      * loaded from the plugin registry. Accessing them directly means:
@@ -292,6 +296,10 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
 lumen_idle_result_t lumen_session_idle(lumen_session_t *session) {
     session->state.has_file = 0;
     while (1) {
+        if (session->state.prefs_dirty) {
+            session->state.prefs_dirty = 0;
+            lumen_prefs_save(&session->state);
+        }
         if (session->have_vout && session->vout->pump_ui &&
             session->vout->pump_ui(session->vout_ctx, &session->state)) {
             return LUMEN_IDLE_QUIT; /* window closed / ESC */
@@ -358,6 +366,11 @@ static int audio_clock(lumen_session_t *session, const lumen_audio_output_vtable
  * this file. Returns 1 (and fills out_stats) if playback must stop. */
 static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
                           lumen_playback_state_t *state, lumen_play_stats_t *out_stats) {
+    if (state->prefs_dirty) {                   /* Preferences changed in the UI */
+        state->prefs_dirty = 0;
+        if (lumen_prefs_save(state) != 0)
+            fprintf(stderr, "lumen: couldn't save preferences to %s\n", state->prefs_path);
+    }
     if (session->have_vout && session->vout->pump_ui &&
         session->vout->pump_ui(session->vout_ctx, state)) {
         state->quit_requested = 1;
@@ -412,10 +425,14 @@ static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vta
 #define VQ_SOFT        8                /* decode this far ahead normally */
 #define VQ_HARD        16               /* ...further only if audio is running low */
 #define VQ_MAX_BYTES   ((size_t)192 << 20)  /* a 4K frame is ~12 MB: bound memory, not count */
-#define AQ_CAP         512              /* decoded audio frames */
+#define VQ_SLOTS       4096             /* ring capacity; with "Buffer ahead" on, time and
+                                           memory limits apply long before this */
+#define AQ_CAP         8192             /* decoded audio frames (~3 min at 21 ms each) */
 #define AQ_AHEAD_MAX_MS 3000            /* audio decoded ahead can't exceed this */
 #define AQ_AUDIO_ONLY_MS 500            /* audio-only files: decode this far ahead */
 #define DEVICE_TARGET_MS 250            /* keep this much queued in the audio device */
+#define BUF_START_MS    2000            /* "Buffer ahead": start / resume playing once this
+                                           much is ready, and keep filling while playing */
 
 typedef struct {
     lumen_frame_t                 frame;
@@ -429,8 +446,21 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  cond;        /* decode thread sleeps here: waiting for room / a command */
 
-    qitem_t vq[VQ_HARD];  int vq_head, vq_count; size_t vq_bytes;
+    qitem_t vq[VQ_SLOTS]; int vq_head, vq_count; size_t vq_bytes; int64_t vq_last_pts;
     qitem_t aq[AQ_CAP];   int aq_head, aq_count; int64_t aq_ms;
+
+    /* "Buffer ahead" (main -> decode, refreshed every pass) */
+    int     buf_enabled;
+    int64_t buf_target_ms;       /* decode this far ahead of the playhead */
+    size_t  buf_max_bytes;       /* ...within this much memory */
+    int64_t play_pos;            /* playhead, for "how far ahead are we" */
+    /* decode -> main */
+    int     room_wait;           /* decode thread is idle because the buffer is full */
+    int     pref_frameskip;
+    /* Decoding speed (decode thread): media time produced per unit of busy
+     * (not waiting-for-room) time, smoothed. 1.0 = exactly real time. */
+    double  decode_speed;
+    int64_t spd_busy_since, spd_media_start, spd_media_last;
 
     /* main -> decode */
     int     abort;
@@ -475,7 +505,7 @@ static int64_t audio_ms(const lumen_frame_t *f) {
 }
 static void vq_pop(engine_t *e, qitem_t *out) {
     *out = e->vq[e->vq_head];
-    e->vq_head = (e->vq_head + 1) % VQ_HARD;
+    e->vq_head = (e->vq_head + 1) % VQ_SLOTS;
     e->vq_count--;
     e->vq_bytes -= video_bytes(&out->frame);
 }
@@ -492,14 +522,28 @@ static void queues_clear(engine_t *e) {
 }
 
 /* Room for the decode thread to read another packet? (lock held) */
+static int64_t video_ahead_ms(const engine_t *e) {
+    return e->vq_count > 0 ? e->vq_last_pts - e->play_pos : 0;
+}
+
 static int has_room(const engine_t *e) {
+    int reserve = (int)e->aq_ms + (e->clk_valid ? e->clk_buf_ms : 0);
+    if (e->buf_enabled) {
+        /* "Buffer ahead": up to buf_target_ms of playback, within
+         * buf_max_bytes. Audio may run a little further so it never
+         * starves while the video side is at its limit. */
+        if (e->aq_count >= AQ_CAP - 8 || e->aq_ms >= e->buf_target_ms + 1500) return 0;
+        if (e->has_video) {
+            int mem_ok = e->vq_bytes < e->buf_max_bytes && e->vq_count < VQ_SLOTS - 1;
+            return mem_ok && (video_ahead_ms(e) < e->buf_target_ms || reserve < 150);
+        }
+        return !e->has_audio || e->aq_ms < e->buf_target_ms;
+    }
     int aq_ok = e->aq_count < AQ_CAP - 8 && e->aq_ms < AQ_AHEAD_MAX_MS;
     if (!aq_ok) return 0;
-    if (e->has_video) {
-        int reserve = (int)e->aq_ms + (e->clk_valid ? e->clk_buf_ms : 0);
+    if (e->has_video)
         return (e->vq_count < VQ_SOFT && e->vq_bytes < VQ_MAX_BYTES) ||
                (reserve < 150 && e->vq_count < VQ_HARD - 1);
-    }
     if (e->has_audio) return e->aq_ms < AQ_AUDIO_ONLY_MS;
     return 1;
 }
@@ -509,7 +553,8 @@ static int has_room(const engine_t *e) {
 static void push_frame(engine_t *e, lumen_frame_t *f, const lumen_decoder_vtable_t *dec) {
     int video = f->type == LUMEN_STREAM_VIDEO;
     pthread_mutex_lock(&e->lock);
-    while (!e->abort && !e->seek_pending && (video ? e->vq_count >= VQ_HARD : e->aq_count >= AQ_CAP))
+    int vcap = e->buf_enabled ? VQ_SLOTS : VQ_HARD;
+    while (!e->abort && !e->seek_pending && (video ? e->vq_count >= vcap : e->aq_count >= AQ_CAP))
         pthread_cond_wait(&e->cond, &e->lock);
     if (e->abort || e->seek_pending) {
         pthread_mutex_unlock(&e->lock);
@@ -518,7 +563,19 @@ static void push_frame(engine_t *e, lumen_frame_t *f, const lumen_decoder_vtable
     }
     qitem_t it = { *f, dec, e->dec_serial };
     if (video) {
-        e->vq[(e->vq_head + e->vq_count) % VQ_HARD] = it;
+        e->vq[(e->vq_head + e->vq_count) % VQ_SLOTS] = it;
+        e->vq_last_pts = f->pts;
+        /* Speed sample every ~2 s of media while the thread was busy. */
+        if (e->spd_busy_since == 0) { e->spd_busy_since = now_ms(); e->spd_media_start = f->pts; }
+        else if (f->pts - e->spd_media_start >= 2000) {
+            int64_t busy = now_ms() - e->spd_busy_since;
+            if (busy > 0) {
+                double sp = (double)(f->pts - e->spd_media_start) / (double)busy;
+                e->decode_speed = e->decode_speed > 0 ? e->decode_speed * 0.6 + sp * 0.4 : sp;
+            }
+            e->spd_busy_since = now_ms();
+            e->spd_media_start = f->pts;
+        }
         e->vq_count++;
         e->vq_bytes += video_bytes(f);
         e->video_frames++;
@@ -572,9 +629,17 @@ static void skip_change(stream_state_t *ss, skip_state_t *k, int level, int64_t 
 }
 
 static void skip_policy(engine_t *e, stream_state_t *ss, skip_state_t *k, int64_t pts) {
-    static int disabled = -1;          /* QQVIDEO_FRAMESKIP=0: always decode everything */
-    if (disabled < 0) { const char *v = getenv("QQVIDEO_FRAMESKIP"); disabled = v && v[0] == '0'; }
-    if (disabled || !ss->dec_vt->set_skip) return;
+    /* Preferences > Adaptive frame skipping; QQVIDEO_FRAMESKIP=0/1 overrides. */
+    static int env = -2;
+    if (env == -2) { const char *v = getenv("QQVIDEO_FRAMESKIP"); env = v ? (v[0] != '0') : -1; }
+    pthread_mutex_lock(&e->lock);
+    int enabled = env >= 0 ? env : e->pref_frameskip;
+    pthread_mutex_unlock(&e->lock);
+    if (!ss->dec_vt->set_skip) return;
+    if (!enabled) {                    /* turned off (maybe mid-file): back to full decoding */
+        if (k->level) { skip_change(ss, k, 0, pts); printf("lumen: frame skipping off\n"); }
+        return;
+    }
     if (k->warmup > 0) { k->warmup--; return; }
     if (pts < k->hold_until) return;
 
@@ -683,8 +748,12 @@ static void *decode_thread_main(void *arg) {
 
     for (;;) {
         pthread_mutex_lock(&e->lock);
-        while (!e->abort && !e->seek_pending && (eof || !has_room(e)))
+        while (!e->abort && !e->seek_pending && (eof || !has_room(e))) {
+            e->room_wait = !eof;             /* buffer full (not merely finished) */
+            e->spd_busy_since = 0;           /* idle time isn't decoding time */
             pthread_cond_wait(&e->cond, &e->lock);
+        }
+        e->room_wait = 0;
         if (e->abort) { pthread_mutex_unlock(&e->lock); break; }
         if (e->seek_pending) {
             int64_t target = e->seek_target;
@@ -720,6 +789,7 @@ static void *decode_thread_main(void *arg) {
             pthread_mutex_lock(&e->lock);
             e->dec_serial = serial;
             e->eof = 0;
+            e->spd_busy_since = 0;
             queues_clear(e);              /* anything queued is from before the seek */
             pthread_mutex_unlock(&e->lock);
             continue;
@@ -1022,6 +1092,14 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
 
     int stop_requested = !e->thread_started;
     int was_paused = 0;
+    /* "Buffer ahead": fill before playback starts (and after every seek);
+     * if the buffer ever runs dry, stop and refill instead of stuttering. */
+    int buffering = state->pref_buffer_enabled;
+    int rebuffers = 0;
+    state->video_fps = 0.0;
+    for (int i = 0; i < table.stream_count; i++)
+        if (table.streams[i].type == LUMEN_STREAM_VIDEO && streams[table.streams[i].stream_index].in_use)
+            state->video_fps = table.streams[i].frame_rate;
     int64_t wall_anchor = 0;      /* wall-clock pacing: frame pts p is due at wall_anchor + p */
     int wall_anchor_valid = 0;
 
@@ -1076,6 +1154,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             state->seek_requested = 0;
             state->seek_flags = LUMEN_SEEK_BACKWARD;   /* back to the default for the next seek */
             wall_anchor_valid = 0;
+            buffering = state->pref_buffer_enabled;    /* refill from the new position */
             continue;
         }
 
@@ -1085,6 +1164,53 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             continue;
         }
         if (was_paused) { was_paused = 0; wall_anchor_valid = 0; }
+
+        /* Settings the decode thread follows, refreshed every pass so
+         * Preferences changes apply immediately. */
+        int64_t ahead_ms;
+        int full, at_eof, vq_n;
+        size_t vq_b;
+        pthread_mutex_lock(&e->lock);
+        e->buf_enabled   = state->pref_buffer_enabled;
+        e->buf_target_ms = (int64_t)state->pref_buffer_seconds * 1000;
+        e->buf_max_bytes = (size_t)state->pref_buffer_mb << 20;
+        e->play_pos      = state->position_ms;
+        e->pref_frameskip = state->pref_frameskip;
+        ahead_ms = e->has_video ? video_ahead_ms(e) : e->aq_ms;
+        full     = e->room_wait;
+        at_eof   = e->eof && e->dec_serial == e->serial;
+        vq_n     = e->vq_count;
+        vq_b     = e->vq_bytes;
+        state->decode_speed_pct = (int)(e->decode_speed * 100.0 + 0.5);
+        pthread_cond_signal(&e->cond);            /* limits may have grown: let it read on */
+        pthread_mutex_unlock(&e->lock);
+        state->buffer_ahead_ms = ahead_ms > 0 ? (int)ahead_ms : 0;
+        if (!state->pref_buffer_enabled) buffering = 0;
+
+        if (buffering) {
+            /* Start (or resume) once BUF_START_MS is ready -- or the buffer
+             * can't grow further (memory limit / end of file) -- and keep
+             * filling toward the full size while playing, like YouTube.
+             * Waiting for the FULL buffer first cost 17 s of black screen
+             * on a CPU too slow for the video (measured). */
+            int64_t start_ms = e->buf_target_ms < BUF_START_MS ? e->buf_target_ms : BUF_START_MS;
+            int pct_t = start_ms > 0 ? (int)(ahead_ms * 100 / start_ms) : 100;
+            int pct_m = e->buf_max_bytes > 0 ? (int)(vq_b * 100 / e->buf_max_bytes) : 0;
+            int pct = pct_t > pct_m ? pct_t : pct_m;
+            state->buffer_fill_pct = pct > 100 ? 100 : (pct < 0 ? 0 : pct);
+            if (full || at_eof || ahead_ms >= start_ms) {
+                buffering = 0;
+                wall_anchor_valid = 0;            /* start the clock fresh from here */
+                printf("lumen: buffered %.1f s ahead (%d frames, %zu MB)\n",
+                       ahead_ms / 1000.0, vq_n, vq_b >> 20);
+            } else {
+                state->buffering = 1;
+                sleep_ms(5);                      /* decode thread is filling; UI keeps pumping */
+                continue;
+            }
+        }
+        state->buffering = 0;
+        (void)vq_n;
 
         int64_t aclk;
         int abuf;
@@ -1181,6 +1307,20 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         pthread_mutex_unlock(&e->lock);
         if (done && abuf <= 0) break;
 
+        /* Buffer ran dry mid-file: refill rather than stutter along. Only
+         * once audio is nearly out too -- a brief empty video queue with
+         * audio still playing is normal frame-to-frame jitter. */
+        if (state->pref_buffer_enabled && !done && !at_eof) {
+            pthread_mutex_lock(&e->lock);
+            int dry = (e->has_video ? e->vq_count == 0 : 1) && e->aq_count == 0;
+            pthread_mutex_unlock(&e->lock);
+            if (dry && abuf < 60) {
+                buffering = 1;
+                rebuffers++;
+                printf("lumen: buffer ran dry -- rebuffering (%d)\n", rebuffers);
+            }
+        }
+
         if (!did_work) sleep_ms(2);
     }
 
@@ -1195,6 +1335,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     queues_clear(e);      /* frames never shown -- before their decoders close */
     pthread_cond_destroy(&e->cond);
     pthread_mutex_destroy(&e->lock);
+    state->buffering = 0;
+    state->buffer_ahead_ms = 0;
     out_stats->frames_decoded = e->frames_decoded;
     out_stats->video_frames = e->video_frames;
     out_stats->audio_frames = e->audio_frames;

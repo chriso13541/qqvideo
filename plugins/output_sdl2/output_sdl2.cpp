@@ -53,6 +53,7 @@
 
 /* Forward declarations -- pkg_render calls pkg_close, defined below it */
 static void pkg_open(lumen_output_ctx_t *ctx);
+static void prefs_open(lumen_output_ctx_t *ctx);
 static void pkg_close(lumen_output_ctx_t *ctx);
 static void pkg_render(lumen_output_ctx_t *ctx);
 
@@ -71,6 +72,8 @@ struct lumen_output_ctx {
     lumen_playback_state_t *state; /* bound via bind_state(); NULL until then */
     float         seek_preview_ms; /* local copy while the user is actively dragging the seek bar */
     int           min_w, min_h;    /* minimum window size, computed from the control bar (0 = not yet) */
+    int           have_frame;      /* texture holds a real frame (not yet after load: it's uninitialized
+                                      memory, which shows up as solid green) */
     int           dragging_seek;   /* persisted across frames -- see draw_controls() for why */
     int64_t       last_seen_seek_generation;
     int           was_paused;      /* detects the pause->resume transition, not just current state */
@@ -102,6 +105,12 @@ struct lumen_output_ctx {
     SDL_Window   *pkg_window;
     SDL_Renderer *pkg_renderer;
     int           pkg_window_open; /* 1 while the window is shown */
+
+    /* ---- Preferences (third system window, same pattern) ---- */
+    ImGuiContext *pref_imgui_ctx;
+    SDL_Window   *pref_window;
+    SDL_Renderer *pref_renderer;
+    int           pref_window_open;
 
     /* Per-container codec disable list. Each entry blocks one (demuxer, decoder)
      * pair: e.g., {"mp4-demuxer", "h264-decoder"} means H.264 is disabled only
@@ -191,20 +200,27 @@ static int handle_events(lumen_output_ctx_t *ctx) {
         else if (e.type == SDL_MOUSEWHEEL)      evt_win_id = e.wheel.windowID;
 
         Uint32 pkg_win_id = ctx->pkg_window ? SDL_GetWindowID(ctx->pkg_window) : 0;
-        bool for_pkg = (pkg_win_id != 0 && evt_win_id == pkg_win_id);
+        Uint32 pref_win_id = ctx->pref_window ? SDL_GetWindowID(ctx->pref_window) : 0;
+        bool for_pref = (pref_win_id != 0 && evt_win_id == pref_win_id);
+        /* for_pkg = "belongs to an auxiliary window, not the video window";
+         * the main-window key/mouse handling below checks it. */
+        bool for_pkg = (pkg_win_id != 0 && evt_win_id == pkg_win_id) || for_pref;
 
-        if (for_pkg && ctx->pkg_imgui_ctx) {
-            ImGui::SetCurrentContext(ctx->pkg_imgui_ctx);
+        ImGuiContext *target = for_pref ? ctx->pref_imgui_ctx
+                             : (for_pkg ? ctx->pkg_imgui_ctx : NULL);
+        if (target) {
+            ImGui::SetCurrentContext(target);
             ImGui_ImplSDL2_ProcessEvent(&e);
             ImGui::SetCurrentContext(ctx->main_imgui_ctx);
         } else {
             ImGui_ImplSDL2_ProcessEvent(&e);
         }
 
-        /* Package window X button → hide (don't quit the whole app) */
+        /* Auxiliary window X button → hide it (don't quit the whole app) */
         if (e.type == SDL_WINDOWEVENT && for_pkg &&
             e.window.event == SDL_WINDOWEVENT_CLOSE) {
-            pkg_close(ctx);
+            if (for_pref) { SDL_HideWindow(ctx->pref_window); ctx->pref_window_open = 0; }
+            else          pkg_close(ctx);
             continue;
         }
 
@@ -334,65 +350,197 @@ sync:
     }
 }
 
+/* Creates a fixed-size auxiliary OS window (Package Manager, Preferences)
+ * with its own renderer and its own ImGui context, so styles/fonts/state
+ * stay independent from the video window. Leaves the main context current.
+ * Returns false on failure (nothing left allocated). */
+static bool aux_window_create(lumen_output_ctx_t *ctx, const char *title, int w, int h,
+                              SDL_Window **win, SDL_Renderer **ren, ImGuiContext **ictx) {
+    /* Fixed size: close/minimize allowed, resize not. */
+    *win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_SHOWN);
+    if (!*win) {
+        fprintf(stderr, "lumen: SDL_CreateWindow(%s) failed: %s\n", title, SDL_GetError());
+        return false;
+    }
+    *ren = SDL_CreateRenderer(*win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!*ren) *ren = SDL_CreateRenderer(*win, -1, SDL_RENDERER_SOFTWARE);
+    if (!*ren) {
+        SDL_DestroyWindow(*win);
+        *win = NULL;
+        return false;
+    }
+    *ictx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(*ictx);
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = NULL;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ImGui::StyleColorsLight();
+    void *font_copy = IM_ALLOC(lumen_font_size);          /* same Roboto as the main window */
+    if (font_copy) {
+        memcpy(font_copy, lumen_font_data, lumen_font_size);
+        if (!io.Fonts->AddFontFromMemoryTTF(font_copy, (int)lumen_font_size, 15.0f)) IM_FREE(font_copy);
+    }
+    ImGui_ImplSDL2_InitForSDLRenderer(*win, *ren);
+    ImGui_ImplSDLRenderer2_Init(*ren);
+    ImGui::SetCurrentContext(ctx->main_imgui_ctx);
+    return true;
+}
+
+static void aux_window_destroy(SDL_Window **win, SDL_Renderer **ren, ImGuiContext **ictx) {
+    if (*ictx) {
+        ImGui::SetCurrentContext(*ictx);
+        ImGui_ImplSDLRenderer2_Shutdown();
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext(*ictx);
+        *ictx = NULL;
+    }
+    if (*ren) { SDL_DestroyRenderer(*ren); *ren = NULL; }
+    if (*win) { SDL_DestroyWindow(*win);   *win = NULL; }
+}
+
 static void pkg_open(lumen_output_ctx_t *ctx) {
     if (ctx->pkg_window) {
         SDL_ShowWindow(ctx->pkg_window);
         ctx->pkg_window_open = 1;
         return; /* already created -- just un-hide */
     }
-
-    /* Fixed size: close/minimize allowed, resize not.
-     * SDL_WINDOW_RESIZABLE deliberately omitted. */
-    ctx->pkg_window = SDL_CreateWindow(
-        "Lumen Package Manager",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        600, 440,
-        SDL_WINDOW_SHOWN);
-    if (!ctx->pkg_window) {
-        fprintf(stderr, "lumen pkg: SDL_CreateWindow failed: %s\n", SDL_GetError());
+    if (!aux_window_create(ctx, "Lumen Package Manager", 600, 440,
+                           &ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx))
         return;
-    }
-
-    ctx->pkg_renderer = SDL_CreateRenderer(ctx->pkg_window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!ctx->pkg_renderer) {
-        ctx->pkg_renderer = SDL_CreateRenderer(ctx->pkg_window, -1, SDL_RENDERER_SOFTWARE);
-    }
-    if (!ctx->pkg_renderer) {
-        SDL_DestroyWindow(ctx->pkg_window);
-        ctx->pkg_window = NULL;
-        return;
-    }
-
-    /* Create a SEPARATE ImGui context so styles/fonts/state are independent
-     * from the main video window. */
-    ctx->pkg_imgui_ctx = ImGui::CreateContext();
-    ImGui::SetCurrentContext(ctx->pkg_imgui_ctx);
-
-    ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = NULL;
-    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    ImGui::StyleColorsLight();
-
-    /* Apply the same Roboto font as the main window */
-    {
-        void *font_copy = IM_ALLOC(lumen_font_size);
-        if (font_copy) {
-            memcpy(font_copy, lumen_font_data, lumen_font_size);
-            if (!io.Fonts->AddFontFromMemoryTTF(font_copy, (int)lumen_font_size, 15.0f)) {
-                IM_FREE(font_copy);
-            }
-        }
-    }
-
-    ImGui_ImplSDL2_InitForSDLRenderer(ctx->pkg_window, ctx->pkg_renderer);
-    ImGui_ImplSDLRenderer2_Init(ctx->pkg_renderer);
-
-    /* Switch back to the main video window's context */
-    ImGui::SetCurrentContext(ctx->main_imgui_ctx);
-
     ctx->pkg_window_open = 1;
     printf("  [pkg] Package Manager window opened\n");
+}
+
+/* ---- Preferences window ------------------------------------------------ */
+
+static void prefs_open(lumen_output_ctx_t *ctx) {
+    if (ctx->pref_window) {
+        SDL_ShowWindow(ctx->pref_window);
+        SDL_RaiseWindow(ctx->pref_window);
+        ctx->pref_window_open = 1;
+        return;
+    }
+    if (!aux_window_create(ctx, "qqvideo Preferences", 500, 560,
+                           &ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx))
+        return;
+    ctx->pref_window_open = 1;
+}
+
+/* Grey explanatory text under a setting. */
+static void pref_note(const char *text) {
+    ImGui::Indent(24.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+    ImGui::Unindent(24.0f);
+    ImGui::Spacing();
+}
+
+static void prefs_render(lumen_output_ctx_t *ctx) {
+    if (!ctx->pref_window || !ctx->pref_window_open || !ctx->pref_imgui_ctx || !ctx->state) return;
+    lumen_playback_state_t *st = ctx->state;
+
+    ImGui::SetCurrentContext(ctx->pref_imgui_ctx);
+    ImGui_ImplSDLRenderer2_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
+
+    int win_w, win_h;
+    SDL_GetWindowSize(ctx->pref_window, &win_w, &win_h);
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2((float)win_w, (float)win_h));
+    ImGui::Begin("##prefs", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+
+    /* ---- Playback ---- */
+    ImGui::SeparatorText("Playback");
+    bool precise = st->precise_seek != 0;
+    if (ImGui::Checkbox("Precise seeking", &precise)) { st->precise_seek = precise; st->prefs_dirty = 1; }
+    pref_note("Seeks land on the exact time you pick. Off: jump to the nearest "
+              "keyframe instead -- instant, but up to several seconds away.");
+
+    bool skip = st->pref_frameskip != 0;
+    if (ImGui::Checkbox("Adaptive frame skipping", &skip)) { st->pref_frameskip = skip; st->prefs_dirty = 1; }
+    pref_note("When decoding can't keep up, skip frames nothing else depends on "
+              "(and then the deblocking filter) so sound stays smooth.");
+
+    /* ---- Buffering ---- */
+    ImGui::SeparatorText("Buffering");
+    bool buf = st->pref_buffer_enabled != 0;
+    if (ImGui::Checkbox("Buffer ahead", &buf)) { st->pref_buffer_enabled = buf; st->prefs_dirty = 1; }
+    pref_note("Decode ahead into memory before playback starts and after seeking, "
+              "and stop to refill if it runs dry instead of stuttering. Smooths "
+              "out heavy scenes; it can't make a CPU that's too slow on average "
+              "keep up -- then it just turns stutter into short pauses.");
+
+    ImGui::BeginDisabled(!buf);
+    ImGui::Indent(24.0f);
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SliderInt("Buffer size", &st->pref_buffer_seconds, 1, 60, "%d s");
+    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;   /* save on release, not every frame */
+
+    /* Memory cap: up to half the machine's RAM. */
+    int ram_mb = SDL_GetSystemRAM();
+    int max_mb = ram_mb > 0 ? ram_mb / 2 : 4096;
+    if (max_mb < 256) max_mb = 256;
+    if (st->pref_buffer_mb > max_mb) st->pref_buffer_mb = max_mb;
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SliderInt("Memory limit", &st->pref_buffer_mb, 64, max_mb, "%d MB");
+    if (ImGui::IsItemDeactivatedAfterEdit()) st->prefs_dirty = 1;
+
+    /* What those limits mean for the video that's open right now:
+     * decoded frames are big (a 4K frame is ~12 MB). */
+    if (st->has_file && ctx->width > 0 && ctx->height > 0) {
+        double frame_mb = (double)ctx->width * ctx->height * 1.5 / (1024.0 * 1024.0);
+        double fps = st->video_fps > 0 ? st->video_fps : 24.0;
+        int frames = (int)(st->pref_buffer_mb / frame_mb);
+        double secs = frames / fps;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("This video (%dx%d) is %.1f MB per frame: %d MB holds %d frames (%.1fs). "
+                           "The %s limit applies first.",
+                           ctx->width, ctx->height, frame_mb, st->pref_buffer_mb, frames, secs,
+                           secs < st->pref_buffer_seconds ? "memory" : "time");
+        ImGui::PopStyleColor();
+        if (st->buffering)
+            ImGui::Text("Buffering... %d%%", st->buffer_fill_pct);
+        else if (buf)
+            ImGui::Text("Decoded ahead: %.1f s", st->buffer_ahead_ms / 1000.0);
+    }
+    ImGui::Unindent(24.0f);
+    ImGui::EndDisabled();
+
+    /* Measured decoding speed: the honest answer to "will buffering help?" */
+    if (st->has_file && st->decode_speed_pct > 0) {
+        ImGui::Indent(24.0f);
+        ImGui::Text("Decoding speed for this video: %.2fx real time", st->decode_speed_pct / 100.0);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        if (st->decode_speed_pct >= 110)
+            ImGui::TextWrapped("Faster than playback: a buffer builds up and absorbs heavy scenes.");
+        else if (st->decode_speed_pct >= 95)
+            ImGui::TextWrapped("About real time: buffering helps with heavy scenes, but keep an eye on it.");
+        else
+            ImGui::TextWrapped("Slower than playback on average: buffering can only turn stutter into "
+                               "pauses. Frame skipping, keyframe seeking or a lower resolution will help more.");
+        ImGui::PopStyleColor();
+        ImGui::Unindent(24.0f);
+    }
+
+    /* ---- footer ---- */
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    if (st->prefs_path[0]) ImGui::TextWrapped("Saved automatically to %s", st->prefs_path);
+    else                   ImGui::TextWrapped("No config directory found -- settings last until qqvideo closes.");
+    ImGui::PopStyleColor();
+    if (ImGui::Button("Close")) { SDL_HideWindow(ctx->pref_window); ctx->pref_window_open = 0; }
+
+    ImGui::End();
+    ImGui::Render();
+    SDL_SetRenderDrawColor(ctx->pref_renderer, 240, 240, 240, 255);
+    SDL_RenderClear(ctx->pref_renderer);
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ctx->pref_renderer);
+    SDL_RenderPresent(ctx->pref_renderer);
+    ImGui::SetCurrentContext(ctx->main_imgui_ctx);
 }
 
 static void pkg_close(lumen_output_ctx_t *ctx) {
@@ -724,7 +872,7 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
         }
         if (ImGui::BeginMenu("Tools")) {
             bool precise = state->precise_seek != 0;
-            if (ImGui::MenuItem("Precise Seeking", NULL, &precise)) state->precise_seek = precise ? 1 : 0;
+            if (ImGui::MenuItem("Precise Seeking", NULL, &precise)) { state->precise_seek = precise ? 1 : 0; state->prefs_dirty = 1; }
             ImGui::SetItemTooltip(
                 "On: seeks land on the exact time you pick.\n"
                 "Off: seeks jump to the nearest keyframe instead -- instant,\n"
@@ -733,6 +881,8 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             if (ImGui::MenuItem("Package Manager...")) {
                 pkg_open(ctx);
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Preferences...")) prefs_open(ctx);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -1249,8 +1399,24 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     int win_w, win_h;
     SDL_GetWindowSize(ctx->window, &win_w, &win_h);
     SDL_Rect dest;
-    bool have_video = video_dest_rect(ctx, win_w, win_h, menu_h, ctrl_h, &dest);
+    bool have_video = video_dest_rect(ctx, win_w, win_h, menu_h, ctrl_h, &dest) && ctx->have_frame;
     if (have_video) draw_subtitles(ctx, dest, win_h, ctx->fullscreen && show_controls, ctrl_h);
+    if (ctx->state && ctx->state->has_file && ctx->state->buffering) {
+        /* "Buffer ahead" is filling: say so, so a pause doesn't look like a hang. */
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Buffering... %d%%", ctx->state->buffer_fill_pct);
+        ImVec2 ts = ImGui::CalcTextSize(msg);
+        float cx = (float)win_w * 0.5f, cy = menu_h + ((float)win_h - menu_h - ctrl_h) * 0.5f;
+        float bw = ts.x + 40.0f, bh = ts.y + 26.0f;
+        ImDrawList *dl = ImGui::GetBackgroundDrawList();
+        ImVec2 a(cx - bw / 2, cy - bh / 2), b(cx + bw / 2, cy + bh / 2);
+        dl->AddRectFilled(a, b, IM_COL32(0, 0, 0, 170), 6.0f);
+        dl->AddText(ImVec2(cx - ts.x / 2, a.y + 7.0f), IM_COL32(255, 255, 255, 255), msg);
+        float px = a.x + 12.0f, pw = bw - 24.0f, py = b.y - 9.0f;       /* progress strip */
+        dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + 3.0f), IM_COL32(90, 90, 90, 255), 1.5f);
+        dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw * ctx->state->buffer_fill_pct / 100.0f, py + 3.0f),
+                          IM_COL32(52, 120, 230, 255), 1.5f);
+    }
 
     ImGui::Render();
 
@@ -1280,6 +1446,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
 
     /* Render the package manager window if it's open */
     if (ctx->pkg_window_open) pkg_render(ctx);
+    if (ctx->pref_window_open) prefs_render(ctx);
 }
 
 static int sdl2_open(lumen_output_ctx_t **out_ctx) {
@@ -1429,6 +1596,7 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
         return -1;
     }
     ctx->width = width;
+    ctx->have_frame = 0;
     ctx->height = height;
 
     /* Skip resizing if the window is in any expanded state. There are two
@@ -1587,6 +1755,7 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
          * wall-clock anchor in step so pacing continues seamlessly if the
          * audio clock goes away (audio track ends, decode starves it). */
         ctx->start_ticks = now - (Uint64)(frame->pts > 0 ? frame->pts : 0);
+        ctx->have_frame = 1;
         SDL_UpdateYUVTexture(ctx->texture, NULL,
             frame->video.planes[0], frame->video.stride[0],
             frame->video.planes[1], frame->video.stride[1],
@@ -1608,6 +1777,7 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
         }
     }
 
+    ctx->have_frame = 1;
     SDL_UpdateYUVTexture(ctx->texture, NULL,
         frame->video.planes[0], frame->video.stride[0],
         frame->video.planes[1], frame->video.stride[1],
@@ -1633,15 +1803,8 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
         ctx->dialog_mutex = NULL;
     }
     /* Tear down the package manager window and its own ImGui context */
-    if (ctx->pkg_imgui_ctx) {
-        ImGui::SetCurrentContext(ctx->pkg_imgui_ctx);
-        ImGui_ImplSDLRenderer2_Shutdown();
-        ImGui_ImplSDL2_Shutdown();
-        ImGui::DestroyContext(ctx->pkg_imgui_ctx);
-        ctx->pkg_imgui_ctx = NULL;
-    }
-    if (ctx->pkg_renderer) { SDL_DestroyRenderer(ctx->pkg_renderer); ctx->pkg_renderer = NULL; }
-    if (ctx->pkg_window)   { SDL_DestroyWindow(ctx->pkg_window);   ctx->pkg_window   = NULL; }
+    aux_window_destroy(&ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx);
+    aux_window_destroy(&ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx);
 
     /* Tear down the main window's ImGui context */
     ImGui::SetCurrentContext(ctx->main_imgui_ctx);

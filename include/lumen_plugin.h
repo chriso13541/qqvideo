@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 20
+#define LUMEN_ABI_VERSION 21
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -403,6 +403,22 @@ typedef struct {
      * worth it for 4K HEVC on a slow CPU, where catching up from a keyframe
      * several seconds back takes a while. Toggled in Tools. */
     int  precise_seek;
+
+    /* ---- Preferences (v21) -- Tools > Preferences; saved to prefs_path.
+     * The UI edits them and sets prefs_dirty; the core saves the file. */
+    int  pref_frameskip;         /* adaptive frame skipping when decoding falls behind */
+    int  pref_buffer_enabled;    /* decode ahead into a large buffer before/while playing */
+    int  pref_buffer_seconds;    /* ...this much playback time */
+    int  pref_buffer_mb;         /* ...but never more than this much memory */
+    int  prefs_dirty;
+    char prefs_path[512];
+
+    /* ---- Buffer status (v21), written by the core for the UI ---- */
+    int    buffering;            /* 1 while pre-buffering / re-buffering: show "Buffering..." */
+    int    buffer_fill_pct;      /* 0-100 while buffering */
+    int    buffer_ahead_ms;      /* decoded video ready ahead of the playhead */
+    double video_fps;            /* current file's frame rate (0 = unknown / no video) */
+    int    decode_speed_pct;     /* measured decoding speed, % of real time (0 = not yet known) */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

@@ -70,6 +70,7 @@ struct lumen_output_ctx {
     int           have_last_redraw;
     lumen_playback_state_t *state; /* bound via bind_state(); NULL until then */
     float         seek_preview_ms; /* local copy while the user is actively dragging the seek bar */
+    int           min_w, min_h;    /* minimum window size, computed from the control bar (0 = not yet) */
     int           dragging_seek;   /* persisted across frames -- see draw_controls() for why */
     int64_t       last_seen_seek_generation;
     int           was_paused;      /* detects the pause->resume transition, not just current state */
@@ -722,6 +723,13 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
+            bool precise = state->precise_seek != 0;
+            if (ImGui::MenuItem("Precise Seeking", NULL, &precise)) state->precise_seek = precise ? 1 : 0;
+            ImGui::SetItemTooltip(
+                "On: seeks land on the exact time you pick.\n"
+                "Off: seeks jump to the nearest keyframe instead -- instant,\n"
+                "but up to several seconds away. Faster on slow CPUs with 4K.");
+            ImGui::Separator();
             if (ImGui::MenuItem("Package Manager...")) {
                 pkg_open(ctx);
             }
@@ -844,14 +852,104 @@ static void draw_queue_panel(lumen_output_ctx_t *ctx) {
     ImGui::End();
 }
 
+/* Height of the control bar; the min-size math and the video letterbox use it. */
+#define LUMEN_CTRL_BAR_H 60.0f
+
+/* Minimum window size = the narrowest the control bar can get with its
+ * two button groups side by side at normal spacing, never overlapping.
+ * Measured with the WIDEST variant of every label ("Fullscreen" not
+ * "Windowed", "Unmute" not "Mute", a two-digit queue count), so a label
+ * changing can't make them collide either. Height leaves a 16:9 video
+ * area of that width between the menu bar and the control bar. Needs the
+ * font, so it's computed on the first frame, then handed to SDL, which
+ * also enlarges the window right away if it's currently smaller. */
+static void compute_min_size(lumen_output_ctx_t *ctx) {
+    ImGuiStyle &st = ImGui::GetStyle();
+    auto btn = [&](const char *label) { return ImGui::CalcTextSize(label).x + st.FramePadding.x * 2; };
+    float left  = 54.0f /* Play/Pause, fixed width */ + btn("|<") + btn("Stop") + btn(">|") + btn("Fullscreen")
+                + st.ItemSpacing.x * 4;
+    float right = btn("Queue (99)") + btn("Unmute") + 100.0f /* volume slider */
+                + ImGui::CalcTextSize("Vol").x + st.ItemSpacing.x * 3;
+    float w = st.WindowPadding.x + left + st.ItemSpacing.x + right + st.WindowPadding.x;
+    ctx->min_w = (int)(w + 0.5f);
+    ctx->min_h = (int)(ImGui::GetFrameHeight() + LUMEN_CTRL_BAR_H + w * 9.0f / 16.0f + 0.5f);
+    SDL_SetWindowMinimumSize(ctx->window, ctx->min_w, ctx->min_h);
+    printf("  [sdl2-video] minimum window size %dx%d\n", ctx->min_w, ctx->min_h);
+}
+
+/* VLC-style seek bar: a track that fills in as the movie plays, plus a
+ * round handle at the current position that grows under the mouse, and a
+ * tooltip with the time under the cursor. Click anywhere to jump there,
+ * or drag; the seek happens on release. */
+static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
+    lumen_playback_state_t *state = ctx->state;
+    bool has_file = state->has_file && state->duration_ms > 0;
+    const float h = 20.0f;                        /* hit area height */
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##seek", ImVec2(width, h));
+    bool hovered = has_file && ImGui::IsItemHovered();
+    bool active  = has_file && ImGui::IsItemActive();
+
+    const float r_handle = 7.0f;                  /* keep the handle inside the hit area (r + ring < h/2) */
+    float x0 = p0.x + r_handle, x1 = p0.x + width - r_handle;
+    float cy = p0.y + h * 0.5f;
+    float dur = (float)(has_file ? state->duration_ms : 1);
+
+    if (active) {                                 /* click or drag: follow the mouse */
+        float t = (ImGui::GetIO().MousePos.x - x0) / (x1 - x0);
+        t = t < 0 ? 0 : (t > 1 ? 1 : t);
+        ctx->dragging_seek = true;
+        ctx->seek_preview_ms = t * dur;
+    }
+    if (has_file && ImGui::IsItemDeactivated() && ctx->dragging_seek) {
+        ctx->dragging_seek = false;
+        if (!state->seek_requested) {
+            state->seek_target_ms = (int64_t)ctx->seek_preview_ms;
+            state->seek_flags = LUMEN_SEEK_BACKWARD;
+            state->seek_requested = 1;
+        }
+    }
+
+    float pos = has_file ? (ctx->dragging_seek ? ctx->seek_preview_ms : (float)state->position_ms) : 0.0f;
+    float frac = pos / dur;
+    frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
+    float hx = x0 + (x1 - x0) * frac;
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    /* Solid colors rather than the theme's pale slider tint: the played
+     * part should read at a glance against the unplayed track. */
+    const ImU32 col_track = IM_COL32(236, 236, 236, 255);
+    const ImU32 col_edge  = IM_COL32(150, 150, 150, 255);
+    const ImU32 col_fill  = (hovered || active) ? IM_COL32(40, 110, 225, 255) : IM_COL32(52, 120, 230, 255);
+    float th = (hovered || active) ? 10.0f : 8.0f;  /* track thickens under the mouse */
+    dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_track, th / 2);
+    dl->AddRect(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_edge, th / 2);
+    if (has_file) {
+        if (hx > x0) dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(hx, cy + th / 2), col_fill, th / 2);
+        float rr = (hovered || active) ? r_handle : r_handle - 1.5f;
+        dl->AddCircleFilled(ImVec2(hx, cy), rr + 2.0f, IM_COL32(255, 255, 255, 255), 24);  /* white ring */
+        dl->AddCircle(ImVec2(hx, cy), rr + 2.0f, IM_COL32(90, 90, 90, 200), 24, 1.0f);     /* keeps it visible on the light track */
+        dl->AddCircleFilled(ImVec2(hx, cy), rr, col_fill, 24);
+    }
+
+    if (hovered || active) {                       /* time under the cursor */
+        float t = (ImGui::GetIO().MousePos.x - x0) / (x1 - x0);
+        t = t < 0 ? 0 : (t > 1 ? 1 : t);
+        char when[16];
+        format_ms((int64_t)((active ? ctx->seek_preview_ms / dur : t) * dur), when, sizeof(when));
+        ImGui::SetTooltip("%s", when);
+    }
+}
+
 static void draw_controls(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *state = ctx->state;
     if (!state) return;
+    if (!ctx->min_w) compute_min_size(ctx);
 
     int win_w, win_h;
     SDL_GetWindowSize(ctx->window, &win_w, &win_h);
 
-    const float bar_height = 60.0f;
+    const float bar_height = LUMEN_CTRL_BAR_H;
     ImGui::SetNextWindowPos(ImVec2(0, (float)win_h - bar_height));
     ImGui::SetNextWindowSize(ImVec2((float)win_w, bar_height));
     ImGui::SetNextWindowBgAlpha(0.75f);
@@ -867,26 +965,14 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     format_ms(state->duration_ms, dur_str, sizeof(dur_str));
 
     bool has_file = state->has_file;
+    ImGui::AlignTextToFramePadding();
     ImGui::Text("%s", cur_str);
     ImGui::SameLine();
-    if (!has_file) ImGui::BeginDisabled();
-    float slider_max = (float)(state->duration_ms > 0 ? state->duration_ms : 1);
-    float slider_value = ctx->dragging_seek ? ctx->seek_preview_ms : (float)state->position_ms;
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0f);
-    ImGui::SliderFloat("##seek", &slider_value, 0.0f, slider_max, "");
-    if (ImGui::IsItemActive()) {
-        ctx->dragging_seek = true;
-        ctx->seek_preview_ms = slider_value;
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        ctx->dragging_seek = false;
-        if (!state->seek_requested) {
-            state->seek_requested = 1;
-            state->seek_target_ms = (int64_t)ctx->seek_preview_ms;
-        }
-    }
-    if (!has_file) ImGui::EndDisabled();
+    /* 20 px bar, nudged up so it lines up with the frame-height time labels */
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetFrameHeight() - 20.0f) * 0.5f);
+    draw_seek_bar(ctx, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(dur_str).x - ImGui::GetStyle().ItemSpacing.x);
     ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
     ImGui::Text("%s", dur_str);
 
     /* --- Row 2 left: transport controls ---------------------------------- */
@@ -1382,6 +1468,12 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
                 target_h = (int)(target_h * scale);
             }
         }
+        /* Small videos (e.g. 320x240) would make the window narrower than
+         * the control bar and the buttons overlap: scale up, aspect kept,
+         * to at least the minimum size. */
+        int mw = ctx->min_w ? ctx->min_w : 520, mh = ctx->min_h ? ctx->min_h : 380;
+        if (target_w < mw) { target_h = (int)((double)target_h * mw / target_w + 0.5); target_w = mw; }
+        if (target_h < mh) target_h = mh;
         SDL_SetWindowSize(ctx->window, target_w, target_h);
         SDL_SetWindowPosition(ctx->window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         printf("  [sdl2-video] loaded stream %dx%d, window resized to %dx%d\n", width, height, target_w, target_h);

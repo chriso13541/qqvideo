@@ -241,6 +241,7 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
     lumen_session_t *session = (lumen_session_t *)calloc(1, sizeof(*session));
     session->reg = reg;
     session->state.volume = 1.0f;
+    session->state.precise_seek = 1;
 
     /* Video and audio output are BUILT INTO the executable -- they are not
      * loaded from the plugin registry. Accessing them directly means:
@@ -436,6 +437,7 @@ typedef struct {
     int     seek_pending;
     int64_t seek_target;
     int     seek_flags;
+    int     seek_precise;
     int     serial;              /* current serial (main bumps it on seek) */
     /* decode -> main */
     int     dec_serial;          /* serial the decode thread is producing */
@@ -453,6 +455,14 @@ typedef struct {
     lumen_sub_track_t            *sub_tracks;
     int  has_video, has_audio;
     int  frames_decoded, video_frames, audio_frames, frames_failed;
+    /* Precise-seek catch-up (decode thread only): after seeking to the
+     * keyframe before catch_target, discard video frames and trim audio
+     * until the target is reached. -1 = not catching up. */
+    int64_t catch_target;
+    int     catch_video, catch_audio;
+    int     catch_skip;           /* set_skip level currently applied while catching up */
+    int     catch_discarded;
+    int     half_frame_ms;        /* half a video frame: tolerance for "the frame AT the target" */
 } engine_t;
 
 /* ---- queues (call with lock held) ---- */
@@ -603,6 +613,19 @@ static void skip_policy(engine_t *e, stream_state_t *ss, skip_state_t *k, int64_
 
 /* ---- the decode thread ---- */
 
+/* Drops the first `ms` of an interleaved S16 audio frame, in place. */
+static void trim_audio_front(lumen_frame_t *f, int64_t ms) {
+    int ch = f->audio.channels > 0 ? f->audio.channels : 1;
+    int64_t n = ms * f->audio.sample_rate / 1000;
+    if (n <= 0) return;
+    if (n >= f->audio.nb_samples) n = f->audio.nb_samples;
+    size_t bytes = (size_t)n * ch * sizeof(int16_t);
+    memmove(f->audio.data, f->audio.data + bytes, f->audio.size - bytes);
+    f->audio.size -= bytes;
+    f->audio.nb_samples -= (int)n;
+    f->pts += n * 1000 / f->audio.sample_rate;
+}
+
 static void deliver(engine_t *e, stream_state_t *ss, skip_state_t *skip, lumen_frame_t *f) {
     if (ss->type == LUMEN_STREAM_SUBTITLE) {
         if (ss->sub_track >= 0) {
@@ -613,6 +636,35 @@ static void deliver(engine_t *e, stream_state_t *ss, skip_state_t *skip, lumen_f
         }
         ss->dec_vt->frame_free(f);
         return;
+    }
+    if (e->catch_target >= 0) {
+        if (ss->type == LUMEN_STREAM_VIDEO && e->catch_video) {
+            /* Half a frame of tolerance, so the frame on screen AT the
+             * target (pts a hair before it) is kept rather than the next
+             * one -- but at 60 fps not the frame before that either. */
+            if (f->pts >= 0 && f->pts < e->catch_target - e->half_frame_ms) {
+                ss->dec_vt->frame_free(f);
+                e->catch_discarded++;
+                return;
+            }
+            e->catch_video = 0;
+            if (ss->dec_vt->set_skip && e->catch_skip != skip->level)
+                ss->dec_vt->set_skip(ss->dec_ctx, skip->level);     /* back to normal */
+        }
+        if (ss->type == LUMEN_STREAM_AUDIO && e->catch_audio) {
+            if (f->pts >= 0 && f->pts + audio_ms(f) <= e->catch_target) {
+                ss->dec_vt->frame_free(f);
+                return;
+            }
+            if (f->pts >= 0 && f->pts < e->catch_target) trim_audio_front(f, e->catch_target - f->pts);
+            e->catch_audio = 0;
+        }
+        if (!e->catch_video && !e->catch_audio) {
+            if (e->catch_discarded)
+                printf("lumen: precise seek -- decoded %d frame(s) past the keyframe to reach %lld ms\n",
+                       e->catch_discarded, (long long)e->catch_target);
+            e->catch_target = -1;
+        }
     }
     if (ss->type == LUMEN_STREAM_VIDEO) skip_policy(e, ss, skip, f->pts);
     push_frame(e, f, ss->dec_vt);
@@ -627,6 +679,7 @@ static void *decode_thread_main(void *arg) {
     skip.last_down = -1;
     skip_reset(&skip);
     int eof = 0;
+    e->catch_target = -1;
 
     for (;;) {
         pthread_mutex_lock(&e->lock);
@@ -636,7 +689,9 @@ static void *decode_thread_main(void *arg) {
         if (e->seek_pending) {
             int64_t target = e->seek_target;
             int flags = e->seek_flags;
+            int precise = e->seek_precise;
             int serial = e->serial;
+            if (precise) flags = LUMEN_SEEK_BACKWARD;   /* keyframe before, then decode up to the target */
             e->seek_pending = 0;
             pthread_mutex_unlock(&e->lock);
 
@@ -655,6 +710,11 @@ static void *decode_thread_main(void *arg) {
                     if (e->streams[i].in_use && e->streams[i].dec_vt->flush)
                         e->streams[i].dec_vt->flush(e->streams[i].dec_ctx, target);
             }
+            e->catch_target = (rc == 0 && precise) ? target : -1;
+            e->catch_video = e->has_video;
+            e->catch_audio = e->has_audio;
+            e->catch_skip = skip.level;
+            e->catch_discarded = 0;
             skip_reset(&skip);            /* keep the level: the hardware didn't change */
             eof = 0;
             pthread_mutex_lock(&e->lock);
@@ -688,6 +748,18 @@ static void *decode_thread_main(void *arg) {
             continue;
         }
         stream_state_t *ss = &e->streams[pkt.stream_index];
+        /* Catching up to a precise-seek target: frames well before it are
+         * never shown, so skip decoding the ones nothing else depends on.
+         * Within 250 ms of the target decode everything, so the frame we
+         * land on is exact. */
+        if (e->catch_target >= 0 && e->catch_video && ss->type == LUMEN_STREAM_VIDEO && ss->dec_vt->set_skip) {
+            int want = (pkt.pts_ms >= 0 && pkt.pts_ms < e->catch_target - 250)
+                     ? (skip.level > 1 ? skip.level : 1) : skip.level;
+            if (want != e->catch_skip) {
+                ss->dec_vt->set_skip(ss->dec_ctx, want);
+                e->catch_skip = want;
+            }
+        }
         lumen_frame_t f;
         int rc = ss->dec_vt->decode(ss->dec_ctx, &pkt, &f);
         if (rc == 0) deliver(e, ss, &skip, &f);
@@ -938,6 +1010,10 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         if (streams[i].type == LUMEN_STREAM_VIDEO) e->has_video = 1;
         if (streams[i].type == LUMEN_STREAM_AUDIO) e->has_audio = 1;
     }
+    e->half_frame_ms = 20;                       /* ~24-25 fps if the rate is unknown */
+    for (int i = 0; i < table.stream_count; i++)
+        if (table.streams[i].type == LUMEN_STREAM_VIDEO && table.streams[i].frame_rate > 1.0)
+            e->half_frame_ms = (int)(500.0 / table.streams[i].frame_rate);
     if (pthread_create(&e->thread, NULL, decode_thread_main, e) == 0) {
         e->thread_started = 1;
     } else {
@@ -989,6 +1065,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             e->seek_pending = 1;
             e->seek_target = state->seek_target_ms;
             e->seek_flags = state->seek_flags;
+            e->seek_precise = state->precise_seek;
             e->serial++;
             e->eof = 0;
             queues_clear(e);

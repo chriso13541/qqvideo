@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 19
+#define LUMEN_ABI_VERSION 20
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -396,6 +396,13 @@ typedef struct {
      * set by the UI together with seek_requested. Arrow-key jumps use the
      * direction of travel; the seek bar uses BACKWARD (the default). */
     int  seek_flags;
+
+    /* v20. 1 = precise seeking (default): land on the exact target time by
+     * decoding from the keyframe before it and discarding what comes first.
+     * 0 = keyframe seeking: instant, but lands on the nearest keyframe --
+     * worth it for 4K HEVC on a slow CPU, where catching up from a keyframe
+     * several seconds back takes a while. Toggled in Tools. */
+    int  precise_seek;
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

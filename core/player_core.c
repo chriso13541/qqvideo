@@ -435,6 +435,7 @@ typedef struct {
     int     abort;
     int     seek_pending;
     int64_t seek_target;
+    int     seek_flags;
     int     serial;              /* current serial (main bumps it on seek) */
     /* decode -> main */
     int     dec_serial;          /* serial the decode thread is producing */
@@ -634,14 +635,21 @@ static void *decode_thread_main(void *arg) {
         if (e->abort) { pthread_mutex_unlock(&e->lock); break; }
         if (e->seek_pending) {
             int64_t target = e->seek_target;
+            int flags = e->seek_flags;
             int serial = e->serial;
             e->seek_pending = 0;
             pthread_mutex_unlock(&e->lock);
 
-            if (!e->dmx->seek) {
+            int rc = e->dmx->seek_ex ? e->dmx->seek_ex(e->dctx, target, flags)
+                   : e->dmx->seek    ? e->dmx->seek(e->dctx, target)
+                   : -2;
+            if (rc == -2) {
                 fprintf(stderr, "lumen: this demuxer doesn't support seeking -- ignoring request\n");
-            } else if (e->dmx->seek(e->dctx, target) != 0) {
-                fprintf(stderr, "lumen: seek to %lldms failed\n", (long long)target);
+            } else if (rc != 0) {
+                /* e.g. a forward jump with no keyframe left before the end:
+                 * playback simply carries on from where the demuxer is. */
+                fprintf(stderr, "lumen: no keyframe %s %lldms -- continuing\n",
+                        (flags & LUMEN_SEEK_FORWARD) ? "after" : "before", (long long)target);
             } else {
                 for (int i = 0; i < LUMEN_MAX_STREAMS; i++)
                     if (e->streams[i].in_use && e->streams[i].dec_vt->flush)
@@ -980,6 +988,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             pthread_mutex_lock(&e->lock);
             e->seek_pending = 1;
             e->seek_target = state->seek_target_ms;
+            e->seek_flags = state->seek_flags;
             e->serial++;
             e->eof = 0;
             queues_clear(e);
@@ -988,6 +997,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             state->position_ms = state->seek_target_ms;
             state->seek_generation++;         /* audio output drops its queued sound */
             state->seek_requested = 0;
+            state->seek_flags = LUMEN_SEEK_BACKWARD;   /* back to the default for the next seek */
             wall_anchor_valid = 0;
             continue;
         }

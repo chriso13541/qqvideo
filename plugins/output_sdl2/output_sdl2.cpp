@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>   /* lroundf: volume steps */
 
 #define LUMEN_SDL2_DROP_THRESHOLD_MS 100
 #define LUMEN_UI_REDRAW_INTERVAL_MS 16 /* ~60fps cap on actual redraws/presents */
@@ -231,6 +232,36 @@ static int handle_events(lumen_output_ctx_t *ctx) {
             }
             if (e.key.keysym.scancode == SDL_SCANCODE_F || e.key.keysym.scancode == SDL_SCANCODE_F11) {
                 toggle_fullscreen(ctx);
+            }
+            /* Left/Right: jump 10 s. Up/Down: volume +/-5%. (VLC/mpv keys)
+             * Seeks go in the direction of travel (see seek_ex): with
+             * keyframes every ~10 s, "position +10 s, snapped back to the
+             * keyframe before it" could land where you started. The new
+             * position is the seek target right away, so repeated presses
+             * (or holding the key) keep adding up. */
+            if ((e.key.keysym.scancode == SDL_SCANCODE_RIGHT || e.key.keysym.scancode == SDL_SCANCODE_LEFT) &&
+                !ImGui::GetIO().WantCaptureKeyboard &&
+                ctx->state && ctx->state->has_file) {
+                lumen_playback_state_t *st = ctx->state;
+                int fwd = e.key.keysym.scancode == SDL_SCANCODE_RIGHT;
+                int64_t base = st->seek_requested ? st->seek_target_ms : st->position_ms;
+                int64_t target = base + (fwd ? 10000 : -10000);
+                if (target < 0) target = 0;
+                if (st->duration_ms > 0 && target > st->duration_ms) target = st->duration_ms;
+                st->seek_target_ms = target;
+                st->seek_flags = fwd ? LUMEN_SEEK_FORWARD : LUMEN_SEEK_BACKWARD;
+                st->seek_requested = 1;
+            }
+            if ((e.key.keysym.scancode == SDL_SCANCODE_UP || e.key.keysym.scancode == SDL_SCANCODE_DOWN) &&
+                !ImGui::GetIO().WantCaptureKeyboard && ctx->state) {
+                lumen_playback_state_t *st = ctx->state;
+                /* Whole percent steps, clamped: 97% + 5 -> 100%, 3% - 5 -> 0%. */
+                int pct = (int)lroundf(st->volume * 100.0f);
+                pct += (e.key.keysym.scancode == SDL_SCANCODE_UP) ? 5 : -5;
+                if (pct > 100) pct = 100;
+                if (pct < 0) pct = 0;
+                st->volume = (float)pct / 100.0f;
+                st->muted = 0;       /* like dragging the slider: changing volume unmutes */
             }
             /* V: cycle None -> each available subtitle track -> None (VLC's key) */
             if (e.key.keysym.scancode == SDL_SCANCODE_V &&

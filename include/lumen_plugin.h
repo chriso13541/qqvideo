@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 18
+#define LUMEN_ABI_VERSION 19
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
  * 10-20 subtitle streams; with 8, every stream past index 7 was silently
@@ -391,6 +391,11 @@ typedef struct {
      * immediately; 0 = no audio clock (silent file / audio not started yet),
      * pace against the wall clock as before. */
     int  video_sync_external;
+
+    /* v19. Direction for the next seek (LUMEN_SEEK_FORWARD / _BACKWARD),
+     * set by the UI together with seek_requested. Arrow-key jumps use the
+     * direction of travel; the seek bar uses BACKWARD (the default). */
+    int  seek_flags;
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */
@@ -437,6 +442,16 @@ typedef struct {
     int (*open_ex)(lumen_demuxer_ctx_t **out_ctx, const char *path,
                    lumen_stream_table_t *out_table,
                    const char *const *allowed_fourccs, int allowed_count);
+
+    /* v19, optional (NULL = the core uses seek()). Seek with a direction:
+     *   LUMEN_SEEK_FORWARD:  land on the first keyframe AT OR AFTER target
+     *   LUMEN_SEEK_BACKWARD: land on the last keyframe AT OR BEFORE target
+     *                        (what plain seek() does)
+     * Relative jumps need this: with keyframes every ~10 s, "position +
+     * 10 s, then back to the keyframe before it" can land on the keyframe
+     * you started from, and pressing Right does nothing. Returns -1 if
+     * there's no keyframe in that direction (e.g. forward near the end). */
+    int (*seek_ex)(lumen_demuxer_ctx_t *ctx, int64_t target_ms, int flags);
 } lumen_demuxer_vtable_t;
 
 /* ---------------------------------------------------------------------- */
@@ -450,6 +465,8 @@ typedef struct lumen_decoder_ctx lumen_decoder_ctx_t; /* opaque, plugin-owned */
 
 #define LUMEN_PROBE_VIDEO 1
 #define LUMEN_PROBE_AUDIO 2
+#define LUMEN_SEEK_BACKWARD 0   /* seek_ex flags (v19) */
+#define LUMEN_SEEK_FORWARD  1
 #define LUMEN_PROBE_SUBTITLE 3
 
 typedef struct {

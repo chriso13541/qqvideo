@@ -231,15 +231,24 @@ static void libav_packet_free(lumen_packet_t *pkt) {
     pkt->data = NULL;
 }
 
-static int libav_seek(lumen_demuxer_ctx_t *ctx, int64_t target_ms) {
+static int libav_seek_ex(lumen_demuxer_ctx_t *ctx, int64_t target_ms, int flags) {
     int idx = av_find_default_stream_index(ctx->fmt_ctx);
     if (idx < 0) return -1;
     AVStream *st = ctx->fmt_ctx->streams[idx];
     int64_t ts = av_rescale_q(target_ms, (AVRational){1, 1000}, st->time_base);
     if (st->start_time != AV_NOPTS_VALUE) ts += st->start_time; /* MPEG-TS etc. don't start at 0 */
-    if (av_seek_frame(ctx->fmt_ctx, idx, ts, AVSEEK_FLAG_BACKWARD) < 0) return -1;
+    /* avformat_seek_file() takes an allowed window around the target:
+     * forward = keyframe in [ts, +inf), backward = keyframe in (-inf, ts]. */
+    int rc = (flags & LUMEN_SEEK_FORWARD)
+        ? avformat_seek_file(ctx->fmt_ctx, idx, ts, ts, INT64_MAX, 0)
+        : avformat_seek_file(ctx->fmt_ctx, idx, INT64_MIN, ts, ts, 0);
+    if (rc < 0) return -1;
     av_packet_unref(ctx->avpkt);
     return 0;
+}
+
+static int libav_seek(lumen_demuxer_ctx_t *ctx, int64_t target_ms) {
+    return libav_seek_ex(ctx, target_ms, LUMEN_SEEK_BACKWARD);
 }
 
 static void libav_close(lumen_demuxer_ctx_t *ctx) {
@@ -257,6 +266,7 @@ static const lumen_demuxer_vtable_t VTABLE = {
     .seek = libav_seek,
     .close = libav_close,
     .open_ex = libav_open_ex,
+    .seek_ex = libav_seek_ex,
 };
 
 static lumen_plugin_descriptor_t DESCRIPTOR = {

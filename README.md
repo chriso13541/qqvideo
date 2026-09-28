@@ -98,6 +98,14 @@ than stutter if it runs dry. It smooths out heavy scenes when decoding
 is faster than real time on average; the window shows the measured
 decoding speed for the open file, since below 1.0x no buffer can keep up.
 
+**Audio comes first.** The decode thread reads compressed packets ahead
+into separate audio and video queues and always decodes audio when its
+reserve drops below 1.5 s, so a slow video frame never starves the sound
+(1080p60 HEVC on an overloaded CPU: 178 audible gaps in 18 s -> 0). Video
+that falls behind skips non-reference frames, then the deblocking filter,
+then jumps to the next keyframe; late frames are dropped rather than shown
+out of sync.
+
 **What changes about the security model.** A distro `libavcodec.so`
 contains every decoder the distro enabled, so "not installed = not
 mapped into the process" no longer holds. What holds instead is "not

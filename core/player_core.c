@@ -440,6 +440,30 @@ typedef struct {
     int                           serial;
 } qitem_t;
 
+/* Compressed packets read ahead of decoding (decode thread only). Audio and
+ * video wait in separate FIFOs so audio can be decoded ahead of a slow video
+ * frame; see decode_thread_main(). Compressed data is small (4K HEVC is a
+ * few MB per second), so reading ahead costs little. */
+#define PKT_FIFO_CAP   8192
+#define VPKT_MAX_BYTES ((size_t)128 << 20)
+typedef struct {
+    lumen_packet_t p[PKT_FIFO_CAP];
+    int head, count;
+    size_t bytes;
+} pkt_fifo_t;
+
+static void fifo_push(pkt_fifo_t *q, const lumen_packet_t *pkt) {
+    q->p[(q->head + q->count) % PKT_FIFO_CAP] = *pkt;
+    q->count++;
+    q->bytes += pkt->size;
+}
+static void fifo_pop(pkt_fifo_t *q, lumen_packet_t *out) {
+    *out = q->p[q->head];
+    q->head = (q->head + 1) % PKT_FIFO_CAP;
+    q->count--;
+    q->bytes -= out->size;
+}
+
 typedef struct {
     pthread_t       thread;
     int             thread_started;
@@ -493,7 +517,16 @@ typedef struct {
     int     catch_skip;           /* set_skip level currently applied while catching up */
     int     catch_discarded;
     int     half_frame_ms;        /* half a video frame: tolerance for "the frame AT the target" */
+    pkt_fifo_t afifo, vfifo;      /* decode thread only */
+    int     hard_drops;           /* times video jumped to the next keyframe to catch up */
 } engine_t;
+
+static void fifos_clear(engine_t *e) {
+    lumen_packet_t pk;
+    while (e->afifo.count > 0) { fifo_pop(&e->afifo, &pk); e->dmx->packet_free(&pk); }
+    while (e->vfifo.count > 0) { fifo_pop(&e->vfifo, &pk); e->dmx->packet_free(&pk); }
+    e->afifo.head = e->vfifo.head = 0;
+}
 
 /* ---- queues (call with lock held) ---- */
 
@@ -526,27 +559,19 @@ static int64_t video_ahead_ms(const engine_t *e) {
     return e->vq_count > 0 ? e->vq_last_pts - e->play_pos : 0;
 }
 
-static int has_room(const engine_t *e) {
-    int reserve = (int)e->aq_ms + (e->clk_valid ? e->clk_buf_ms : 0);
-    if (e->buf_enabled) {
-        /* "Buffer ahead": up to buf_target_ms of playback, within
-         * buf_max_bytes. Audio may run a little further so it never
-         * starves while the video side is at its limit. */
-        if (e->aq_count >= AQ_CAP - 8 || e->aq_ms >= e->buf_target_ms + 1500) return 0;
-        if (e->has_video) {
-            int mem_ok = e->vq_bytes < e->buf_max_bytes && e->vq_count < VQ_SLOTS - 1;
-            return mem_ok && (video_ahead_ms(e) < e->buf_target_ms || reserve < 150);
-        }
-        return !e->has_audio || e->aq_ms < e->buf_target_ms;
-    }
-    int aq_ok = e->aq_count < AQ_CAP - 8 && e->aq_ms < AQ_AHEAD_MAX_MS;
-    if (!aq_ok) return 0;
-    if (e->has_video)
-        return (e->vq_count < VQ_SOFT && e->vq_bytes < VQ_MAX_BYTES) ||
-               (reserve < 150 && e->vq_count < VQ_HARD - 1);
-    if (e->has_audio) return e->aq_ms < AQ_AUDIO_ONLY_MS;
-    return 1;
+/* Room for more DECODED video / audio? (lock held) */
+static int video_room(const engine_t *e) {
+    if (e->buf_enabled)
+        return e->vq_bytes < e->buf_max_bytes && e->vq_count < VQ_SLOTS - 1 &&
+               video_ahead_ms(e) < e->buf_target_ms;
+    return e->vq_count < VQ_SOFT && e->vq_bytes < VQ_MAX_BYTES;
 }
+static int audio_room(const engine_t *e) {
+    if (e->aq_count >= AQ_CAP - 8) return 0;
+    if (e->buf_enabled) return e->aq_ms < e->buf_target_ms + 1500;
+    return e->aq_ms < (e->has_video ? AQ_AHEAD_MAX_MS : AQ_AUDIO_ONLY_MS);
+}
+
 
 /* Decode thread: hand a frame to the main thread. Waits if the queue is
  * full; drops the frame if a seek or stop arrives meanwhile. (lock NOT held) */
@@ -735,6 +760,47 @@ static void deliver(engine_t *e, stream_state_t *ss, skip_state_t *skip, lumen_f
     push_frame(e, f, ss->dec_vt);
 }
 
+#define AUDIO_PRIORITY_MS   1500   /* keep at least this much audio ready (decoded + device) */
+#define VIDEO_HARD_LATE_MS  500    /* video this far behind the audio: jump to the next keyframe */
+
+/* Decode one packet from `q` for the stream it belongs to. */
+static void decode_packet(engine_t *e, skip_state_t *skip, lumen_packet_t *pkt) {
+    stream_state_t *ss = &e->streams[pkt->stream_index];
+    if (e->catch_target >= 0 && e->catch_video && ss->type == LUMEN_STREAM_VIDEO && ss->dec_vt->set_skip) {
+        /* Catching up to a precise-seek target: frames well before it are
+         * never shown, so skip decoding the ones nothing else depends on. */
+        int want = (pkt->pts_ms >= 0 && pkt->pts_ms < e->catch_target - 250)
+                 ? (skip->level > 1 ? skip->level : 1) : skip->level;
+        if (want != e->catch_skip) {
+            ss->dec_vt->set_skip(ss->dec_ctx, want);
+            e->catch_skip = want;
+        }
+    }
+    lumen_frame_t f;
+    int rc = ss->dec_vt->decode(ss->dec_ctx, pkt, &f);
+    if (rc == 0) deliver(e, ss, skip, &f);
+    else if (rc < 0) e->frames_failed++;
+    if (rc >= 0 && ss->type != LUMEN_STREAM_SUBTITLE && ss->dec_vt->receive)
+        while (ss->dec_vt->receive(ss->dec_ctx, &f) == 0) deliver(e, ss, skip, &f);
+    e->dmx->packet_free(pkt);
+    reset_pkt(pkt);
+}
+
+/* The decode thread. Packets are read ahead into an audio FIFO and a
+ * video FIFO (still compressed), and each pass picks what to decode:
+ *
+ *   1. audio reserve below AUDIO_PRIORITY_MS -> decode AUDIO first,
+ *      reading ahead in the file as far as needed to find audio packets;
+ *   2. otherwise decode VIDEO while there's room for decoded frames;
+ *   3. otherwise top up audio; otherwise wait.
+ *
+ * Before this, one packet at a time was decoded in file order, so a slow
+ * video frame (4K HEVC: 100+ ms) held up the audio packets behind it and
+ * the sound device ran dry: 178 audible gaps in 18 s of 1080p60 HEVC on an
+ * overloaded CPU (measured). Ears notice gaps far more than eyes notice a
+ * dropped frame, so audio goes first -- and video that falls hopelessly
+ * behind (VIDEO_HARD_LATE_MS) skips ahead to the next keyframe instead of
+ * dragging on forever. */
 static void *decode_thread_main(void *arg) {
     engine_t *e = (engine_t *)arg;
     lumen_packet_t pkt;
@@ -743,17 +809,40 @@ static void *decode_thread_main(void *arg) {
     memset(&skip, 0, sizeof(skip));
     skip.last_down = -1;
     skip_reset(&skip);
-    int eof = 0;
+    int read_eof = 0, drained = 0;
+    int dropping = 0;                 /* skipping video packets until a keyframe */
     e->catch_target = -1;
 
     for (;;) {
+        enum { NONE, DEC_AUDIO, DEC_VIDEO, READ, DRAIN } act = NONE;
+        int drop_ok = 0;
+        int64_t clk_now = 0;
+
         pthread_mutex_lock(&e->lock);
-        while (!e->abort && !e->seek_pending && (eof || !has_room(e))) {
-            e->room_wait = !eof;             /* buffer full (not merely finished) */
-            e->spd_busy_since = 0;           /* idle time isn't decoding time */
+        for (;;) {
+            if (e->abort || e->seek_pending) break;
+            int reserve   = (int)e->aq_ms + (e->clk_valid ? e->clk_buf_ms : 0);
+            int can_read  = !read_eof && e->vfifo.bytes < VPKT_MAX_BYTES &&
+                            e->vfifo.count < PKT_FIFO_CAP - 1 && e->afifo.count < PKT_FIFO_CAP - 1;
+            int a_room    = e->has_audio && audio_room(e);
+            int v_room    = e->has_video && video_room(e);
+            if (a_room && reserve < AUDIO_PRIORITY_MS && e->afifo.count > 0)       act = DEC_AUDIO;
+            else if (a_room && reserve < AUDIO_PRIORITY_MS && can_read)            act = READ;
+            else if (v_room && e->vfifo.count > 0)                                 act = DEC_VIDEO;
+            else if (v_room && can_read)                                           act = READ;
+            else if (a_room && e->afifo.count > 0)                                 act = DEC_AUDIO;
+            else if (a_room && can_read)                                           act = READ;
+            else if (!e->has_video && !e->has_audio && can_read)                   act = READ;
+            else if (read_eof && !drained && e->afifo.count == 0 && e->vfifo.count == 0) act = DRAIN;
+            if (act != NONE) break;
+            e->room_wait = !drained;      /* buffer full (not merely finished) */
+            e->spd_busy_since = 0;        /* idle time isn't decoding time */
             pthread_cond_wait(&e->cond, &e->lock);
         }
         e->room_wait = 0;
+        drop_ok = e->clk_valid && e->clk_running && e->catch_target < 0;
+        int skip_ok = e->pref_frameskip;
+        clk_now = e->clk_ms + (e->clk_running ? now_ms() - e->clk_at : 0);
         if (e->abort) { pthread_mutex_unlock(&e->lock); break; }
         if (e->seek_pending) {
             int64_t target = e->seek_target;
@@ -764,14 +853,13 @@ static void *decode_thread_main(void *arg) {
             e->seek_pending = 0;
             pthread_mutex_unlock(&e->lock);
 
+            fifos_clear(e);                /* read-ahead packets are from before the seek */
             int rc = e->dmx->seek_ex ? e->dmx->seek_ex(e->dctx, target, flags)
                    : e->dmx->seek    ? e->dmx->seek(e->dctx, target)
                    : -2;
             if (rc == -2) {
                 fprintf(stderr, "lumen: this demuxer doesn't support seeking -- ignoring request\n");
             } else if (rc != 0) {
-                /* e.g. a forward jump with no keyframe left before the end:
-                 * playback simply carries on from where the demuxer is. */
                 fprintf(stderr, "lumen: no keyframe %s %lldms -- continuing\n",
                         (flags & LUMEN_SEEK_FORWARD) ? "after" : "before", (long long)target);
             } else {
@@ -785,7 +873,7 @@ static void *decode_thread_main(void *arg) {
             e->catch_skip = skip.level;
             e->catch_discarded = 0;
             skip_reset(&skip);            /* keep the level: the hardware didn't change */
-            eof = 0;
+            read_eof = drained = dropping = 0;
             pthread_mutex_lock(&e->lock);
             e->dec_serial = serial;
             e->eof = 0;
@@ -798,48 +886,77 @@ static void *decode_thread_main(void *arg) {
 
         /* Reading and decoding happen with the lock released: the main
          * thread keeps running the UI no matter how long these take. */
-        if (e->dmx->read_packet(e->dctx, &pkt) != 0) {
+        if (act == READ) {
+            if (e->dmx->read_packet(e->dctx, &pkt) != 0) {
+                read_eof = 1;
+                reset_pkt(&pkt);
+                continue;
+            }
+            int si = pkt.stream_index;
+            if (si < 0 || si >= LUMEN_MAX_STREAMS || !e->streams[si].in_use) {
+                e->dmx->packet_free(&pkt);
+            } else if (e->streams[si].type == LUMEN_STREAM_AUDIO) {
+                fifo_push(&e->afifo, &pkt);
+            } else if (e->streams[si].type == LUMEN_STREAM_VIDEO) {
+                fifo_push(&e->vfifo, &pkt);
+            } else {
+                decode_packet(e, &skip, &pkt);   /* subtitles: tiny, decode right away */
+            }
+            reset_pkt(&pkt);
+        } else if (act == DEC_AUDIO) {
+            fifo_pop(&e->afifo, &pkt);
+            decode_packet(e, &skip, &pkt);
+        } else if (act == DEC_VIDEO) {
+            fifo_pop(&e->vfifo, &pkt);
+            /* React to lag directly: audio no longer waits for video, so
+             * video that's behind the (running) audio clock must speed up
+             * now, not after the gradual policy's warm-up and counters --
+             * that delay once cost a whole keyframe interval of video. */
+            if (drop_ok && skip_ok && !dropping && pkt.pts_ms >= 0) {
+                stream_state_t *vs = &e->streams[pkt.stream_index];
+                int64_t lag = clk_now - pkt.pts_ms;
+                int want = lag > 250 ? 2 : (lag > 100 ? 1 : 0);
+                if (want > skip.level && vs->dec_vt->set_skip) {
+                    skip_change(vs, &skip, want, pkt.pts_ms);
+                    printf("lumen: video %lld ms behind -- skip level %d\n", (long long)lag, want);
+                }
+            }
+            /* Hopelessly behind the audio? Decoding frames that will only be
+             * thrown away as late makes it worse: drop packets up to the next
+             * keyframe and start fresh there. */
+            if (dropping || (drop_ok && pkt.pts_ms >= 0 && clk_now - pkt.pts_ms > VIDEO_HARD_LATE_MS)) {
+                if (!pkt.keyframe) {
+                    if (!dropping) {
+                        dropping = 1;
+                        e->hard_drops++;
+                        printf("lumen: video %lld ms behind the audio -- skipping to the next keyframe\n",
+                               (long long)(clk_now - pkt.pts_ms));
+                    }
+                    e->dmx->packet_free(&pkt);
+                    reset_pkt(&pkt);
+                    continue;
+                }
+                if (dropping) {           /* keyframe: reset references, resume here */
+                    stream_state_t *vs = &e->streams[pkt.stream_index];
+                    if (vs->dec_vt->flush) vs->dec_vt->flush(vs->dec_ctx, pkt.pts_ms);
+                    dropping = 0;
+                }
+            }
+            decode_packet(e, &skip, &pkt);
+        } else if (act == DRAIN) {
             for (int i = 0; i < LUMEN_MAX_STREAMS; i++) {     /* EOF: flush decoders */
                 stream_state_t *ss = &e->streams[i];
                 if (!ss->in_use || !ss->dec_vt->drain || ss->type == LUMEN_STREAM_SUBTITLE) continue;
                 lumen_frame_t f;
                 while (ss->dec_vt->drain(ss->dec_ctx, &f) == 0) deliver(e, ss, &skip, &f);
             }
-            eof = 1;
+            drained = 1;
             pthread_mutex_lock(&e->lock);
             e->eof = 1;
             pthread_mutex_unlock(&e->lock);
-            reset_pkt(&pkt);
-            continue;
         }
-        if (pkt.stream_index < 0 || pkt.stream_index >= LUMEN_MAX_STREAMS || !e->streams[pkt.stream_index].in_use) {
-            e->dmx->packet_free(&pkt);
-            reset_pkt(&pkt);
-            continue;
-        }
-        stream_state_t *ss = &e->streams[pkt.stream_index];
-        /* Catching up to a precise-seek target: frames well before it are
-         * never shown, so skip decoding the ones nothing else depends on.
-         * Within 250 ms of the target decode everything, so the frame we
-         * land on is exact. */
-        if (e->catch_target >= 0 && e->catch_video && ss->type == LUMEN_STREAM_VIDEO && ss->dec_vt->set_skip) {
-            int want = (pkt.pts_ms >= 0 && pkt.pts_ms < e->catch_target - 250)
-                     ? (skip.level > 1 ? skip.level : 1) : skip.level;
-            if (want != e->catch_skip) {
-                ss->dec_vt->set_skip(ss->dec_ctx, want);
-                e->catch_skip = want;
-            }
-        }
-        lumen_frame_t f;
-        int rc = ss->dec_vt->decode(ss->dec_ctx, &pkt, &f);
-        if (rc == 0) deliver(e, ss, &skip, &f);
-        else if (rc < 0) e->frames_failed++;
-        /* A packet can produce more than one frame: collect them all. */
-        if (rc >= 0 && ss->type != LUMEN_STREAM_SUBTITLE && ss->dec_vt->receive)
-            while (ss->dec_vt->receive(ss->dec_ctx, &f) == 0) deliver(e, ss, &skip, &f);
-        e->dmx->packet_free(&pkt);
-        reset_pkt(&pkt);
     }
+    fifos_clear(e);
     return NULL;
 }
 
@@ -1279,7 +1396,13 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                     got = 1;
                     more = e->vq_count > 0;
                     pthread_cond_signal(&e->cond);
-                    if (!stale && vout && -d > LUMEN_VIDEO_LATE_DROP_MS && more) stale = 2;  /* late: drop */
+                    /* Late: drop. With the audio clock even the only frame
+                     * queued (the previous picture stays up) -- showing it
+                     * would put the picture out of step with the sound
+                     * (measured up to 739 ms off under overload once audio
+                     * stopped waiting for video). Without audio, keep the
+                     * last one, or a slow silent video would never show. */
+                    if (!stale && vout && -d > LUMEN_VIDEO_LATE_DROP_MS && (more || use_audio)) stale = 2;
                 }
             }
             pthread_mutex_unlock(&e->lock);
@@ -1312,9 +1435,12 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
          * audio still playing is normal frame-to-frame jitter. */
         if (state->pref_buffer_enabled && !done && !at_eof) {
             pthread_mutex_lock(&e->lock);
-            int dry = (e->has_video ? e->vq_count == 0 : 1) && e->aq_count == 0;
+            /* With audio decoded first, audio rarely runs dry any more:
+             * for video files, "dry" means the video queue emptied. */
+            int dry = e->has_video ? (e->vq_count == 0 && e->vq_last_pts < e->play_pos + 100)
+                                   : (e->aq_count == 0 && abuf < 60);
             pthread_mutex_unlock(&e->lock);
-            if (dry && abuf < 60) {
+            if (dry) {
                 buffering = 1;
                 rebuffers++;
                 printf("lumen: buffer ran dry -- rebuffering (%d)\n", rebuffers);

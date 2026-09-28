@@ -461,8 +461,10 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
 
     bool skip = st->pref_frameskip != 0;
     if (ImGui::Checkbox("Adaptive frame skipping", &skip)) { st->pref_frameskip = skip; st->prefs_dirty = 1; }
-    pref_note("When decoding can't keep up, skip frames nothing else depends on "
-              "(and then the deblocking filter) so sound stays smooth.");
+    pref_note("When video falls behind, skip frames nothing else depends on (and "
+              "then the deblocking filter) so more frames arrive on time. Audio "
+              "always comes first either way; video that falls far behind jumps "
+              "ahead to the next keyframe.");
 
     /* ---- Buffering ---- */
     ImGui::SeparatorText("Buffering");
@@ -1075,6 +1077,15 @@ static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
     dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_track, th / 2);
     dl->AddRect(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_edge, th / 2);
     if (has_file) {
+        /* YouTube-style buffered range: from the playhead to how far ahead
+         * is already decoded ("Buffer ahead", or the normal read-ahead). */
+        if (!ctx->dragging_seek && state->buffer_ahead_ms > 0) {
+            float bf = ((float)state->position_ms + (float)state->buffer_ahead_ms) / dur;
+            bf = bf > 1 ? 1 : bf;
+            float bx = x0 + (x1 - x0) * bf;
+            if (bx > hx) dl->AddRectFilled(ImVec2(hx - th / 2, cy - th / 2), ImVec2(bx, cy + th / 2),
+                                           IM_COL32(168, 190, 228, 255), th / 2);
+        }
         if (hx > x0) dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(hx, cy + th / 2), col_fill, th / 2);
         float rr = (hovered || active) ? r_handle : r_handle - 1.5f;
         dl->AddCircleFilled(ImVec2(hx, cy), rr + 2.0f, IM_COL32(255, 255, 255, 255), 24);  /* white ring */

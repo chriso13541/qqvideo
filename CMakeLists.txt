@@ -91,6 +91,7 @@ if (SDL2_FOUND)
       third_party/imgui/imgui_impl_sdl2.cpp
       third_party/imgui/imgui_impl_sdlrenderer2.cpp
       third_party/fonts/lumen_font.cpp
+      third_party/remixicon/remixicon_font.cpp
   )
 else()
   set(BUILTIN_OUTPUT_SOURCES "")
@@ -126,6 +127,7 @@ target_include_directories(qqvideo PRIVATE
     third_party/tinyfiledialogs
     third_party/imgui
     third_party/fonts
+    third_party/remixicon
     third_party
     resources
     ${SDL2_INCLUDE_DIRS})

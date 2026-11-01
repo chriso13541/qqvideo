@@ -33,6 +33,7 @@
 #include "imgui_impl_sdlrenderer2.h"
 #include "../../third_party/tinyfiledialogs/tinyfiledialogs.h"
 #include "lumen_font.h"  /* Roboto font data (compiled separately in lumen_font.cpp) */
+#include "lumen_icons.h" /* Remix Icon subset + ICON_* macros (third_party/remixicon/) */
 
 /* App icon embedded as a PNG byte array -- used for SDL_SetWindowIcon
  * (the title-bar icon). The .ico file + Windows .rc handles the taskbar. */
@@ -1203,24 +1204,86 @@ static void draw_queue_panel(lumen_output_ctx_t *ctx) {
     ImGui::End();
 }
 
+/* ---- Transport icons (Remix Icon) ----------------------------------------
+ * The icon glyphs are merged into the main UI font, so ICON_PLAY etc. are
+ * just characters: ImGui::Button(ICON_PLAY "##play") draws the icon.
+ *
+ * Early-2000s look: icons are rasterized with no oversampling and snapped
+ * to whole pixels, then crunch_icon_glyphs() pushes their edge alpha hard
+ * toward 0 or 255 -- crisp, slightly stair-stepped edges like the bitmap
+ * buttons in old Winamp/WMP skins, instead of soft modern anti-aliasing.
+ * Only the icon glyphs are touched; Roboto text stays smooth. */
+#define LUMEN_ICON_PX      16.0f   /* icon size; a multiple of 4 keeps Remix's 24-unit grid on whole pixels-ish */
+#define LUMEN_ICON_AA_LO   80      /* alpha <= this -> fully transparent */
+#define LUMEN_ICON_AA_HI   150     /* alpha >= this -> fully opaque; between = a thin ramp */
+
+static void merge_icon_font(ImGuiIO &io) {
+    static const ImWchar icon_ranges[] = { ICON_RANGE_MIN, ICON_RANGE_MAX, 0 };
+    ImFontConfig cfg;
+    cfg.MergeMode            = true;     /* add into the Roboto font just loaded */
+    cfg.PixelSnapH           = true;
+    cfg.OversampleH          = 1;        /* no sub-pixel smoothing */
+    cfg.OversampleV          = 1;
+    cfg.GlyphMinAdvanceX     = LUMEN_ICON_PX;   /* every icon the same width */
+    cfg.GlyphOffset          = ImVec2(0.0f, 2.0f); /* sit on Roboto's text line */
+    cfg.FontDataOwnedByAtlas = false;    /* static array -- ImGui must not free it */
+    if (!io.Fonts->AddFontFromMemoryTTF((void *)remixicon_font_data, (int)remixicon_font_size,
+                                        LUMEN_ICON_PX, &cfg, icon_ranges))
+        fprintf(stderr, "lumen: failed to load icon font -- buttons will show '?'\n");
+}
+
+/* Build the atlas now and re-threshold the icon glyphs' pixels in place.
+ * The renderer backend uploads the atlas later (first NewFrame) from the
+ * same Alpha8 buffer, so the edit is what ends up on screen. */
+static void crunch_icon_glyphs(ImGuiIO &io) {
+    ImFontAtlas *atlas = io.Fonts;
+    if (!atlas->Build() || !atlas->TexPixelsAlpha8 || atlas->Fonts.Size == 0) return;
+    ImFont *font = atlas->Fonts[0];
+    const int tw = atlas->TexWidth, th = atlas->TexHeight;
+    for (ImWchar cp = ICON_RANGE_MIN; cp <= ICON_RANGE_MAX; cp++) {
+        const ImFontGlyph *g = font->FindGlyphNoFallback(cp);
+        if (!g || !g->Visible) continue;
+        int x0 = (int)(g->U0 * tw + 0.5f), x1 = (int)(g->U1 * tw + 0.5f);
+        int y0 = (int)(g->V0 * th + 0.5f), y1 = (int)(g->V1 * th + 0.5f);
+        for (int y = y0; y < y1; y++) {
+            unsigned char *row = atlas->TexPixelsAlpha8 + (size_t)y * tw;
+            for (int x = x0; x < x1; x++) {
+                int a = row[x];
+                if      (a <= LUMEN_ICON_AA_LO) a = 0;
+                else if (a >= LUMEN_ICON_AA_HI) a = 255;
+                else    a = (a - LUMEN_ICON_AA_LO) * 255 / (LUMEN_ICON_AA_HI - LUMEN_ICON_AA_LO);
+                row[x] = (unsigned char)a;
+            }
+        }
+        if (cp == 0xFFFF) break;   /* ImWchar is 16-bit: don't wrap */
+    }
+}
+
+/* Square-ish icon button used across the control bar. */
+#define LUMEN_ICON_BTN_W 30.0f
+static bool icon_button(const char *label_with_id, const char *tooltip) {
+    bool pressed = ImGui::Button(label_with_id, ImVec2(LUMEN_ICON_BTN_W, 0));
+    if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tooltip);
+    return pressed;
+}
+
 /* Height of the control bar; the min-size math and the video letterbox use it. */
 #define LUMEN_CTRL_BAR_H 60.0f
 
 /* Minimum window size = the narrowest the control bar can get with its
  * two button groups side by side at normal spacing, never overlapping.
- * Measured with the WIDEST variant of every label ("Fullscreen" not
- * "Windowed", "Unmute" not "Mute", a two-digit queue count), so a label
- * changing can't make them collide either. Height leaves a 16:9 video
+ * Transport buttons are fixed-width icons; the queue button is measured
+ * with a two-digit count, so a label changing can't make them collide. Height leaves a 16:9 video
  * area of that width between the menu bar and the control bar. Needs the
  * font, so it's computed on the first frame, then handed to SDL, which
  * also enlarges the window right away if it's currently smaller. */
 static void compute_min_size(lumen_output_ctx_t *ctx) {
     ImGuiStyle &st = ImGui::GetStyle();
     auto btn = [&](const char *label) { return ImGui::CalcTextSize(label).x + st.FramePadding.x * 2; };
-    float left  = 54.0f /* Play/Pause, fixed width */ + btn("|<") + btn("Stop") + btn(">|") + btn("Fullscreen")
+    float left  = LUMEN_ICON_BTN_W * 5 /* play, prev, stop, next, fullscreen */
                 + st.ItemSpacing.x * 4;
-    float right = btn("Queue (99)") + btn("Unmute") + 100.0f /* volume slider */
-                + ImGui::CalcTextSize("Vol").x + st.ItemSpacing.x * 3;
+    float right = btn(ICON_PLAYLIST " 99") + LUMEN_ICON_BTN_W /* mute */ + 100.0f /* volume slider */
+                + st.ItemSpacing.x * 2;
     float w = st.WindowPadding.x + left + st.ItemSpacing.x + right + st.WindowPadding.x;
     ctx->min_w = (int)(w + 0.5f);
     ctx->min_h = (int)(ImGui::GetFrameHeight() + LUMEN_CTRL_BAR_H + w * 9.0f / 16.0f + 0.5f);
@@ -1338,59 +1401,62 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     /* --- Row 2 left: transport controls ---------------------------------- */
     if (!has_file) ImGui::BeginDisabled();
 
-    /* Play / Pause -- leftmost, full words for clarity */
-    if (ImGui::Button(state->paused ? "Play" : "Pause", ImVec2(54, 0))) {
+    /* Old-school square buttons with a 1px border, like early-2000s
+     * players -- control bar only, the menus and dialogs keep ImGui's look. */
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+
+    /* Play / Pause -- leftmost */
+    if (icon_button(state->paused ? ICON_PLAY "##playpause" : ICON_PAUSE "##playpause",
+                    state->paused ? "Play (Space)" : "Pause (Space)")) {
         state->paused = !state->paused;
     }
     ImGui::SameLine();
 
     /* Previous track */
-    if (ImGui::Button("|<")) {
+    if (icon_button(ICON_SKIP_BACK "##prev", "Previous")) {
         int prev = state->queue_position > 0 ? state->queue_position - 1 : 0;
         state->queue_jump_requested = 1;
         state->queue_jump_index = prev;
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous");
     ImGui::SameLine();
 
     /* Stop -- clears queue and returns to idle */
-    if (ImGui::Button("Stop")) {
+    if (icon_button(ICON_STOP "##stop", "Stop and clear queue")) {
         state->stop_requested = 1;
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stop and clear queue");
     ImGui::SameLine();
 
     /* Next track */
-    if (ImGui::Button(">|")) {
+    if (icon_button(ICON_SKIP_FORWARD "##next", "Next")) {
         state->queue_jump_requested = 1;
         state->queue_jump_index = state->queue_position + 1;
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next");
     ImGui::SameLine();
 
     if (!has_file) ImGui::EndDisabled();
 
     /* Fullscreen (always available regardless of has_file) */
-    if (ImGui::Button(ctx->fullscreen ? "Windowed" : "Fullscreen")) {
+    if (icon_button(ctx->fullscreen ? ICON_FULLSCREEN_EXIT "##fs" : ICON_FULLSCREEN "##fs",
+                    ctx->fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)")) {
         toggle_fullscreen(ctx);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(ctx->fullscreen ? "Windowed" : "Fullscreen");
 
     /* --- Row 2 right: Queue, Mute, Volume -- right-aligned -------------- */
     /* Compute how much space the right cluster needs, then jump there. */
     ImGuiStyle &style = ImGui::GetStyle();
     char queue_btn[32];
     int total_q = state->queue_count + state->pending_add_count;
-    if (total_q > 0) snprintf(queue_btn, sizeof(queue_btn), "Queue (%d)", total_q);
-    else             strncpy(queue_btn, "Queue", sizeof(queue_btn));
+    if (total_q > 0) snprintf(queue_btn, sizeof(queue_btn), ICON_PLAYLIST " %d##queue", total_q);
+    else             snprintf(queue_btn, sizeof(queue_btn), ICON_PLAYLIST "##queue");
 
-    const char *mute_label = state->muted ? "Unmute" : "Mute";
     float vol_slider_w = 100.0f;
+    float queue_w = ImGui::CalcTextSize(queue_btn, NULL, true).x + style.FramePadding.x * 2;
+    if (queue_w < LUMEN_ICON_BTN_W) queue_w = LUMEN_ICON_BTN_W;
 
-    float right_w = ImGui::CalcTextSize(queue_btn).x  + style.FramePadding.x * 2 + style.ItemSpacing.x
-                  + ImGui::CalcTextSize(mute_label).x + style.FramePadding.x * 2 + style.ItemSpacing.x
-                  + ImGui::CalcTextSize("Vol").x       + style.ItemSpacing.x
-                  + vol_slider_w                       + style.WindowPadding.x;
+    float right_w = queue_w          + style.ItemSpacing.x
+                  + LUMEN_ICON_BTN_W + style.ItemSpacing.x
+                  + vol_slider_w     + style.WindowPadding.x;
 
     float right_x = ImGui::GetWindowWidth() - right_w;
     float left_cursor = ImGui::GetCursorPosX();
@@ -1400,12 +1466,17 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     else
         ImGui::SameLine();
 
-    if (ImGui::Button(queue_btn)) state->show_queue = !state->show_queue;
+    if (ImGui::Button(queue_btn, ImVec2(queue_w, 0))) state->show_queue = !state->show_queue;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(state->show_queue ? "Hide queue" : "Show queue");
     ImGui::SameLine();
 
     /* Mute/Unmute: toggling saves or restores the pre-mute volume level
-     * so the slider position is preserved while muted. */
-    if (ImGui::Button(mute_label)) {
+     * so the slider position is preserved while muted. The speaker icon
+     * follows the level: muted / low / normal. */
+    const char *mute_icon = state->muted || state->volume <= 0.0f ? ICON_VOLUME_MUTE "##mute"
+                          : state->volume < 0.5f                  ? ICON_VOLUME_DOWN "##mute"
+                          :                                         ICON_VOLUME_UP   "##mute";
+    if (ImGui::Button(mute_icon, ImVec2(LUMEN_ICON_BTN_W, 0))) {
         if (state->muted) {
             state->muted = 0;
             state->volume = ctx->volume_before_mute > 0.0f ? ctx->volume_before_mute : 0.5f;
@@ -1421,13 +1492,14 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
 
     ImGui::SetNextItemWidth(vol_slider_w);
     float volume_pct = state->volume * 100.0f;
-    if (ImGui::SliderFloat("Vol", &volume_pct, 0.0f, 100.0f, "%.0f%%")) {
+    if (ImGui::SliderFloat("##vol", &volume_pct, 0.0f, 100.0f, "%.0f%%")) {
         state->volume = volume_pct / 100.0f;
         /* Dragging the slider while muted implicitly unmutes */
         if (state->muted) state->muted = 0;
     }
     if (ImGui::IsItemDeactivatedAfterEdit() && state->pref_remember_volume) state->prefs_dirty = 1;
 
+    ImGui::PopStyleVar(2);
     ImGui::End();
 }
 
@@ -1773,6 +1845,7 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
             fprintf(stderr, "lumen: failed to load embedded Roboto font -- falling back to ProggyClean\n");
             IM_FREE(font_copy);  /* only free on failure; success means ImGui owns it */
         } else {
+            merge_icon_font(io);
             /* Second, large copy of Roboto just for subtitles. Rasterized at
              * 48px so it stays crisp when scaled to video size, with extra
              * glyph ranges subtitles actually use: accented Latin (Latin
@@ -1796,6 +1869,7 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
     } else {
         fprintf(stderr, "lumen: failed to allocate font buffer -- falling back to ProggyClean\n");
     }
+    crunch_icon_glyphs(io);
     ImGui_ImplSDL2_InitForSDLRenderer(ctx->window, ctx->renderer);
     ImGui_ImplSDLRenderer2_Init(ctx->renderer);
 

@@ -12,6 +12,35 @@ simply cannot be triggered on a system where that decoder plugin was never
 installed -- because the code is never mapped into the process at all,
 not merely "disabled."
 
+## Linux: quick install
+
+```
+git clone https://github.com/chriso13541/qqvideo && cd qqvideo
+./install.sh              # build + install to /usr/local (asks for sudo or doas)
+./install.sh --user       # or: install to ~/.local, no root
+./install.sh --uninstall  # remove it again (add --user if you used it)
+```
+
+`install.sh` works on Gentoo, Debian/Ubuntu/Devuan, Arch and Fedora. It
+checks for a compiler, cmake, pkg-config, SDL2 and FFmpeg >= 5.1 first;
+if anything's missing it prints the exact `emerge`/`apt`/`pacman`/`dnf`
+line, or runs it for you with `--deps`. `./install.sh --check` only
+checks. Other options: `--ffmpeg-prefix DIR` to build against an FFmpeg
+you compiled yourself, `--prefix DIR`, `-j N`, `--clean`; `--help` for
+all of them. It keeps a copy of the install manifest in
+`<prefix>/share/qqvideo/`, so `--uninstall` works even after you delete
+the source tree.
+
+**Gentoo notes:** `media-video/ffmpeg` with default USE flags has every
+decoder qqvideo uses (H.264/HEVC/AV1 decoding is built in; the `x264`/
+`x265` flags are only for *encoding*). `media-libs/libsdl2` needs `X` (or
+`wayland`) and a sound flag (`alsa`, `pulseaudio` or `pipewire`).
+File > Open needs a dialog helper -- `gnome-extra/zenity` or `kdialog`.
+A source-built FFmpeg in `/usr/local` may not be on Gentoo's default
+pkg-config path, so pass `--ffmpeg-prefix /usr/local` for that.
+
+The manual steps below are what the script does.
+
 ## Linux: system FFmpeg (default on Linux)
 
 On Linux, qqvideo uses whatever FFmpeg your system already has instead
@@ -793,3 +822,15 @@ To actually build on Windows:
 - **Manifest signing.** `lumenctl` currently trusts whatever's in the
   package dir. Given your Ed25519-signing habits elsewhere, that's the
   natural next addition: sign manifests, verify before `lumen_load_plugin`.
+
+## Third-party
+
+- [Dear ImGui](https://github.com/ocornut/imgui) (MIT) -- UI
+- [Roboto](https://fonts.google.com/specimen/Roboto) (Apache-2.0) -- UI font
+- [Remix Icon](https://github.com/Remix-Design/RemixIcon) 4.8.0 (Apache-2.0) --
+  player control icons. Only the icons used are embedded
+  (`third_party/remixicon/`); regenerate or add icons with
+  `tools/gen_icon_font.py`. Pinned to 4.8.0 because 4.9+ moved to a custom,
+  non-open-source license.
+- [tinyfiledialogs](https://sourceforge.net/projects/tinyfiledialogs/) (zlib) -- file dialogs
+- [stb_image](https://github.com/nothings/stb) (public domain / MIT) -- window icon

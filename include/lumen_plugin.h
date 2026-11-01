@@ -456,6 +456,11 @@ typedef struct {
     int  audio_track_count;
     int  audio_selected;         /* index into audio_tracks, -1 = none */
     char pref_audio_lang[32];    /* Preferences > Audio: start with a track in this language */
+
+    /* ---- Appended after v23 (append-only, no ABI bump: plugins never
+     * read the playback state; only the built-in output does). ---- */
+    int  pref_system_dialog;     /* 1 = use the desktop's file picker (zenity/kdialog/Win32)
+                                    instead of qqvideo's built-in file browser */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

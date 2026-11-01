@@ -34,6 +34,7 @@
 #include "../../third_party/tinyfiledialogs/tinyfiledialogs.h"
 #include "lumen_font.h"  /* Roboto font data (compiled separately in lumen_font.cpp) */
 #include "lumen_icons.h" /* Remix Icon subset + ICON_* macros (third_party/remixicon/) */
+#include "file_browser.h" /* built-in file picker (no zenity/kdialog needed) */
 
 /* App icon embedded as a PNG byte array -- used for SDL_SetWindowIcon
  * (the title-bar icon). The .ico file + Windows .rc handles the taskbar. */
@@ -99,6 +100,10 @@ struct lumen_output_ctx {
     SDL_atomic_t dialog_result_ready;  /* 1 when thread has a path waiting */
     char         dialog_result_path[512];
     int          dialog_purpose;       /* 0 = add_to_queue, 1 = open_file, 2 = add subtitle track */
+    lumen_file_browser *fb;            /* built-in picker; created on first use */
+    char         last_media_dir[512];  /* folder of the last file opened/dropped: where
+                                          Add Subtitle Track starts browsing */
+    int          drop_count;           /* files so far in the current drag-and-drop */
     ImFont      *sub_font;             /* large font for subtitles; NULL = use the UI font */
     float        volume_before_mute;   /* saved for the mute/unmute toggle */
 
@@ -192,6 +197,44 @@ static void format_ms(int64_t ms, char *out, size_t out_size) {
     else snprintf(out, out_size, "%d:%02d", m, s);
 }
 
+/* Folder part of a path (UTF-8, either separator). */
+static void dir_of(const char *path, char *out, size_t n) {
+    snprintf(out, n, "%s", path);
+    char *s1 = strrchr(out, '/'), *s2 = strrchr(out, '\\');
+    char *sep = s1 > s2 ? s1 : s2;
+    if (sep) *(sep == out ? sep + 1 : sep) = '\0'; else out[0] = '\0';
+}
+
+/* One file from a drag-and-drop (SDL sends one SDL_DROPFILE per file).
+ * Subtitles are added to what's playing; anything else is treated as
+ * media -- the first plays now, the rest are queued after it. Folders
+ * are ignored. */
+static void handle_dropped_file(lumen_output_ctx_t *ctx, const char *path) {
+    lumen_playback_state_t *state = ctx->state;
+    if (!state || !path || !*path) return;
+    SDL_RWops *probe = SDL_RWFromFile(path, "rb");   /* skips folders and unreadable files */
+    if (!probe) { printf("  [sdl2-video] dropped item ignored (not a readable file): %s\n", path); return; }
+    SDL_RWclose(probe);
+
+    if (lumen_fb_is_subtitle_ext(path)) {
+        if (state->has_file) {
+            snprintf(state->subtitle_add_path, sizeof(state->subtitle_add_path), "%s", path);
+            state->subtitle_add_requested = 1;
+        }
+        return;
+    }
+    dir_of(path, ctx->last_media_dir, sizeof(ctx->last_media_dir));
+    if (ctx->drop_count++ == 0) {
+        snprintf(state->open_file_pending_path, sizeof(state->open_file_pending_path), "%s", path);
+        state->open_file_requested = 1;
+    } else if (state->pending_add_count < LUMEN_PENDING_QUEUE_MAX) {
+        snprintf(state->pending_add_paths[state->pending_add_count],
+                 sizeof(state->pending_add_paths[0]), "%s", path);
+        state->pending_add_count++;
+    }
+    SDL_RaiseWindow(ctx->window);
+}
+
 static int handle_events(lumen_output_ctx_t *ctx) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -204,6 +247,8 @@ static int handle_events(lumen_output_ctx_t *ctx) {
         else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) evt_win_id = e.button.windowID;
         else if (e.type == SDL_MOUSEMOTION)     evt_win_id = e.motion.windowID;
         else if (e.type == SDL_MOUSEWHEEL)      evt_win_id = e.wheel.windowID;
+        else if (e.type == SDL_DROPFILE || e.type == SDL_DROPBEGIN || e.type == SDL_DROPCOMPLETE)
+            evt_win_id = e.drop.windowID;
 
         Uint32 pkg_win_id = ctx->pkg_window ? SDL_GetWindowID(ctx->pkg_window) : 0;
         Uint32 pref_win_id = ctx->pref_window ? SDL_GetWindowID(ctx->pref_window) : 0;
@@ -249,6 +294,18 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 ctx->have_last_redraw = 0;
             }
         }
+        /* Drag-and-drop from a file manager: the first media file of a drop
+         * plays now and the rest join the queue (VLC-style); a subtitle
+         * file is added as a track to what's playing. */
+        if (e.type == SDL_DROPBEGIN && !for_pkg) ctx->drop_count = 0;
+        if (e.type == SDL_DROPFILE && !for_pkg) {
+            handle_dropped_file(ctx, e.drop.file);
+            SDL_free(e.drop.file);
+            continue;
+        }
+        /* The built-in file browser owns the keyboard while it's open:
+         * typing a file name mustn't pause, seek or go fullscreen. */
+        if (e.type == SDL_KEYDOWN && !for_pkg && lumen_fb_is_open(ctx->fb)) continue;
         if (e.type == SDL_KEYDOWN && !for_pkg) {
             if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
                 if (ctx->fullscreen) toggle_fullscreen(ctx);
@@ -501,6 +558,17 @@ static void prefs_page_general(lumen_output_ctx_t *ctx, lumen_playback_state_t *
     ImGui::SeparatorText("Startup");
     pref_check("Remember the volume", &st->pref_remember_volume, st);
     pref_note("Start at the volume you last used instead of 100%.");
+
+    ImGui::SeparatorText("Opening files");
+    pref_check("Use the system file picker", &st->pref_system_dialog, st);
+#if defined(_WIN32)
+    pref_note("Off: qqvideo's own file browser. On: the standard Windows Open dialog.");
+#else
+    pref_note("Off: qqvideo's own file browser, which needs nothing else installed. "
+              "On: your desktop's picker -- needs zenity, kdialog, or Python with Tk.");
+#endif
+    pref_note("You can also drag files onto the window: the first plays, the rest are queued; "
+              "subtitle files are added to the video that's playing.");
 }
 
 static void prefs_page_playback(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
@@ -967,7 +1035,25 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
      * the same background thread so the decode/render loop keeps running
      * while the user picks a file. dialog_purpose tells pump_ui how to use
      * the result (0 = append to queue, 1 = replace queue, 2 = subtitle). */
-    auto spawn_dialog = [ctx](int purpose) {
+    auto spawn_dialog = [ctx, state](int purpose) {
+                if (!state->pref_system_dialog) {
+                    /* Built-in browser: drawn every frame in maybe_redraw;
+                     * its result lands in dialog_result_path just like the
+                     * thread's, so pump_ui handles both the same way. */
+                    if (!ctx->fb) {
+                        char cfg[512];
+                        dir_of(state->prefs_path, cfg, sizeof(cfg));
+                        ctx->fb = lumen_fb_create(cfg);
+                    }
+                    ctx->dialog_purpose = purpose;
+                    SDL_AtomicSet(&ctx->dialog_result_ready, 0);
+                    SDL_AtomicSet(&ctx->dialog_running, 1);
+                    lumen_fb_open(ctx->fb,
+                                  purpose == 2 ? "Add Subtitle Track" : purpose == 1 ? "Open File" : "Add to Queue",
+                                  purpose == 2 ? LUMEN_FB_SUBTITLES : LUMEN_FB_MEDIA,
+                                  purpose == 2 ? ctx->last_media_dir : NULL);
+                    return;
+                }
                 if (ctx->dialog_thread) {
                     SDL_WaitThread(ctx->dialog_thread, NULL);
                     ctx->dialog_thread = NULL;
@@ -1291,10 +1377,26 @@ static void compute_min_size(lumen_output_ctx_t *ctx) {
     printf("  [sdl2-video] minimum window size %dx%d\n", ctx->min_w, ctx->min_h);
 }
 
-/* VLC-style seek bar: a track that fills in as the movie plays, plus a
- * round handle at the current position that grows under the mouse, and a
- * tooltip with the time under the cursor. Click anywhere to jump there,
- * or drag; the seek happens on release. */
+/* Retro seek bar, in the style of classic VLC / WMP / Win9x trackbars:
+ * a sunken rectangular groove that fills with a blue gradient as the
+ * movie plays, a pale strip for what's already buffered ahead, and a
+ * raised rectangular thumb at the playhead. Everything is snapped to
+ * whole pixels, so edges stay hard instead of anti-aliased.
+ * Click anywhere to jump there, or drag; the seek happens on release,
+ * and a tooltip shows the time under the cursor. */
+static void bevel_rect(ImDrawList *dl, float x0, float y0, float x1, float y1,
+                       ImU32 tl_outer, ImU32 br_outer, ImU32 tl_inner, ImU32 br_inner) {
+    /* Two 1px frames: outer then inner. tl = top/left edges, br = bottom/right. */
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y0 + 1), tl_outer);
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 1, y1), tl_outer);
+    dl->AddRectFilled(ImVec2(x0, y1 - 1), ImVec2(x1, y1), br_outer);
+    dl->AddRectFilled(ImVec2(x1 - 1, y0), ImVec2(x1, y1), br_outer);
+    dl->AddRectFilled(ImVec2(x0 + 1, y0 + 1), ImVec2(x1 - 1, y0 + 2), tl_inner);
+    dl->AddRectFilled(ImVec2(x0 + 1, y0 + 1), ImVec2(x0 + 2, y1 - 1), tl_inner);
+    dl->AddRectFilled(ImVec2(x0 + 1, y1 - 2), ImVec2(x1 - 1, y1 - 1), br_inner);
+    dl->AddRectFilled(ImVec2(x1 - 2, y0 + 1), ImVec2(x1 - 1, y1 - 1), br_inner);
+}
+
 static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
     lumen_playback_state_t *state = ctx->state;
     bool has_file = state->has_file && state->duration_ms > 0;
@@ -1304,9 +1406,13 @@ static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
     bool hovered = has_file && ImGui::IsItemHovered();
     bool active  = has_file && ImGui::IsItemActive();
 
-    const float r_handle = 7.0f;                  /* keep the handle inside the hit area (r + ring < h/2) */
-    float x0 = p0.x + r_handle, x1 = p0.x + width - r_handle;
-    float cy = p0.y + h * 0.5f;
+    const float thumb_w = 10.0f, thumb_h = 18.0f;   /* raised thumb */
+    const float groove_h = 12.0f;                     /* sunken groove */
+    float gx0 = floorf(p0.x), gx1 = floorf(p0.x + width);
+    float cy  = floorf(p0.y + h * 0.5f);
+    float gy0 = cy - groove_h / 2, gy1 = cy + groove_h / 2;
+    /* The playhead travels the inside of the groove, keeping the thumb within it. */
+    float x0 = gx0 + thumb_w / 2, x1 = gx1 - thumb_w / 2;
     float dur = (float)(has_file ? state->duration_ms : 1);
 
     if (active) {                                 /* click or drag: follow the mouse */
@@ -1327,32 +1433,48 @@ static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
     float pos = has_file ? (ctx->dragging_seek ? ctx->seek_preview_ms : (float)state->position_ms) : 0.0f;
     float frac = pos / dur;
     frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
-    float hx = x0 + (x1 - x0) * frac;
+    float hx = floorf(x0 + (x1 - x0) * frac);
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    /* Solid colors rather than the theme's pale slider tint: the played
-     * part should read at a glance against the unplayed track. */
-    const ImU32 col_track = IM_COL32(236, 236, 236, 255);
-    const ImU32 col_edge  = IM_COL32(150, 150, 150, 255);
-    const ImU32 col_fill  = (hovered || active) ? IM_COL32(40, 110, 225, 255) : IM_COL32(52, 120, 230, 255);
-    float th = (hovered || active) ? 10.0f : 8.0f;  /* track thickens under the mouse */
-    dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_track, th / 2);
-    dl->AddRect(ImVec2(x0, cy - th / 2), ImVec2(x1, cy + th / 2), col_edge, th / 2);
+    const ImU32 white  = IM_COL32(255, 255, 255, 255);
+    const ImU32 light  = IM_COL32(223, 223, 223, 255);
+    const ImU32 shadow = IM_COL32(128, 128, 128, 255);
+    const ImU32 dark   = IM_COL32( 64,  64,  64, 255);
+
+    /* Groove: white well with a 2px sunken bevel around it. */
+    float ix0 = gx0 + 2, iy0 = gy0 + 2, ix1 = gx1 - 2, iy1 = gy1 - 2;   /* inside the bevel */
+    dl->AddRectFilled(ImVec2(ix0, iy0), ImVec2(ix1, iy1), has_file ? white : IM_COL32(236, 236, 236, 255));
+    bevel_rect(dl, gx0, gy0, gx1, gy1, shadow, white, dark, light);
+
     if (has_file) {
-        /* YouTube-style buffered range: from the playhead to how far ahead
-         * is already decoded ("Buffer ahead", or the normal read-ahead). */
+        float fill_x = hx < ix0 ? ix0 : (hx > ix1 ? ix1 : hx);
+        /* Buffered-ahead strip: from the playhead to how far ahead is decoded. */
         if (!ctx->dragging_seek && state->buffer_ahead_ms > 0) {
             float bf = ((float)state->position_ms + (float)state->buffer_ahead_ms) / dur;
             bf = bf > 1 ? 1 : bf;
-            float bx = x0 + (x1 - x0) * bf;
-            if (bx > hx) dl->AddRectFilled(ImVec2(hx - th / 2, cy - th / 2), ImVec2(bx, cy + th / 2),
-                                           IM_COL32(168, 190, 228, 255), th / 2);
+            float bx = floorf(x0 + (x1 - x0) * bf);
+            bx = bx > ix1 ? ix1 : bx;
+            if (bx > fill_x) dl->AddRectFilled(ImVec2(fill_x, iy0), ImVec2(bx, iy1), IM_COL32(190, 206, 232, 255));
         }
-        if (hx > x0) dl->AddRectFilled(ImVec2(x0, cy - th / 2), ImVec2(hx, cy + th / 2), col_fill, th / 2);
-        float rr = (hovered || active) ? r_handle : r_handle - 1.5f;
-        dl->AddCircleFilled(ImVec2(hx, cy), rr + 2.0f, IM_COL32(255, 255, 255, 255), 24);  /* white ring */
-        dl->AddCircle(ImVec2(hx, cy), rr + 2.0f, IM_COL32(90, 90, 90, 200), 24, 1.0f);     /* keeps it visible on the light track */
-        dl->AddCircleFilled(ImVec2(hx, cy), rr, col_fill, 24);
+        /* Played part: vertical blue gradient, brighter under the mouse. */
+        if (fill_x > ix0) {
+            ImU32 top = (hovered || active) ? IM_COL32(110, 165, 245, 255) : IM_COL32( 92, 146, 232, 255);
+            ImU32 bot = (hovered || active) ? IM_COL32( 30,  80, 190, 255) : IM_COL32( 24,  70, 172, 255);
+            dl->AddRectFilledMultiColor(ImVec2(ix0, iy0), ImVec2(fill_x, iy1), top, top, bot, bot);
+        }
+
+        /* Thumb: a raised 3D button (white/light highlight on the top and
+         * left, gray/black shadow on the bottom and right). */
+        float tx0 = hx - thumb_w / 2, tx1 = tx0 + thumb_w;
+        float ty0 = cy - thumb_h / 2, ty1 = ty0 + thumb_h;
+        ImU32 face = active ? IM_COL32(200, 200, 200, 255) : hovered ? IM_COL32(236, 236, 236, 255)
+                            : IM_COL32(212, 208, 200, 255);
+        dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), face);
+        bevel_rect(dl, tx0, ty0, tx1, ty1, white, IM_COL32(0, 0, 0, 255), light, shadow);
+        /* Grip line down the middle, like old trackbar thumbs. */
+        float mx = floorf((tx0 + tx1) / 2) - 1;
+        dl->AddRectFilled(ImVec2(mx, ty0 + 4), ImVec2(mx + 1, ty1 - 4), shadow);
+        dl->AddRectFilled(ImVec2(mx + 1, ty0 + 4), ImVec2(mx + 2, ty1 - 4), white);
     }
 
     if (hovered || active) {                       /* time under the cursor */
@@ -1651,6 +1773,22 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     if (show_menu)     draw_menu_bar(ctx);
     if (show_controls) draw_queue_panel(ctx);
     if (show_controls) draw_controls(ctx);
+
+    /* Built-in file browser (modal over everything else). */
+    if (lumen_fb_is_open(ctx->fb)) {
+        char picked[512];
+        lumen_fb_result r = lumen_fb_draw(ctx->fb, picked, sizeof(picked));
+        if (r != LUMEN_FB_NONE) {
+            SDL_LockMutex(ctx->dialog_mutex);
+            if (r == LUMEN_FB_PICKED) snprintf(ctx->dialog_result_path, sizeof(ctx->dialog_result_path), "%s", picked);
+            else                      ctx->dialog_result_path[0] = '\0';
+            SDL_UnlockMutex(ctx->dialog_mutex);
+            if (r == LUMEN_FB_PICKED && ctx->dialog_purpose != 2)
+                dir_of(picked, ctx->last_media_dir, sizeof(ctx->last_media_dir));
+            SDL_AtomicSet(&ctx->dialog_result_ready, 1);
+            SDL_AtomicSet(&ctx->dialog_running, 0);
+        }
+    }
 
     /* Error overlay -- shown when player_core.c sets state->error_msg
      * (missing decoder, blocked codec). Displayed in the video area centre. */
@@ -2113,6 +2251,8 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
         SDL_DestroyMutex(ctx->dialog_mutex);
         ctx->dialog_mutex = NULL;
     }
+    lumen_fb_destroy(ctx->fb);
+    ctx->fb = NULL;
     /* Tear down the package manager window and its own ImGui context */
     aux_window_destroy(&ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx);
     aux_window_destroy(&ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx);

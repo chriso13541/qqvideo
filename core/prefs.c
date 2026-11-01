@@ -31,6 +31,7 @@ void lumen_prefs_defaults(lumen_playback_state_t *st) {
     st->pref_sub_lang[0] = '\0';
     st->pref_sub_scale_pct = 100;
     st->pref_audio_lang[0] = '\0';
+    st->pref_system_dialog = 0;
 }
 
 /* Builds the config directory path; creates it if `create`. */
@@ -100,6 +101,7 @@ void lumen_prefs_load(lumen_playback_state_t *st) {
         else if (!strcmp(key, "audio_delay_ms"))  st->pref_av_offset_ms = clampi(v, -2000, 2000);
         else if (!strcmp(key, "subtitle_autoload")) st->pref_sub_autoload = v != 0;
         else if (!strcmp(key, "subtitle_size"))   st->pref_sub_scale_pct = clampi(v, 50, 250);
+        else if (!strcmp(key, "system_file_dialog")) st->pref_system_dialog = v != 0;
     }
     fclose(f);
 }
@@ -133,6 +135,7 @@ int lumen_prefs_save(const lumen_playback_state_t *st) {
     fprintf(f, "subtitle_language = %s\n", st->pref_sub_lang);
     fprintf(f, "subtitle_size = %d\n", st->pref_sub_scale_pct);
     fprintf(f, "audio_language = %s\n", st->pref_audio_lang);
+    fprintf(f, "system_file_dialog = %d\n", st->pref_system_dialog ? 1 : 0);
     if (fclose(f) != 0) return -1;
     /* write-then-rename, so a crash mid-save can't leave a truncated file */
 #if defined(_WIN32)

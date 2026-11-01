@@ -7,8 +7,8 @@
 extern const unsigned int  remixicon_font_size;
 extern const unsigned char remixicon_font_data[];
 
-#define ICON_RANGE_MIN 0xED9A
-#define ICON_RANGE_MAX 0xF2A1
+#define ICON_RANGE_MIN 0xEA60
+#define ICON_RANGE_MAX 0xF3C7
 
 #define ICON_PLAY             "\xef\x80\x8a"   /* ri-play-fill U+F00A */
 #define ICON_PAUSE            "\xee\xbf\x97"   /* ri-pause-fill U+EFD7 */
@@ -21,3 +21,18 @@ extern const unsigned char remixicon_font_data[];
 #define ICON_VOLUME_UP        "\xef\x8a\xa1"   /* ri-volume-up-fill U+F2A1 */
 #define ICON_VOLUME_DOWN      "\xef\x8a\x9b"   /* ri-volume-down-fill U+F29B */
 #define ICON_VOLUME_MUTE      "\xef\x8a\x9d"   /* ri-volume-mute-fill U+F29D */
+#define ICON_FOLDER           "\xee\xb5\xa1"   /* ri-folder-fill U+ED61 */
+#define ICON_FOLDER_OPEN      "\xee\xb5\xaf"   /* ri-folder-open-fill U+ED6F */
+#define ICON_FILE             "\xee\xb3\xa0"   /* ri-file-fill U+ECE0 */
+#define ICON_FILE_VIDEO       "\xef\x8f\x87"   /* ri-file-video-fill U+F3C7 */
+#define ICON_FILE_TEXT        "\xee\xb4\x8e"   /* ri-file-text-fill U+ED0E */
+#define ICON_ARROW_UP         "\xee\xa9\xb6"   /* ri-arrow-up-line U+EA76 */
+#define ICON_ARROW_LEFT       "\xee\xa9\xa0"   /* ri-arrow-left-line U+EA60 */
+#define ICON_ARROW_RIGHT      "\xee\xa9\xac"   /* ri-arrow-right-line U+EA6C */
+#define ICON_HOME             "\xee\xb8\x9c"   /* ri-home-4-fill U+EE1C */
+#define ICON_DRIVE            "\xee\xb7\xb8"   /* ri-hard-drive-2-fill U+EDF8 */
+#define ICON_HISTORY          "\xee\xb8\x97"   /* ri-history-line U+EE17 */
+#define ICON_REFRESH          "\xef\x81\xa4"   /* ri-refresh-line U+F064 */
+#define ICON_COMPUTER         "\xee\xaf\x8a"   /* ri-computer-line U+EBCA */
+#define ICON_DOWNLOAD         "\xee\xb1\x93"   /* ri-download-2-fill U+EC53 */
+#define ICON_FILM             "\xee\xb4\xa0"   /* ri-film-fill U+ED20 */

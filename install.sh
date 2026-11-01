@@ -129,7 +129,6 @@ pkg_name() {   # pkg_name <dep>
         gentoo:pkgconfig)  echo "virtual/pkgconfig" ;;
         gentoo:sdl2)       echo "media-libs/libsdl2" ;;
         gentoo:ffmpeg)     echo "media-video/ffmpeg" ;;
-        gentoo:dialog)     echo "gnome-extra/zenity" ;;
         gentoo:desktop)    echo "dev-util/desktop-file-utils" ;;
 
         debian:compiler)   echo "build-essential" ;;
@@ -137,7 +136,6 @@ pkg_name() {   # pkg_name <dep>
         debian:pkgconfig)  echo "pkg-config" ;;
         debian:sdl2)       echo "libsdl2-dev" ;;
         debian:ffmpeg)     echo "libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev" ;;
-        debian:dialog)     echo "zenity" ;;
         debian:desktop)    echo "desktop-file-utils" ;;
 
         arch:compiler)     echo "base-devel" ;;
@@ -145,7 +143,6 @@ pkg_name() {   # pkg_name <dep>
         arch:pkgconfig)    echo "pkgconf" ;;
         arch:sdl2)         echo "sdl2" ;;
         arch:ffmpeg)       echo "ffmpeg" ;;
-        arch:dialog)       echo "zenity" ;;
         arch:desktop)      echo "desktop-file-utils" ;;
 
         fedora:compiler)   echo "gcc gcc-c++ make" ;;
@@ -153,7 +150,6 @@ pkg_name() {   # pkg_name <dep>
         fedora:pkgconfig)  echo "pkgconf-pkg-config" ;;
         fedora:sdl2)       echo "SDL2-devel" ;;
         fedora:ffmpeg)     echo "ffmpeg-free-devel" ;;   # or ffmpeg-devel from RPM Fusion for H.264/HEVC
-        fedora:dialog)     echo "zenity" ;;
         fedora:desktop)    echo "desktop-file-utils" ;;
         *)                 echo "$1" ;;
     esac
@@ -202,10 +198,6 @@ check_deps() {
         done
         [ "$ff_ok" = 1 ] || MISSING+=(ffmpeg)
     fi
-    # File > Open uses tinyfiledialogs, which shells out to one of these.
-    command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1 ||
-        command -v qarma >/dev/null 2>&1 || command -v matedialog >/dev/null 2>&1 ||
-        MISSING_OPT+=(dialog)
     command -v update-desktop-database >/dev/null 2>&1 || MISSING_OPT+=(desktop)
 }
 
@@ -223,7 +215,6 @@ report_deps() {
     if [ ${#MISSING_OPT[@]} -gt 0 ]; then
         for k in "${MISSING_OPT[@]}"; do
             case "$k" in
-                dialog)  warn "no zenity/kdialog found: File > Open won't be able to show a file picker ($(pkg_name dialog))." ;;
                 desktop) warn "update-desktop-database not found: 'Open With' may not list qqvideo until next login ($(pkg_name desktop))." ;;
             esac
         done

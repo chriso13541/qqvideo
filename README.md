@@ -35,7 +35,8 @@ the source tree.
 decoder qqvideo uses (H.264/HEVC/AV1 decoding is built in; the `x264`/
 `x265` flags are only for *encoding*). `media-libs/libsdl2` needs `X` (or
 `wayland`) and a sound flag (`alsa`, `pulseaudio` or `pipewire`).
-File > Open needs a dialog helper -- `gnome-extra/zenity` or `kdialog`.
+Nothing else is needed for opening files: qqvideo has its own file
+browser (below), so zenity/kdialog are optional.
 A source-built FFmpeg in `/usr/local` may not be on Gentoo's default
 pkg-config path, so pass `--ffmpeg-prefix /usr/local` for that.
 
@@ -199,6 +200,42 @@ tools/lumenctl/lumenctl.sh      install/remove/list plugins, Gentoo-emerge-style
 third_party/tinyfiledialogs/    vendored native file-open dialog (see below)
 third_party/imgui/              vendored Dear ImGui (v1.91.5) + SDL2/SDLRenderer2 backend
 ```
+
+## Opening files: built-in browser and drag-and-drop
+
+File > Open, Add to Queue and Subtitles > Add Subtitle Track use
+qqvideo's own file browser (`plugins/output_sdl2/file_browser.cpp`),
+drawn with ImGui inside the player window -- same look on Linux and
+Windows, and nothing to install: no zenity, kdialog, GTK or Qt. It's
+plain C++17 `<filesystem>` plus `GetLogicalDrives` on Windows.
+
+- Sidebar: Home, Desktop, Videos, Downloads (from `user-dirs.dirs`, so
+  localized folder names work), `/` and mounted drives (`/run/media/$USER`,
+  `/media`, `/mnt`) on Linux, drive letters on Windows, and the 8 most
+  recent folders you opened something from.
+- Back / Forward / Up / Refresh, and an editable location bar (`~` works).
+  The File box takes a name in the current folder or a full path.
+- Sortable Name / Size / Modified columns, folders first; a type filter
+  (video and audio / subtitles / all files) and a Show hidden toggle.
+- Keys: arrows, PgUp/PgDn, Home/End, a letter jumps to the next name
+  starting with it, Enter opens, Backspace goes up, Alt+Left/Right go
+  back/forward, Esc cancels. Player shortcuts are off while it's open.
+- Add Subtitle Track starts in the playing video's folder. The last
+  folder and recent folders are saved to `~/.config/qqvideo/file_browser.ini`
+  (`%APPDATA%\qqvideo\` on Windows).
+
+**Drag and drop** files onto the window: the first video plays now and
+the rest are queued after it; a subtitle file is added as a track to
+the video that's playing. Folders are ignored. (A subtitle dropped in
+the *same* batch as a new video is skipped -- drop it again once the
+video starts, unless it sits next to the video, where it's listed
+automatically.)
+
+Preferences > General > *Use the system file picker* switches back to
+the desktop's dialog via tinyfiledialogs (the Win32 Open dialog on
+Windows; zenity, kdialog or Python/Tk on Linux). Off by default -- which
+also keeps tinyfiledialogs' shell-out code path (see its CVE history
+below) out of normal use.
 
 ## Launching without a terminal: native file-open dialog
 

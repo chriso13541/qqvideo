@@ -558,7 +558,11 @@ int main(int argc, char **argv) {
              * does something. This is the VLC-style blank-startup state:
              * no file dialog is forced on the user; they choose. */
             lumen_idle_result_t idle = lumen_session_idle(session);
-            drain_pending_adds(session); /* process any adds that happened while idle */
+            /* Process adds that happened while idle -- except when a file is
+             * being opened: adds that arrive WITH an open (a multi-file
+             * drag-and-drop) belong after it, so they're drained below,
+             * once the queue has been replaced. */
+            if (idle != LUMEN_IDLE_OPEN_FILE) drain_pending_adds(session);
             push_queue_state(session);
 
             if (idle == LUMEN_IDLE_QUIT) break;
@@ -581,6 +585,7 @@ int main(int argc, char **argv) {
                 queue_append(picked);
                 q_pos = 0;
                 free(picked);
+                drain_pending_adds(session);   /* rest of a multi-file drop */
                 push_queue_state(session);
             }
 
@@ -635,8 +640,11 @@ int main(int argc, char **argv) {
         lumen_play_stats_t stats;
         rc = lumen_session_play_file(session, play_path, &stats);
 
-        /* Always drain and push after a play ends */
-        drain_pending_adds(session);
+        /* Always drain and push after a play ends -- unless a file is being
+         * opened: adds that came with it (multi-file drag-and-drop) go
+         * after it, so the open branch below drains them once it has
+         * replaced the queue. */
+        if (!stats.open_file_requested) drain_pending_adds(session);
 
         if (lumen_session_is_quit_requested(session)) break;
 
@@ -669,6 +677,7 @@ int main(int argc, char **argv) {
                 q_pos = 0;
                 free(picked);
             }
+            drain_pending_adds(session);   /* rest of a multi-file drop */
             /* If path is empty (shouldn't normally happen since the dialog
              * only sets open_file_requested when a file was actually picked),
              * just leave q_pos as-is and re-play the current item. */

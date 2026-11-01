@@ -42,6 +42,22 @@ ICONS = [
     ("VOLUME_UP",       "volume-up-fill",       0xF2A1),
     ("VOLUME_DOWN",     "volume-down-fill",     0xF29B),
     ("VOLUME_MUTE",     "volume-mute-fill",     0xF29D),
+    # built-in file browser
+    ("FOLDER",          "folder-fill",          0xED61),
+    ("FOLDER_OPEN",     "folder-open-fill",     0xED6F),
+    ("FILE",            "file-fill",            0xECE0),
+    ("FILE_VIDEO",      "file-video-fill",      0xF3C7),
+    ("FILE_TEXT",       "file-text-fill",       0xED0E),
+    ("ARROW_UP",        "arrow-up-line",        0xEA76),
+    ("ARROW_LEFT",      "arrow-left-line",      0xEA60),
+    ("ARROW_RIGHT",     "arrow-right-line",     0xEA6C),
+    ("HOME",            "home-4-fill",          0xEE1C),
+    ("DRIVE",           "hard-drive-2-fill",    0xEDF8),
+    ("HISTORY",         "history-line",         0xEE17),
+    ("REFRESH",         "refresh-line",         0xF064),
+    ("COMPUTER",        "computer-line",        0xEBCA),
+    ("DOWNLOAD",        "download-2-fill",      0xEC53),
+    ("FILM",            "film-fill",            0xED20),
 ]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

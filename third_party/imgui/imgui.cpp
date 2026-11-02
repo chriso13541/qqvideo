@@ -6717,8 +6717,12 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
         // Title bar
         if (!(flags & ImGuiWindowFlags_NoTitleBar))
         {
+#ifdef IMGUI_QQ_RETRO   // qqvideo: classic gradient title bar
+            QQ_RetroTitleBar(window->DrawList, title_bar_rect.Min, title_bar_rect.Max, title_bar_is_highlight);
+#else
             ImU32 title_bar_col = GetColorU32(title_bar_is_highlight ? ImGuiCol_TitleBgActive : ImGuiCol_TitleBg);
             window->DrawList->AddRectFilled(title_bar_rect.Min, title_bar_rect.Max, title_bar_col, window_rounding, ImDrawFlags_RoundCornersTop);
+#endif
         }
 
         // Menu bar
@@ -6846,7 +6850,14 @@ void ImGui::RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& titl
     }
     //if (g.IO.KeyShift) window->DrawList->AddRect(layout_r.Min, layout_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
     //if (g.IO.KeyCtrl) window->DrawList->AddRect(clip_r.Min, clip_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
+#ifdef IMGUI_QQ_RETRO   // qqvideo: white title on the active (blue) bar, light gray on inactive
+    const bool qq_active = g.NavWindow && window->RootWindowForTitleBarHighlight == g.NavWindow->RootWindowForTitleBarHighlight;
+    PushStyleColor(ImGuiCol_Text, qq_active ? IM_COL32_WHITE : IM_COL32(212, 208, 200, 255));
     RenderTextClipped(layout_r.Min, layout_r.Max, name, NULL, &text_size, style.WindowTitleAlign, &clip_r);
+    PopStyleColor();
+#else
+    RenderTextClipped(layout_r.Min, layout_r.Max, name, NULL, &text_size, style.WindowTitleAlign, &clip_r);
+#endif
 }
 
 void ImGui::UpdateWindowParentAndRootLinks(ImGuiWindow* window, ImGuiWindowFlags flags, ImGuiWindow* parent_window)

@@ -741,11 +741,18 @@ bool ImGui::ButtonEx(const char* label, const ImVec2& size_arg, ImGuiButtonFlags
     // Render
     const ImU32 col = GetColorU32((held && hovered) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
     RenderNavCursor(bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo: 3D bevel; pressed = sunken, label moves down-right 1px
+    const bool qq_down = held && hovered;
+    QQ_RetroRaised(window->DrawList, bb.Min, bb.Max, col, qq_down);
+    const ImVec2 qq_nudge = qq_down ? ImVec2(1.0f, 1.0f) : ImVec2(0.0f, 0.0f);
+#else
     RenderFrame(bb.Min, bb.Max, col, true, style.FrameRounding);
+    const ImVec2 qq_nudge(0.0f, 0.0f);
+#endif
 
     if (g.LogEnabled)
         LogSetNextTextDecoration("[", "]");
-    RenderTextClipped(bb.Min + style.FramePadding, bb.Max - style.FramePadding, label, NULL, &label_size, style.ButtonTextAlign, &bb);
+    RenderTextClipped(bb.Min + style.FramePadding + qq_nudge, bb.Max - style.FramePadding + qq_nudge, label, NULL, &label_size, style.ButtonTextAlign, &bb);
 
     // Automatically close popups
     //if (pressed && !(flags & ImGuiButtonFlags_DontClosePopups) && (window->Flags & ImGuiWindowFlags_Popup))
@@ -819,7 +826,11 @@ bool ImGui::ArrowButtonEx(const char* str_id, ImGuiDir dir, ImVec2 size, ImGuiBu
     const ImU32 bg_col = GetColorU32((held && hovered) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
     const ImU32 text_col = GetColorU32(ImGuiCol_Text);
     RenderNavCursor(bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo
+    QQ_RetroRaised(window->DrawList, bb.Min, bb.Max, bg_col, held && hovered);
+#else
     RenderFrame(bb.Min, bb.Max, bg_col, true, g.Style.FrameRounding);
+#endif
     RenderArrow(window->DrawList, bb.Min + ImVec2(ImMax(0.0f, (size.x - g.FontSize) * 0.5f), ImMax(0.0f, (size.y - g.FontSize) * 0.5f)), text_col, dir);
 
     IMGUI_TEST_ENGINE_ITEM_INFO(id, str_id, g.LastItemData.StatusFlags);
@@ -856,11 +867,17 @@ bool ImGui::CloseButton(ImGuiID id, const ImVec2& pos)
         return pressed;
 
     // Render
+#ifdef IMGUI_QQ_RETRO   // qqvideo: always-visible raised [x] button with a black cross
+    QQ_RetroRaised(window->DrawList, bb.Min, bb.Max, GetColorU32(ImGuiCol_Button), held && hovered);
+    RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
+    ImU32 cross_col = IM_COL32_BLACK;
+#else
     ImU32 bg_col = GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered);
     if (hovered)
         window->DrawList->AddRectFilled(bb.Min, bb.Max, bg_col);
     RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
     ImU32 cross_col = GetColorU32(ImGuiCol_Text);
+#endif
     ImVec2 cross_center = bb.GetCenter() - ImVec2(0.5f, 0.5f);
     float cross_extent = g.FontSize * 0.5f * 0.7071f - 1.0f;
     window->DrawList->AddLine(cross_center + ImVec2(+cross_extent, +cross_extent), cross_center + ImVec2(-cross_extent, -cross_extent), cross_col, 1.0f);
@@ -1047,7 +1064,11 @@ bool ImGui::ScrollbarEx(const ImRect& bb_frame, ImGuiID id, ImGuiAxis axis, ImS6
         grab_rect = ImRect(ImLerp(bb.Min.x, bb.Max.x, grab_v_norm), bb.Min.y, ImLerp(bb.Min.x, bb.Max.x, grab_v_norm) + grab_h_pixels, bb.Max.y);
     else
         grab_rect = ImRect(bb.Min.x, ImLerp(bb.Min.y, bb.Max.y, grab_v_norm), bb.Max.x, ImLerp(bb.Min.y, bb.Max.y, grab_v_norm) + grab_h_pixels);
+#ifdef IMGUI_QQ_RETRO   // qqvideo: raised thumb
+    QQ_RetroRaised(window->DrawList, grab_rect.Min, grab_rect.Max, grab_col, false);
+#else
     window->DrawList->AddRectFilled(grab_rect.Min, grab_rect.Max, grab_col, style.ScrollbarRounding);
+#endif
 
     return held;
 }
@@ -1185,7 +1206,11 @@ bool ImGui::Checkbox(const char* label, bool* v)
     if (is_visible)
     {
         RenderNavCursor(total_bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo
+        QQ_RetroSunken(window->DrawList, check_bb.Min, check_bb.Max, GetColorU32((held && hovered) ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg));
+#else
         RenderFrame(check_bb.Min, check_bb.Max, GetColorU32((held && hovered) ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), true, style.FrameRounding);
+#endif
         ImU32 check_col = GetColorU32(ImGuiCol_CheckMark);
         if (mixed_value)
         {
@@ -1858,6 +1883,17 @@ bool ImGui::BeginCombo(const char* label, const char* preview_value, ImGuiComboF
     const ImU32 frame_col = GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     const float value_x2 = ImMax(bb.Min.x, bb.Max.x - arrow_size);
     RenderNavCursor(bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo: one sunken well, the arrow button raised inside its right end
+    QQ_RetroSunken(window->DrawList, bb.Min, bb.Max, frame_col);
+    if (!(flags & ImGuiComboFlags_NoArrowButton))
+    {
+        ImU32 bg_col = GetColorU32(hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+        ImU32 text_col = GetColorU32(ImGuiCol_Text);
+        QQ_RetroRaised(window->DrawList, ImVec2(value_x2, bb.Min.y + 2.0f), ImVec2(bb.Max.x - 2.0f, bb.Max.y - 2.0f), bg_col, popup_open);
+        if (value_x2 + arrow_size - style.FramePadding.x <= bb.Max.x)
+            RenderArrow(window->DrawList, ImVec2(value_x2 + style.FramePadding.y - 1.0f, bb.Min.y + style.FramePadding.y), text_col, ImGuiDir_Down, 1.0f);
+    }
+#else
     if (!(flags & ImGuiComboFlags_NoPreview))
         window->DrawList->AddRectFilled(bb.Min, ImVec2(value_x2, bb.Max.y), frame_col, style.FrameRounding, (flags & ImGuiComboFlags_NoArrowButton) ? ImDrawFlags_RoundCornersAll : ImDrawFlags_RoundCornersLeft);
     if (!(flags & ImGuiComboFlags_NoArrowButton))
@@ -1869,6 +1905,7 @@ bool ImGui::BeginCombo(const char* label, const char* preview_value, ImGuiComboF
             RenderArrow(window->DrawList, ImVec2(value_x2 + style.FramePadding.y, bb.Min.y + style.FramePadding.y), text_col, ImGuiDir_Down, 1.0f);
     }
     RenderFrameBorder(bb.Min, bb.Max, style.FrameRounding);
+#endif
 
     // Custom preview
     if (flags & ImGuiComboFlags_CustomPreview)
@@ -2660,7 +2697,11 @@ bool ImGui::DragScalar(const char* label, ImGuiDataType data_type, void* p_data,
     // Draw frame
     const ImU32 frame_col = GetColorU32(g.ActiveId == id ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     RenderNavCursor(frame_bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo
+    QQ_RetroSunken(window->DrawList, frame_bb.Min, frame_bb.Max, frame_col);
+#else
     RenderFrame(frame_bb.Min, frame_bb.Max, frame_col, true, style.FrameRounding);
+#endif
 
     // Drag behavior
     const bool value_changed = DragBehavior(id, data_type, p_data, v_speed, p_min, p_max, format, flags);
@@ -3242,7 +3283,11 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
     // Draw frame
     const ImU32 frame_col = GetColorU32(g.ActiveId == id ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     RenderNavCursor(frame_bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo
+    QQ_RetroSunken(window->DrawList, frame_bb.Min, frame_bb.Max, frame_col);
+#else
     RenderFrame(frame_bb.Min, frame_bb.Max, frame_col, true, g.Style.FrameRounding);
+#endif
 
     // Slider behavior
     ImRect grab_bb;
@@ -3252,7 +3297,11 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
 
     // Render grab
     if (grab_bb.Max.x > grab_bb.Min.x)
+#ifdef IMGUI_QQ_RETRO   // qqvideo: raised thumb spanning the track's height
+        QQ_RetroRaised(window->DrawList, ImVec2(grab_bb.Min.x, frame_bb.Min.y), ImVec2(grab_bb.Max.x, frame_bb.Max.y), GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), false);
+#else
         window->DrawList->AddRectFilled(grab_bb.Min, grab_bb.Max, GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), style.GrabRounding);
+#endif
 
     // Display value using user-provided display format so user can add prefix/suffix/decorations to the value.
     char value_buf[64];
@@ -5104,7 +5153,11 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     if (!is_multiline)
     {
         RenderNavCursor(frame_bb, id);
+#ifdef IMGUI_QQ_RETRO   // qqvideo
+        QQ_RetroSunken(draw_window->DrawList, frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg));
+#else
         RenderFrame(frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+#endif
     }
 
     const ImVec4 clip_rect(frame_bb.Min.x, frame_bb.Min.y, frame_bb.Min.x + inner_size.x, frame_bb.Min.y + inner_size.y); // Not using frame_bb.Max because we have adjusted size
@@ -8815,7 +8868,14 @@ bool ImGui::BeginMenuEx(const char* label, const char* icon, bool enabled)
         ImVec2 text_pos(window->DC.CursorPos.x + offsets->OffsetLabel, window->DC.CursorPos.y + window->DC.CurrLineTextBaseOffset);
         pressed = Selectable("", menu_is_open, selectable_flags, ImVec2(w, label_size.y));
         LogSetNextTextDecoration("[", "]");
+#ifdef IMGUI_QQ_RETRO   // qqvideo: white text on the highlight
+        const bool qq_hi = enabled && (menu_is_open || (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_HoveredRect));
+        if (qq_hi) PushStyleColor(ImGuiCol_Text, IM_COL32_WHITE);
         RenderText(text_pos, label);
+        if (qq_hi) PopStyleColor();
+#else
+        RenderText(text_pos, label);
+#endif
         PopStyleVar();
         window->DC.CursorPos.x += IM_TRUNC(style.ItemSpacing.x * (-1.0f + 0.5f)); // -1 spacing to compensate the spacing added when Selectable() did a SameLine(). It would also work to call SameLine() ourselves after the PopStyleVar().
     }
@@ -8832,10 +8892,17 @@ bool ImGui::BeginMenuEx(const char* label, const char* icon, bool enabled)
         ImVec2 text_pos(window->DC.CursorPos.x + offsets->OffsetLabel, window->DC.CursorPos.y + window->DC.CurrLineTextBaseOffset);
         pressed = Selectable("", menu_is_open, selectable_flags | ImGuiSelectableFlags_SpanAvailWidth, ImVec2(min_w, label_size.y));
         LogSetNextTextDecoration("", ">");
+#ifdef IMGUI_QQ_RETRO   // qqvideo: white text on the highlight
+        const bool qq_hi = enabled && (menu_is_open || (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_HoveredRect));
+        if (qq_hi) PushStyleColor(ImGuiCol_Text, IM_COL32_WHITE);
+#endif
         RenderText(text_pos, label);
         if (icon_w > 0.0f)
             RenderText(pos + ImVec2(offsets->OffsetIcon, 0.0f), icon);
         RenderArrow(window->DrawList, pos + ImVec2(offsets->OffsetMark + extra_w + g.FontSize * 0.30f, 0.0f), GetColorU32(ImGuiCol_Text), ImGuiDir_Right);
+#ifdef IMGUI_QQ_RETRO
+        if (qq_hi) PopStyleColor();
+#endif
     }
     if (!enabled)
         EndDisabled();
@@ -9039,6 +9106,10 @@ bool ImGui::MenuItemEx(const char* label, const char* icon, const char* shortcut
         pressed = Selectable("", false, selectable_flags | ImGuiSelectableFlags_SpanAvailWidth, ImVec2(min_w, label_size.y));
         if (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_Visible)
         {
+#ifdef IMGUI_QQ_RETRO   // qqvideo: white text (label, shortcut, check) on the highlight
+            const bool qq_hi = enabled && (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_HoveredRect);
+            if (qq_hi) { PushStyleColor(ImGuiCol_Text, IM_COL32_WHITE); PushStyleColor(ImGuiCol_TextDisabled, IM_COL32(220, 220, 220, 255)); }
+#endif
             RenderText(pos + ImVec2(offsets->OffsetLabel, 0.0f), label);
             if (icon_w > 0.0f)
                 RenderText(pos + ImVec2(offsets->OffsetIcon, 0.0f), icon);
@@ -9051,6 +9122,9 @@ bool ImGui::MenuItemEx(const char* label, const char* icon, const char* shortcut
             }
             if (selected)
                 RenderCheckMark(window->DrawList, pos + ImVec2(offsets->OffsetMark + stretch_w + g.FontSize * 0.40f, g.FontSize * 0.134f * 0.5f), GetColorU32(ImGuiCol_Text), g.FontSize * 0.866f);
+#ifdef IMGUI_QQ_RETRO
+            if (qq_hi) PopStyleColor(2);
+#endif
         }
     }
     IMGUI_TEST_ENGINE_ITEM_INFO(g.LastItemData.ID, label, g.LastItemData.StatusFlags | ImGuiItemStatusFlags_Checkable | (selected ? ImGuiItemStatusFlags_Checked : 0));

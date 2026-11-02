@@ -35,6 +35,7 @@
 #include "lumen_font.h"  /* Roboto font data (compiled separately in lumen_font.cpp) */
 #include "lumen_icons.h" /* Remix Icon subset + ICON_* macros (third_party/remixicon/) */
 #include "file_browser.h" /* built-in file picker (no zenity/kdialog needed) */
+#include "retro_style.h"  /* classic 3D-bevel look (with the patched ImGui) */
 
 /* App icon embedded as a PNG byte array -- used for SDL_SetWindowIcon
  * (the title-bar icon). The .ico file + Windows .rc handles the taskbar. */
@@ -212,6 +213,11 @@ static void dir_of(const char *path, char *out, size_t n) {
 static void handle_dropped_file(lumen_output_ctx_t *ctx, const char *path) {
     lumen_playback_state_t *state = ctx->state;
     if (!state || !path || !*path) return;
+    if (strlen(path) >= sizeof(state->open_file_pending_path)) {   /* would be truncated */
+        fprintf(stderr, "lumen: dropped path too long (max %d bytes), skipped: %s\n",
+                (int)sizeof(state->open_file_pending_path) - 1, path);
+        return;
+    }
     SDL_RWops *probe = SDL_RWFromFile(path, "rb");   /* skips folders and unreadable files */
     if (!probe) { printf("  [sdl2-video] dropped item ignored (not a readable file): %s\n", path); return; }
     SDL_RWclose(probe);
@@ -451,6 +457,7 @@ static bool aux_window_create(lumen_output_ctx_t *ctx, const char *title, int w,
     io.IniFilename = NULL;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsLight();
+    qq_retro_apply_style();
     void *font_copy = IM_ALLOC(lumen_font_size);          /* same Roboto as the main window */
     if (font_copy) {
         memcpy(font_copy, lumen_font_data, lumen_font_size);
@@ -732,7 +739,15 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
     static const char *PAGES[] = { "General", "Playback", "Video", "Audio", "Subtitles" };
-    const float footer_h = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
+    /* Footer = the "Saved automatically to <path>" note (which wraps when
+     * the path is long) + the Close button; measure it rather than assume
+     * one line, or a long config path pushes Close off the window. */
+    char saved_note[600];
+    if (st->prefs_path[0]) snprintf(saved_note, sizeof(saved_note), "Saved automatically to %s", st->prefs_path);
+    else snprintf(saved_note, sizeof(saved_note), "No config directory found -- settings last until qqvideo closes.");
+    const float note_h = ImGui::CalcTextSize(saved_note, NULL, false, ImGui::GetContentRegionAvail().x).y;
+    const ImGuiStyle &fst = ImGui::GetStyle();
+    const float footer_h = fst.ItemSpacing.y * 3.0f + 2.0f /* separator */ + note_h + ImGui::GetFrameHeight();
 
     /* Sidebar */
     ImGui::BeginChild("##nav", ImVec2(130.0f, -footer_h), ImGuiChildFlags_Borders);
@@ -755,12 +770,12 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
     /* Footer */
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    if (st->prefs_path[0]) ImGui::TextWrapped("Saved automatically to %s", st->prefs_path);
-    else                   ImGui::TextWrapped("No config directory found -- settings last until qqvideo closes.");
+    ImGui::TextWrapped("%s", saved_note);
     ImGui::PopStyleColor();
     if (ImGui::Button("Close")) { SDL_HideWindow(ctx->pref_window); ctx->pref_window_open = 0; }
 
     ImGui::End();
+    qq_retro_decorate_windows();
     ImGui::Render();
     SDL_SetRenderDrawColor(ctx->pref_renderer, 240, 240, 240, 255);
     SDL_RenderClear(ctx->pref_renderer);
@@ -1015,6 +1030,7 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
     }
 
     ImGui::End();
+    qq_retro_decorate_windows();
     ImGui::Render();
 
     SDL_SetRenderDrawColor(ctx->pkg_renderer, 240, 240, 240, 255);
@@ -1068,6 +1084,7 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
                 }
     };
 
+    qq_retro_push_menu_colors();   /* navy highlight + white text, menus only */
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
 
@@ -1175,6 +1192,7 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
         }
         ImGui::EndMainMenuBar();
     }
+    qq_retro_pop_menu_colors();
 }
 /* Queue panel -- drawn above the control bar when state->show_queue is
  * set. Shows all queued items with the currently-playing one highlighted.
@@ -1486,6 +1504,71 @@ static void draw_seek_bar(lumen_output_ctx_t *ctx, float width) {
     }
 }
 
+/* Volume: the same sunken groove + raised thumb as the seek bar, sized
+ * to sit in a row of buttons. Click or drag to set it (dragging while
+ * muted unmutes); the mouse wheel over it steps by the Up/Down amount.
+ * Gray fill while muted, so the level you'll return to stays visible. */
+static void draw_volume_bar(lumen_output_ctx_t *ctx, float width) {
+    lumen_playback_state_t *state = ctx->state;
+    const float h = ImGui::GetFrameHeight();       /* line up with the buttons */
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##volume", ImVec2(width, h));
+    bool hovered = ImGui::IsItemHovered();
+    bool active  = ImGui::IsItemActive();
+
+    const float thumb_w = 8.0f, thumb_h = 16.0f, groove_h = 10.0f;
+    float gx0 = floorf(p0.x), gx1 = floorf(p0.x + width);
+    float cy  = floorf(p0.y + h * 0.5f);
+    float gy0 = cy - groove_h / 2, gy1 = cy + groove_h / 2;
+    float x0 = gx0 + thumb_w / 2, x1 = gx1 - thumb_w / 2;
+
+    if (active) {
+        float t = (ImGui::GetIO().MousePos.x - x0) / (x1 - x0);
+        t = t < 0 ? 0 : (t > 1 ? 1 : t);
+        state->volume = roundf(t * 100.0f) / 100.0f;   /* whole percents */
+        if (state->muted) state->muted = 0;
+    }
+    if (ImGui::IsItemDeactivated() && state->pref_remember_volume) state->prefs_dirty = 1;
+    if (hovered && ImGui::GetIO().MouseWheel != 0.0f) {
+        int step = state->pref_volume_step > 0 ? state->pref_volume_step : 5;
+        int pct = (int)lroundf(state->volume * 100.0f) + (ImGui::GetIO().MouseWheel > 0 ? step : -step);
+        pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+        state->volume = (float)pct / 100.0f;
+        if (state->muted) state->muted = 0;
+        if (state->pref_remember_volume) state->prefs_dirty = 1;
+    }
+
+    float frac = state->volume < 0 ? 0 : (state->volume > 1 ? 1 : state->volume);
+    float hx = floorf(x0 + (x1 - x0) * frac);
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImU32 white  = IM_COL32(255, 255, 255, 255);
+    const ImU32 light  = IM_COL32(223, 223, 223, 255);
+    const ImU32 shadow = IM_COL32(128, 128, 128, 255);
+    const ImU32 dark   = IM_COL32( 64,  64,  64, 255);
+
+    float ix0 = gx0 + 2, iy0 = gy0 + 2, ix1 = gx1 - 2, iy1 = gy1 - 2;
+    dl->AddRectFilled(ImVec2(ix0, iy0), ImVec2(ix1, iy1), white);
+    bevel_rect(dl, gx0, gy0, gx1, gy1, shadow, white, dark, light);
+    float fill_x = hx < ix0 ? ix0 : (hx > ix1 ? ix1 : hx);
+    if (fill_x > ix0) {
+        ImU32 top, bot;
+        if (state->muted)           { top = IM_COL32(190, 190, 190, 255); bot = IM_COL32(140, 140, 140, 255); }
+        else if (hovered || active) { top = IM_COL32(110, 165, 245, 255); bot = IM_COL32( 30,  80, 190, 255); }
+        else                        { top = IM_COL32( 92, 146, 232, 255); bot = IM_COL32( 24,  70, 172, 255); }
+        dl->AddRectFilledMultiColor(ImVec2(ix0, iy0), ImVec2(fill_x, iy1), top, top, bot, bot);
+    }
+    float tx0 = hx - thumb_w / 2, tx1 = tx0 + thumb_w;
+    float ty0 = cy - thumb_h / 2, ty1 = ty0 + thumb_h;
+    ImU32 face = active ? IM_COL32(200, 200, 200, 255) : hovered ? IM_COL32(236, 236, 236, 255)
+                        : IM_COL32(212, 208, 200, 255);
+    dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), face);
+    bevel_rect(dl, tx0, ty0, tx1, ty1, white, IM_COL32(0, 0, 0, 255), light, shadow);
+
+    if (hovered || active)
+        ImGui::SetTooltip(state->muted ? "Volume %d%% (muted)" : "Volume %d%%", (int)lroundf(state->volume * 100.0f));
+}
+
 static void draw_controls(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *state = ctx->state;
     if (!state) return;
@@ -1497,7 +1580,8 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     const float bar_height = LUMEN_CTRL_BAR_H;
     ImGui::SetNextWindowPos(ImVec2(0, (float)win_h - bar_height));
     ImGui::SetNextWindowSize(ImVec2((float)win_w, bar_height));
-    ImGui::SetNextWindowBgAlpha(0.75f);
+    /* Solid in a window; see-through over the video in fullscreen. */
+    ImGui::SetNextWindowBgAlpha(ctx->fullscreen ? 0.80f : 1.0f);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                               ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1523,10 +1607,6 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
     /* --- Row 2 left: transport controls ---------------------------------- */
     if (!has_file) ImGui::BeginDisabled();
 
-    /* Old-school square buttons with a 1px border, like early-2000s
-     * players -- control bar only, the menus and dialogs keep ImGui's look. */
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
 
     /* Play / Pause -- leftmost */
     if (icon_button(state->paused ? ICON_PLAY "##playpause" : ICON_PAUSE "##playpause",
@@ -1612,16 +1692,8 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
                           state->muted ? ctx->volume_before_mute * 100.0f : 0.0f);
     ImGui::SameLine();
 
-    ImGui::SetNextItemWidth(vol_slider_w);
-    float volume_pct = state->volume * 100.0f;
-    if (ImGui::SliderFloat("##vol", &volume_pct, 0.0f, 100.0f, "%.0f%%")) {
-        state->volume = volume_pct / 100.0f;
-        /* Dragging the slider while muted implicitly unmutes */
-        if (state->muted) state->muted = 0;
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit() && state->pref_remember_volume) state->prefs_dirty = 1;
+    draw_volume_bar(ctx, vol_slider_w);
 
-    ImGui::PopStyleVar(2);
     ImGui::End();
 }
 
@@ -1845,6 +1917,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
                           IM_COL32(52, 120, 230, 255), 1.5f);
     }
 
+    qq_retro_decorate_windows();
     ImGui::Render();
 
     /* Window title update (unchanged) */
@@ -1970,6 +2043,7 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
      * use for anyway. */
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsLight();
+    qq_retro_apply_style();
 
     /* Load Roboto (embedded in lumen_font.cpp) at 15px -- smooth anti-aliased
      * TrueType rendering, replacing the default ProggyClean bitmap font.

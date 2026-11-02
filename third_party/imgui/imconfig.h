@@ -136,3 +136,18 @@ namespace ImGui
     void MyFunction(const char* name, MyMatrix44* mtx);
 }
 */
+
+//---- qqvideo: classic Windows 9x "3D bevel" look --------------------------
+// imgui_widgets.cpp and imgui.cpp are patched (search "qqvideo:") to draw
+// buttons, input frames, slider/scrollbar grabs and title bars through
+// these hooks instead of flat rectangles. They're implemented in
+// plugins/output_sdl2/retro_style.cpp. See QQVIDEO_PATCHES.md.
+#define IMGUI_QQ_RETRO 1
+struct ImDrawList;
+struct ImVec2;
+// Raised 3D frame (button face), or the pressed/sunken version of it.
+void QQ_RetroRaised(ImDrawList* dl, const ImVec2& a, const ImVec2& b, unsigned int face, bool pressed);
+// Sunken well (text box, checkbox, slider track), filled with `fill`.
+void QQ_RetroSunken(ImDrawList* dl, const ImVec2& a, const ImVec2& b, unsigned int fill);
+// Title bar: blue gradient when active, gray when not.
+void QQ_RetroTitleBar(ImDrawList* dl, const ImVec2& a, const ImVec2& b, bool active);

@@ -862,7 +862,9 @@ To actually build on Windows:
 
 ## Third-party
 
-- [Dear ImGui](https://github.com/ocornut/imgui) (MIT) -- UI
+- [Dear ImGui](https://github.com/ocornut/imgui) (MIT) -- UI. Lightly patched for the
+  classic 3D-bevel look (buttons, frames, menus, title bars); every change is
+  listed in `third_party/imgui/QQVIDEO_PATCHES.md`.
 - [Roboto](https://fonts.google.com/specimen/Roboto) (Apache-2.0) -- UI font
 - [Remix Icon](https://github.com/Remix-Design/RemixIcon) 4.8.0 (Apache-2.0) --
   player control icons. Only the icons used are embedded

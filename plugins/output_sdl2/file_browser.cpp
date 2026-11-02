@@ -418,6 +418,11 @@ static bool activate(lumen_file_browser *fb, std::string target, char *out, size
         fb->error = "Not found: " + target;
         return false;
     }
+    if (target.size() >= out_size) {       /* would be cut short into a wrong path */
+        fb->error = "Path too long for qqvideo (" + std::to_string(target.size()) + " bytes, max " +
+                    std::to_string(out_size - 1) + ")";
+        return false;
+    }
     snprintf(out, out_size, "%s", target.c_str());
     remember_recent(fb, fb->cwd);
     finish(fb);
@@ -457,11 +462,10 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
     ImGui::SetNextWindowSizeConstraints(ImVec2(360, 260), ImVec2(io.DisplaySize.x, io.DisplaySize.y));
 
     /* Square, bordered, like the control bar and an old common dialog. */
+    /* Square corners; the frames themselves are the retro bevels drawn by
+     * retro_style.cpp (raised dialog, sunken panes and text boxes). */
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 0.0f);
@@ -474,7 +478,7 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
 
     bool keep_open = true;
     if (!ImGui::BeginPopupModal(popup_id.c_str(), &keep_open, ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::PopStyleVar(9);
+        ImGui::PopStyleVar(6);
         ImGui::PopStyleColor(2);
         if (fb->open && !fb->just_opened) {   /* closed via the title-bar X */
             fb->last_dir = fb->cwd; fb->open = false; save_state(fb);
@@ -723,7 +727,7 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
         result = LUMEN_FB_CANCELLED;
     }
     ImGui::EndPopup();
-    ImGui::PopStyleVar(9);
+    ImGui::PopStyleVar(6);
     ImGui::PopStyleColor(2);
     return result;
 }

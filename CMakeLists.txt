@@ -84,6 +84,7 @@ if (SDL2_FOUND)
   set(BUILTIN_OUTPUT_SOURCES
       plugins/output_sdl2/output_sdl2.cpp
       plugins/output_sdl2/file_browser.cpp
+      plugins/output_sdl2/retro_style.cpp
       plugins/output_sdl2_audio/output_sdl2_audio.c
       third_party/imgui/imgui.cpp
       third_party/imgui/imgui_draw.cpp

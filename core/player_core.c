@@ -13,7 +13,16 @@
 #if defined(_WIN32)
   #include <windows.h>
   static void sleep_ms(int ms) { Sleep((DWORD)ms); }
-  static int64_t now_ms(void) { return (int64_t)GetTickCount64(); }
+  /* Not GetTickCount64: that only advances every ~15.6 ms (the system
+   * tick), almost a whole frame at 60 fps, which made frame timing judder
+   * on Windows. The performance counter is precise to well under 1 us. */
+  static int64_t now_ms(void) {
+      static LARGE_INTEGER freq;
+      LARGE_INTEGER t;
+      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+      QueryPerformanceCounter(&t);
+      return (int64_t)(t.QuadPart / freq.QuadPart * 1000 + (t.QuadPart % freq.QuadPart) * 1000 / freq.QuadPart);
+  }
 #else
   #include <unistd.h>
   #include <time.h>

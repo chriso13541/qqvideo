@@ -57,6 +57,8 @@
 
 #define LUMEN_SDL2_DROP_THRESHOLD_MS 100
 #define LUMEN_UI_REDRAW_INTERVAL_MS 16 /* ~60fps cap on actual redraws/presents */
+#define LUMEN_VIDEO_DRIVES_REDRAW_MS 60 /* video frames this recent: they do the redrawing
+                                         * (UI-only redraws resume below ~17 fps, or paused) */
 #define LUMEN_IDLE_WINDOW_W 640
 #define LUMEN_IDLE_WINDOW_H 360
 
@@ -76,7 +78,10 @@ struct lumen_output_ctx {
     int           fullscreen;
     long          frames_rendered;
     long          frames_dropped;
+    long          frames_unseen;   /* uploaded, then replaced before ever being drawn */
+    int           frame_undrawn;   /* the texture holds a frame not drawn yet */
     Uint64        last_ui_redraw_ticks;
+    Uint64        last_video_redraw_ticks; /* last redraw for a new video frame (0 = none yet) */
     int           have_last_redraw;
     lumen_playback_state_t *state; /* bound via bind_state(); NULL until then */
     float         seek_preview_ms; /* local copy while the user is actively dragging the seek bar */
@@ -2262,10 +2267,23 @@ static void draw_subtitles(lumen_output_ctx_t *ctx, const SDL_Rect &v, int win_h
     }
 }
 
-static void maybe_redraw(lumen_output_ctx_t *ctx) {
+/* Redraw the window (UI + current video frame), at most ~60 times a
+ * second. `new_frame`: a video frame was just uploaded -- draw it NOW,
+ * whatever the rate limit says. Otherwise it would wait for the next
+ * UI redraw, and if the following frame got there first it was never
+ * shown at all (a dropped frame). While video frames keep coming, they
+ * drive the redraws and UI-only redraws stand aside: with vsync each
+ * present waits for the display, and two per video frame (UI, then the
+ * frame) were enough to make the frame miss its refresh. */
+static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
     Uint64 now = SDL_GetTicks64();
-    if (ctx->have_last_redraw && (now - ctx->last_ui_redraw_ticks) < LUMEN_UI_REDRAW_INTERVAL_MS) {
-        return;
+    if (new_frame) {
+        ctx->last_video_redraw_ticks = now;
+    } else {
+        if (ctx->have_last_redraw && (now - ctx->last_ui_redraw_ticks) < LUMEN_UI_REDRAW_INTERVAL_MS)
+            return;
+        if (ctx->last_video_redraw_ticks && now - ctx->last_video_redraw_ticks < LUMEN_VIDEO_DRIVES_REDRAW_MS)
+            return;
     }
     ctx->last_ui_redraw_ticks = now;
     ctx->have_last_redraw = 1;
@@ -2428,6 +2446,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
             ctx->applied_scale_smooth = smooth;
         }
         SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
+        ctx->frame_undrawn = 0;
     }
 
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ctx->renderer);
@@ -2516,6 +2535,12 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         free(ctx);
         return -1;
+    }
+    {
+        SDL_RendererInfo ri;
+        if (SDL_GetRendererInfo(ctx->renderer, &ri) == 0)
+            printf("  [sdl2-video] renderer: %s%s\n", ri.name,
+                   (ri.flags & SDL_RENDERER_PRESENTVSYNC) ? ", vsync" : "");
     }
 
     IMGUI_CHECKVERSION();
@@ -2664,6 +2689,8 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
     ctx->have_start = 0;
     ctx->frames_rendered = 0;
     ctx->frames_dropped = 0;
+    ctx->frames_unseen = 0;
+    ctx->frame_undrawn = 0;
     ctx->was_paused = 0;
 
     return 0;
@@ -2768,11 +2795,13 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
          * audio clock goes away (audio track ends, decode starves it). */
         ctx->start_ticks = now - (Uint64)(frame->pts > 0 ? frame->pts : 0);
         ctx->have_frame = 1;
+        if (ctx->frame_undrawn) ctx->frames_unseen++;
+        ctx->frame_undrawn = 1;
         SDL_UpdateYUVTexture(ctx->texture, NULL,
             frame->video.planes[0], frame->video.stride[0],
             frame->video.planes[1], frame->video.stride[1],
             frame->video.planes[2], frame->video.stride[2]);
-        maybe_redraw(ctx);
+        maybe_redraw(ctx, true);
         ctx->frames_rendered++;
         return 0;
     }
@@ -2790,20 +2819,23 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
     }
 
     ctx->have_frame = 1;
+    if (ctx->frame_undrawn) ctx->frames_unseen++;
+    ctx->frame_undrawn = 1;
     SDL_UpdateYUVTexture(ctx->texture, NULL,
         frame->video.planes[0], frame->video.stride[0],
         frame->video.planes[1], frame->video.stride[1],
         frame->video.planes[2], frame->video.stride[2]);
 
-    maybe_redraw(ctx);
+    maybe_redraw(ctx, true);
     ctx->frames_rendered++;
     return 0;
 }
 
 static void sdl2_close(lumen_output_ctx_t *ctx) {
     if (!ctx) return;
-    printf("  [sdl2-video] closed -- %ld frames rendered, %ld dropped (too stale to bother)\n",
-           ctx->frames_rendered, ctx->frames_dropped);
+    printf("  [sdl2-video] closed -- %ld frames rendered, %ld dropped (too stale to bother), "
+           "%ld replaced before reaching the screen\n",
+           ctx->frames_rendered, ctx->frames_dropped, ctx->frames_unseen);
     /* Join the dialog thread if it's still running -- must happen before
      * we free ctx, because the thread holds a pointer to ctx. */
     if (ctx->dialog_thread) {

@@ -128,6 +128,15 @@ selected one's packets are decoded, the others' are dropped unread.
 Supported audio: AAC, MP3, Opus, Vorbis, FLAC, AC-3, E-AC-3, DTS (incl.
 DTS-HD MA), Dolby TrueHD, ALAC and PCM.
 
+**On-screen notices.** Pausing, playing, seeking with the arrow keys
+(presses in a row add up: "+30s"), volume and mute changes, aspect ratio
+and crop changes and snapshots show a short white notice in the
+top-left corner of the picture that fades in and out, like a TV's.
+
+**Volume.** 100% plays 30% louder than the file itself (about +2.3 dB) and
+the rest of the scale follows (50% = 0.65x). Peaks that the boost would
+push past full scale are rounded off smoothly instead of clipping.
+
 **Video menu** (between Audio and Subtitles), with VLC's choices and keys:
 *Aspect Ratio* sets the shape of the whole picture (Default, 16:9, 4:3,
 1:1, 16:10, 2.21:1, 2.35:1, 2.39:1, 5:4; `A` cycles), for video encoded

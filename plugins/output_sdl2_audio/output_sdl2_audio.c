@@ -18,6 +18,7 @@
 #include "../../include/lumen_plugin.h"
 #include <SDL2/SDL.h>
 #include <stdlib.h>
+#include <math.h>   /* tanhf, lrintf: the volume limiter */
 #include <stdio.h>
 #include <string.h>
 
@@ -147,21 +148,42 @@ static int sdl2_audio_pump_ui(lumen_output_ctx_t *ctx, lumen_playback_state_t *s
     return 0;
 }
 
+/* The volume slider's 100% plays this much louder than the file itself
+ * (about +2.3 dB), and every other setting scales with it: 50% = 0.65x.
+ * Many files are mastered quietly, and 100% being merely "as recorded"
+ * was too quiet next to other players. */
+#define LUMEN_VOLUME_GAIN 1.3f
+
+/* Above full scale a boosted sample would clip (harsh distortion on loud
+ * peaks). Instead, samples beyond 80% of full scale are squeezed smoothly
+ * into the room that's left: identical below the knee, and the output can
+ * approach but never pass full scale. */
+#define LIMIT_KNEE 26214.0f            /* 0.8 * 32767 */
+static int16_t soft_limit(float x) {
+    float a = x < 0 ? -x : x;
+    if (a > LIMIT_KNEE) {
+        const float room = 32767.0f - LIMIT_KNEE;
+        a = LIMIT_KNEE + room * tanhf((a - LIMIT_KNEE) / room);
+        x = x < 0 ? -a : a;
+    }
+    return (int16_t)lrintf(x);
+}
+
 static int sdl2_audio_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
     if (!ctx->device || !frame->audio.data || frame->audio.size == 0) return 0;
     /* Muted = queue silence rather than dropping frames: the audio clock
      * keeps running (video is timed against it), and unmuting is instant. */
     float volume = ctx->state ? (ctx->state->muted ? 0.0f : ctx->state->volume) : 1.0f;
-    if (volume >= 0.999f) {
+    const float gain = volume * LUMEN_VOLUME_GAIN;
+    if (gain > 0.999f && gain < 1.001f) {
         SDL_QueueAudio(ctx->device, frame->audio.data, (Uint32)frame->audio.size);
     } else {
         size_t n_samples = frame->audio.size / sizeof(int16_t);
         int16_t *scaled = (int16_t *)malloc(frame->audio.size);
         if (!scaled) return 0;
         const int16_t *src = (const int16_t *)frame->audio.data;
-        for (size_t i = 0; i < n_samples; i++) {
-            scaled[i] = (int16_t)((float)src[i] * volume);
-        }
+        for (size_t i = 0; i < n_samples; i++)
+            scaled[i] = soft_limit((float)src[i] * gain);
         SDL_QueueAudio(ctx->device, scaled, (Uint32)frame->audio.size);
         free(scaled);
     }

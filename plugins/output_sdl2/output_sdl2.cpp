@@ -52,7 +52,7 @@
 #include "stb_image.h"
 #include "qqvideo_icon.h"
 #include <stdlib.h>
-#include <stdarg.h>   /* show_toast */
+#include <stdarg.h>   /* osd_show */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>   /* lroundf: volume steps */
@@ -164,13 +164,22 @@ struct lumen_output_ctx {
     int             pkg_disabled_count;
 
     /* Video menu: aspect ratio / crop (indexes into k_aspects / k_crops,
-     * 0 = Default; reset for each new video, like VLC), snapshots, and a
-     * short notice in the corner ("Aspect ratio: 16:9", "Snapshot saved") */
+     * 0 = Default; reset for each new video, like VLC), and snapshots */
     int             aspect_idx;
     int             crop_idx;
     int             snapshot_requested;
-    char            toast[1300];
-    Uint64          toast_until;
+
+    /* On-screen notice, TV style: "Pause", "+10s", "Volume 60%", ... in
+     * the top-left corner of the picture, fading in and out. */
+    char            osd[1300];
+    int             osd_icon;          /* OSD_ICON_* drawn before the text */
+    Uint64          osd_start;         /* when it (re)appeared */
+    int             osd_ms;            /* how long it stays, fades included */
+    int             osd_seek_s;        /* arrow-key seeks add up while "+20s" is up */
+    Uint64          osd_seek_until;
+    int             osd_seen_paused;   /* last state seen, to notice changes from any */
+    int             osd_seen_vol;      /* source (keys, buttons, slider, wheel); -1 = */
+    int             osd_seen_muted;    /* nothing seen yet */
 };
 
 /* ---- Video > Aspect Ratio / Crop ---------------------------------------
@@ -215,29 +224,43 @@ static void video_geometry(const lumen_output_ctx_t *ctx, SDL_Rect *src, double 
     *aspect = cr;
 }
 
-/* A notice in the top-left corner for a few seconds. */
-static void show_toast(lumen_output_ctx_t *ctx, int ms, const char *fmt, ...) {
+/* ---- on-screen notices (OSD) --------------------------------------------- */
+enum { OSD_ICON_NONE, OSD_ICON_PLAY, OSD_ICON_PAUSE };
+#define OSD_FADE_IN_MS  120
+#define OSD_FADE_OUT_MS 450
+
+/* Show a notice for `ms` (fades included). If one is already fully up, the
+ * new text replaces it without fading in again -- holding an arrow key or
+ * dragging the volume slider doesn't make it flicker. */
+static void osd_show_icon(lumen_output_ctx_t *ctx, int ms, int icon, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(ctx->toast, sizeof(ctx->toast), fmt, ap);
+    vsnprintf(ctx->osd, sizeof(ctx->osd), fmt, ap);
     va_end(ap);
-    ctx->toast_until = SDL_GetTicks64() + (Uint64)ms;
+    const Uint64 now = SDL_GetTicks64();
+    const bool up = ctx->osd_start && now < ctx->osd_start + (Uint64)ctx->osd_ms - OSD_FADE_OUT_MS &&
+                    now >= ctx->osd_start + OSD_FADE_IN_MS;
+    ctx->osd_start = up ? now - OSD_FADE_IN_MS : now;
+    ctx->osd_ms = ms + (up ? OSD_FADE_IN_MS : 0);
+    ctx->osd_icon = icon;
 }
+#define osd_show(ctx, ms, ...) osd_show_icon((ctx), (ms), OSD_ICON_NONE, __VA_ARGS__)
+static void osd_seek(lumen_output_ctx_t *ctx, int step_s);   /* below, with the drawing */
 
 static void set_aspect(lumen_output_ctx_t *ctx, int idx) {
     ctx->aspect_idx = ((idx % LUMEN_N_ASPECTS) + LUMEN_N_ASPECTS) % LUMEN_N_ASPECTS;
-    show_toast(ctx, 2000, "Aspect ratio: %s", k_aspects[ctx->aspect_idx].label);
+    osd_show(ctx, 2000, "Aspect ratio: %s", k_aspects[ctx->aspect_idx].label);
 }
 
 static void set_crop(lumen_output_ctx_t *ctx, int idx) {
     ctx->crop_idx = ((idx % LUMEN_N_CROPS) + LUMEN_N_CROPS) % LUMEN_N_CROPS;
-    show_toast(ctx, 2000, "Crop: %s", k_crops[ctx->crop_idx].label);
+    osd_show(ctx, 2000, "Crop: %s", k_crops[ctx->crop_idx].label);
 }
 
 /* Video > Take Snapshot: done at the next redraw, which has the frame. */
 static void request_snapshot(lumen_output_ctx_t *ctx) {
     if (ctx->state && ctx->state->has_file && ctx->have_frame && ctx->texture) ctx->snapshot_requested = 1;
-    else show_toast(ctx, 2000, "No video to take a snapshot of");
+    else osd_show(ctx, 2000, "No video to take a snapshot of");
 }
 
 /* Background thread for any file-picker dialog (Add to Queue or Open File).
@@ -801,6 +824,7 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 int64_t base = st->seek_requested ? st->seek_target_ms : st->position_ms;
                 int64_t step = (int64_t)(st->pref_seek_step_s > 0 ? st->pref_seek_step_s : 10) * 1000;
                 int64_t target = base + (fwd ? step : -step);
+                osd_seek(ctx, (int)(fwd ? step : -step) / 1000);        /* "+10s" in the corner */
                 if (target < 0) target = 0;
                 if (st->duration_ms > 0 && target > st->duration_ms) target = st->duration_ms;
                 st->seek_target_ms = target;
@@ -2404,7 +2428,7 @@ static void take_snapshot(lumen_output_ctx_t *ctx) {
         if (mw > 0 && out_w > mw) { out_h = (int)((long long)out_h * mw / out_w); out_w = mw; }
         if (mh > 0 && out_h > mh) { out_w = (int)((long long)out_w * mh / out_h); out_h = mh; }
     }
-    if (out_w < 2 || out_h < 2) { show_toast(ctx, 4000, "Couldn't take a snapshot (no picture)"); return; }
+    if (out_w < 2 || out_h < 2) { osd_show(ctx, 4000, "Couldn't take a snapshot (no picture)"); return; }
 
     unsigned char *rgb = (unsigned char *)malloc((size_t)out_w * out_h * 3);
     SDL_Texture *tgt = rgb ? SDL_CreateTexture(ctx->renderer, SDL_PIXELFORMAT_ARGB8888,
@@ -2418,41 +2442,106 @@ static void take_snapshot(lumen_output_ctx_t *ctx) {
         SDL_SetRenderTarget(ctx->renderer, NULL);
     }
     if (!ok) {
-        show_toast(ctx, 4000, "Couldn't take a snapshot (%s)", SDL_GetError());
+        osd_show(ctx, 4000, "Couldn't take a snapshot (%s)", SDL_GetError());
         free(rgb);
     } else {
         char err[256];
         if (lumen_snapshot_save(rgb, out_w, out_h, err, sizeof(err)) != 0)   /* takes rgb */
-            show_toast(ctx, 4000, "Couldn't save the snapshot: %s", err);
+            osd_show(ctx, 4000, "Couldn't save the snapshot: %s", err);
         else
-            show_toast(ctx, 10000, "Saving snapshot...");
+            osd_show(ctx, 10000, "Saving snapshot...");   /* replaced by the result */
     }
     if (tgt) SDL_DestroyTexture(tgt);
 }
 
-/* The corner notice: aspect ratio / crop changes, snapshots. */
-static void draw_toast(lumen_output_ctx_t *ctx, float top) {
+/* Notice what changed since the last frame, whoever changed it: the
+ * keyboard, the control bar, a click on the picture, the mouse wheel. */
+static void osd_watch(lumen_output_ctx_t *ctx) {
+    lumen_playback_state_t *st = ctx->state;
     int ok;
-    char msg[sizeof(ctx->toast) - 64];
+    char msg[sizeof(ctx->osd) - 64];
     if (lumen_snapshot_poll(&ok, msg, sizeof(msg))) {
-        if (ok) show_toast(ctx, 4000, "Snapshot saved: %s", msg);
-        else    show_toast(ctx, 6000, "Couldn't save the snapshot: %s", msg);
+        if (ok) osd_show(ctx, 4000, "Snapshot saved\n%s", msg);
+        else    osd_show(ctx, 6000, "Couldn't save the snapshot\n%s", msg);
     }
-    if (!ctx->toast[0] || SDL_GetTicks64() >= ctx->toast_until) return;
+    if (!st || !st->has_file) {             /* idle: start afresh with the next file */
+        ctx->osd_seen_paused = ctx->osd_seen_vol = ctx->osd_seen_muted = -1;
+        return;
+    }
+    const int vol = (int)lroundf(st->volume * 100.0f);
+    if (ctx->osd_seen_paused >= 0 && st->paused != ctx->osd_seen_paused)
+        osd_show_icon(ctx, 1300, st->paused ? OSD_ICON_PAUSE : OSD_ICON_PLAY, st->paused ? "Pause" : "Play");
+    else if (ctx->osd_seen_muted >= 0 && st->muted != ctx->osd_seen_muted)
+        osd_show(ctx, 1300, st->muted ? "Muted" : "Volume %d%%", vol);
+    else if (ctx->osd_seen_vol >= 0 && vol != ctx->osd_seen_vol)
+        osd_show(ctx, 1300, "Volume %d%%", vol);
+    ctx->osd_seen_paused = st->paused;
+    ctx->osd_seen_muted = st->muted;
+    ctx->osd_seen_vol = vol;
+}
+
+/* Arrow keys: "+10s" / "-10s". Presses in quick succession add up
+ * ("+30s"), like the seek target itself does. */
+static void osd_seek(lumen_output_ctx_t *ctx, int step_s) {
+    const Uint64 now = SDL_GetTicks64();
+    ctx->osd_seek_s = now < ctx->osd_seek_until ? ctx->osd_seek_s + step_s : step_s;
+    ctx->osd_seek_until = now + 1300;
+    const int a = ctx->osd_seek_s < 0 ? -ctx->osd_seek_s : ctx->osd_seek_s;
+    const char sign = ctx->osd_seek_s < 0 ? '-' : '+';
+    if (a >= 60) osd_show(ctx, 1300, "%c%d:%02d", sign, a / 60, a % 60);
+    else         osd_show(ctx, 1300, "%c%ds", sign, a);
+}
+
+/* Draw the notice: white text with a dark outline, no box, in the
+ * top-left corner of the picture area, fading in and out. Drawn on the
+ * background list: over the video, under menus and dialogs. */
+static void osd_draw(lumen_output_ctx_t *ctx, float top) {
+    if (!ctx->osd[0] || !ctx->osd_start) return;
+    const Uint64 now = SDL_GetTicks64();
+    const Uint64 end = ctx->osd_start + (Uint64)ctx->osd_ms;
+    if (now >= end) { ctx->osd[0] = '\0'; return; }
+    const float t = (float)(now - ctx->osd_start), left = (float)(end - now);
+    float alpha = 1.0f;
+    if (t < OSD_FADE_IN_MS)    alpha = t / OSD_FADE_IN_MS;
+    if (left < OSD_FADE_OUT_MS) alpha = left / OSD_FADE_OUT_MS;
+    alpha = alpha * alpha * (3.0f - 2.0f * alpha);          /* smoothstep: gentle ends */
+
     int win_w, win_h;
     SDL_GetWindowSize(ctx->window, &win_w, &win_h);
-    ImGui::SetNextWindowPos(ImVec2(8.0f, floorf(top + 8.0f)), ImGuiCond_Always);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2((float)win_w - 16.0f, FLT_MAX));
-    ImGui::SetNextWindowBgAlpha(1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 5.0f));
-    ImGui::Begin("##qq_toast", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
-                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    ImGui::PushTextWrapPos((float)win_w - 32.0f);
-    ImGui::TextUnformatted(ctx->toast);
-    ImGui::PopTextWrapPos();
-    ImGui::End();
-    ImGui::PopStyleVar();
+    ImFont *font = ctx->sub_font ? ctx->sub_font : ImGui::GetFont();
+    float size = (float)win_h * 0.045f;
+    if (size < 18.0f) size = 18.0f;
+    if (size > 40.0f) size = 40.0f;
+    const bool long_text = strchr(ctx->osd, '\n') != NULL;  /* snapshot path: smaller */
+    if (long_text) size *= 0.7f;
+
+    ImDrawList *dl = ImGui::GetBackgroundDrawList();
+    const float o = size * 0.07f < 1.5f ? 1.5f : size * 0.07f;
+    const ImU32 outline = IM_COL32(0, 0, 0, (int)(200 * alpha)), fill = IM_COL32(255, 255, 255, (int)(255 * alpha));
+    float x = 18.0f, y = floorf(top + size * 0.45f);
+
+    if (ctx->osd_icon != OSD_ICON_NONE) {                   /* drawn, so it's crisp at any size */
+        const float h = size * 0.72f, ty = y + (size - h) * 0.55f;
+        auto shape = [&](float dx, float dy, ImU32 c) {
+            if (ctx->osd_icon == OSD_ICON_PAUSE) {
+                const float bw = h * 0.34f;
+                dl->AddRectFilled(ImVec2(x + dx, ty + dy), ImVec2(x + dx + bw, ty + dy + h), c);
+                dl->AddRectFilled(ImVec2(x + dx + h - bw, ty + dy), ImVec2(x + dx + h, ty + dy + h), c);
+            } else {
+                dl->AddTriangleFilled(ImVec2(x + dx, ty + dy), ImVec2(x + dx + h * 0.9f, ty + dy + h * 0.5f),
+                                      ImVec2(x + dx, ty + dy + h), c);
+            }
+        };
+        static const float dirs[8][2] = {{-1,-1},{0,-1},{1,-1},{-1,0},{1,0},{-1,1},{0,1},{1,1}};
+        for (int d = 0; d < 8; d++) shape(dirs[d][0] * o, dirs[d][1] * o, outline);
+        shape(0, 0, fill);
+        x += h + size * 0.35f;
+    }
+    const float wrap = (float)win_w - x - 18.0f;
+    static const float dirs[8][2] = {{-1,-1},{0,-1},{1,-1},{-1,0},{1,0},{-1,1},{0,1},{1,1}};
+    for (int d = 0; d < 8; d++)
+        dl->AddText(font, size, ImVec2(x + dirs[d][0] * o, y + dirs[d][1] * o), outline, ctx->osd, NULL, wrap);
+    dl->AddText(font, size, ImVec2(x, y), fill, ctx->osd, NULL, wrap);
 }
 
 /* Redraw the window (UI + current video frame), at most ~60 times a
@@ -2523,7 +2612,8 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
     /* "Resume from 12:34?" banner, under the menu bar (or at the very top
      * in fullscreen, where the menu bar is hidden). */
     draw_resume_banner(ctx, show_menu ? menu_h : 0.0f);
-    draw_toast(ctx, show_menu ? menu_h : 0.0f);         /* "Crop: 16:9", "Snapshot saved" */
+    osd_watch(ctx);                                     /* "Pause", "Volume 60%", ... */
+    osd_draw(ctx, show_menu ? menu_h : 0.0f);
 
     /* Built-in file browser (modal over everything else). */
     if (lumen_fb_is_open(ctx->fb)) {
@@ -2671,6 +2761,7 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
 
     lumen_output_ctx_t *ctx = (lumen_output_ctx_t *)calloc(1, sizeof(*ctx));
     ctx->last_queue_pos = -2;
+    ctx->osd_seen_paused = ctx->osd_seen_vol = ctx->osd_seen_muted = -1;   /* nothing seen yet */
     ctx->last_mouse_move_ticks = SDL_GetTicks64();
     ctx->controls_visible = 1;
     ctx->pkg_window = NULL;

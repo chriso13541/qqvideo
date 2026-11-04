@@ -695,6 +695,13 @@ static void vq_pop(engine_t *e, qitem_t *out) {
     e->vq_count--;
     e->vq_bytes -= video_bytes(&out->frame);
 }
+/* Is a frame from the current position (not from before a seek) queued?
+ * Call with the lock held. Frames are queued in order, so the newest one
+ * decides. */
+static int vq_has_fresh(const engine_t *e) {
+    return e->vq_count > 0 && e->vq[(e->vq_head + e->vq_count - 1) % VQ_SLOTS].serial == e->serial;
+}
+
 static void aq_pop(engine_t *e, qitem_t *out) {
     *out = e->aq[e->aq_head];
     e->aq_head = (e->aq_head + 1) % AQ_CAP;
@@ -1473,6 +1480,17 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             state->video_fps = table.streams[i].frame_rate;
     int64_t wall_anchor = 0;      /* wall-clock pacing: frame pts p is due at wall_anchor + p */
     int wall_anchor_valid = 0;
+    /* Settling: after starting or seeking, hold the audio until the first
+     * video frame from the new position is decoded. Audio decodes far
+     * faster, so starting it at once left the video behind before it had
+     * shown a frame -- by however long a precise seek spent decoding from
+     * the keyframe -- and the catch-up logic then skipped B-frames: half
+     * the frame rate for a few seconds after every seek. Starting both
+     * together avoids that. Paused, the first frame is shown as soon as
+     * it's ready (a paused seek used to keep showing the old picture). */
+    int settling = 1, settled_paused_frame = 0;
+    int64_t settle_since = now_ms();
+#define SETTLE_MAX_MS 3000          /* video that never comes (broken stream): go anyway */
 
     int64_t resume_next_save = now_ms() + 30000;
 
@@ -1541,6 +1559,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 e->seek_target = state->position_ms;
                 e->seek_flags = LUMEN_SEEK_BACKWARD;
                 e->seek_precise = 1;
+                e->clk_valid = e->clk_running = 0;
                 e->serial++;
                 e->eof = 0;
                 queues_clear(e);
@@ -1549,6 +1568,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 state->seek_generation++;
                 wall_anchor_valid = 0;
                 buffering = state->pref_buffer_enabled;
+                settling = 1; settle_since = now_ms(); settled_paused_frame = 0;
                 cur_audio_track = t;
                 printf("lumen: audio track -> %d: %s\n", t, state->audio_tracks[t].label);
                 continue;
@@ -1564,6 +1584,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             e->seek_target = state->seek_target_ms;
             e->seek_flags = state->seek_flags;
             e->seek_precise = state->precise_seek;
+            e->clk_valid = e->clk_running = 0;   /* the old position's clock means nothing now: */
+                                                 /* used for lag decisions it threw frames away */
             e->serial++;
             e->eof = 0;
             queues_clear(e);
@@ -1575,12 +1597,38 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             state->seek_flags = LUMEN_SEEK_BACKWARD;   /* back to the default for the next seek */
             wall_anchor_valid = 0;
             buffering = state->pref_buffer_enabled;    /* refill from the new position */
+            settling = 1;                              /* audio waits for the first frame */
+            settle_since = now_ms();
+            settled_paused_frame = 0;
             continue;
         }
 
         if (state->paused) {
             was_paused = 1;
-            sleep_ms(10);
+            /* Seeked while paused: show the frame at the new position as
+             * soon as it's decoded, and stay paused. */
+            if (settling && vout && !settled_paused_frame) {
+                qitem_t it;
+                int got = 0;
+                pthread_mutex_lock(&e->lock);
+                while (e->vq_count > 0) {
+                    vq_pop(e, &it);
+                    if (it.serial == e->serial) { got = 1; break; }
+                    pthread_mutex_unlock(&e->lock);
+                    it.dec->frame_free(&it.frame);        /* from before the seek */
+                    pthread_mutex_lock(&e->lock);
+                }
+                pthread_cond_signal(&e->cond);
+                pthread_mutex_unlock(&e->lock);
+                if (got) {
+                    state->position_ms = it.frame.pts;
+                    state->video_sync_external = 1;       /* show it now */
+                    if (vout->present(session->vout_ctx, &it.frame) != 0) stop_requested = 1;
+                    it.dec->frame_free(&it.frame);
+                    settled_paused_frame = 1;
+                }
+            }
+            sleep_ms(settled_paused_frame || !settling ? 10 : 2);
             continue;
         }
         if (was_paused) { was_paused = 0; wall_anchor_valid = 0; }
@@ -1631,6 +1679,19 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         }
         state->buffering = 0;
         (void)vq_n;
+
+        if (settling) {
+            pthread_mutex_lock(&e->lock);
+            const int ready = !e->has_video || !vout || vq_has_fresh(e) || settled_paused_frame ||
+                              (e->eof && e->dec_serial == e->serial);
+            pthread_mutex_unlock(&e->lock);
+            if (!ready && now_ms() - settle_since < SETTLE_MAX_MS) {
+                sleep_ms(2);              /* the decode thread is getting there; UI keeps pumping */
+                continue;
+            }
+            settling = 0;
+            wall_anchor_valid = 0;        /* the clocks start from here */
+        }
 
         int64_t aclk;
         int abuf;

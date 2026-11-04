@@ -224,6 +224,12 @@ CMake toolchain file (see the comment at its top).
   work). Tools > Preferences > General > "Bluecurve window frame" switches
   back to the standard Windows frame. Linux keeps your window manager's frame
   unless you turn the option on.
+- **Old icon still showing in Explorer?** Explorer caches icons and often
+  keeps showing an `.exe`'s previous one after it's rebuilt. Run
+  `ie4uinit.exe -show` (Windows 10/11; `ie4uinit.exe -ClearIconCache` on
+  older versions), or copy the `.exe` to a new folder, to see the current
+  icon. Check the build itself in the file's Properties dialog, which reads
+  the `.exe` directly.
 - **Known gap:** some Windows code paths still use the "ANSI" file APIs,
   so paths with characters outside the system code page (e.g. a
   Japanese folder name on an English Windows) can fail. The file

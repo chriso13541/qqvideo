@@ -30,6 +30,8 @@
 #include <SDL2/SDL.h>
 #if defined(_WIN32)
 #include <SDL2/SDL_syswm.h>   /* HWND, for rounding the window's corners (SetWindowRgn) */
+#else
+#include <dlfcn.h>            /* libX11 at runtime: the pointer position while dragging */
 #endif
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
@@ -96,6 +98,12 @@ struct lumen_output_ctx {
     SDL_Rect      wm_max_rect;
     int           wm_drag_x0, wm_drag_x1; /* draggable part of the title bar (hit test) */
     int           wm_shape_mode, wm_shape_w, wm_shape_h;   /* corner region applied (Windows) */
+    /* dragging the title bar of a maximized window: restore, then keep dragging */
+    int           wm_press;              /* left button went down on the maximized title */
+    float         wm_press_x, wm_press_y;/* ... where (window coords) */
+    int           wm_handoff;            /* Windows: frames until the OS takes over the drag */
+    int           wm_manual_drag;        /* elsewhere: we move the window until release */
+    int           wm_drag_off_x, wm_drag_off_y; /* cursor's offset in the window while dragging */
     Uint64        resume_last_tick;      /* banner countdown: time of the previous frame ... */
     Uint64        resume_elapsed_ms;     /* ... and playing (unpaused) time it's been shown */
     int           controls_visible;      /* 1 = draw chrome/cursor; 0 = hidden (fullscreen idle) */
@@ -291,6 +299,124 @@ static void wm_set_maximized(lumen_output_ctx_t *ctx, int on) {
     }
 }
 
+#if defined(_WIN32)
+static HWND wm_hwnd(lumen_output_ctx_t *ctx) {
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(ctx->window, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return NULL;
+    return info.info.win.window;
+}
+#endif
+
+#if !defined(_WIN32)
+/* Where the pointer is on screen, for dragging the window ourselves (only
+ * needed off Windows, where the system takes the drag over). SDL's
+ * SDL_GetGlobalMouseState is cached on X11 and goes stale while a button
+ * is held, and window-relative pointer events lag behind our own window
+ * moves, so ask the X server directly. libX11 is loaded at runtime (SDL
+ * has it loaded already), which keeps X11 headers out of the build.
+ * Wayland can't tell an app where the pointer is: returns 0 there. */
+static int wm_pointer_on_screen(int *x, int *y) {
+    typedef void *(*open_fn)(const char *);
+    typedef unsigned long (*root_fn)(void *);
+    typedef int (*query_fn)(void *, unsigned long, unsigned long *, unsigned long *,
+                            int *, int *, int *, int *, unsigned int *);
+    static int tried = 0;
+    static void *dpy = NULL;
+    static root_fn root_of = NULL;
+    static query_fn query = NULL;
+    if (!tried) {
+        tried = 1;
+        const char *drv = SDL_GetCurrentVideoDriver();
+        void *lib = (drv && strcmp(drv, "x11") == 0) ? dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL) : NULL;
+        if (lib) {
+            open_fn xopen = (open_fn)dlsym(lib, "XOpenDisplay");
+            root_of = (root_fn)dlsym(lib, "XDefaultRootWindow");
+            query = (query_fn)dlsym(lib, "XQueryPointer");
+            if (xopen && root_of && query) dpy = xopen(NULL);   /* our own connection, kept open */
+        }
+    }
+    if (!dpy) return 0;
+    unsigned long root_ret, child;
+    int rx, ry, wx, wy;
+    unsigned int mask;
+    if (!query(dpy, root_of(dpy), &root_ret, &child, &rx, &ry, &wx, &wy, &mask)) return 0;
+    *x = rx;
+    *y = ry;
+    return 1;
+}
+#endif
+
+/* The title bar of a maximized window was dragged (press at px,py in a
+ * title bar max_w wide): restore the window's old size under the cursor,
+ * keeping the cursor at the same relative spot along the title, and keep
+ * dragging -- what Windows does with its own maximized windows. */
+static void wm_drag_out_of_maximized(lumen_output_ctx_t *ctx, float px, float py, float max_w) {
+    const int rw = ctx->wm_restore.w, rh = ctx->wm_restore.h;
+    if (rw <= 0 || rh <= 0) return;
+    int gx = 0, gy = 0;
+    SDL_GetGlobalMouseState(&gx, &gy);
+    int off = max_w > 0 ? (int)(px / max_w * (float)rw) : rw / 2;
+    if (rw > 140) {                  /* stay on the draggable part of the title */
+        if (off < 40) off = 40;
+        if (off > rw - 90) off = rw - 90;
+    }
+    int offy = (int)py;
+    if (offy < 2) offy = 2;
+    if (offy > (int)QQ_WM_TITLE_H - 2) offy = (int)QQ_WM_TITLE_H - 2;
+
+    ctx->wm_maximized = 0;
+    SDL_SetWindowSize(ctx->window, rw, rh);
+    SDL_SetWindowPosition(ctx->window, gx - off, gy - offy);
+    ctx->wm_drag_off_x = off;
+    ctx->wm_drag_off_y = offy;
+#if defined(_WIN32)
+    /* Hand the drag to Windows once a frame at the restored size is on
+     * screen (see wm_drag_continue): that gives Snap back, too. */
+    ctx->wm_handoff = 2;
+#else
+    ctx->wm_manual_drag = 1;
+#endif
+}
+
+/* Once per frame: continue a drag started by wm_drag_out_of_maximized. */
+static void wm_drag_continue(lumen_output_ctx_t *ctx) {
+#if defined(_WIN32)
+    if (ctx->wm_handoff > 0 && --ctx->wm_handoff == 0) {
+        HWND hwnd = wm_hwnd(ctx);
+        if (hwnd && (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000)) {
+            POINT p;
+            GetCursorPos(&p);
+            /* the mouse kept moving while the restored frame was drawn:
+             * put the grab point back under it before the system takes over */
+            SDL_SetWindowPosition(ctx->window, p.x - ctx->wm_drag_off_x, p.y - ctx->wm_drag_off_y);
+            ReleaseCapture();
+            /* SC_MOVE | HTCAPTION: the system's move loop, driven by the
+             * mouse, exactly as if the title bar had been pressed. Returns
+             * when the button is released. */
+            SendMessage(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, MAKELPARAM(p.x, p.y));
+            /* the move loop ate the button release: tell ImGui */
+            SDL_Event up;
+            SDL_zero(up);
+            up.type = SDL_MOUSEBUTTONUP;
+            up.button.windowID = SDL_GetWindowID(ctx->window);
+            up.button.button = SDL_BUTTON_LEFT;
+            up.button.state = SDL_RELEASED;
+            up.button.clicks = 1;
+            SDL_PushEvent(&up);
+        }
+    }
+#else
+    if (ctx->wm_manual_drag) {
+        int gx = 0, gy = 0;
+        if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) || !wm_pointer_on_screen(&gx, &gy))
+            ctx->wm_manual_drag = 0;
+        else
+            SDL_SetWindowPosition(ctx->window, gx - ctx->wm_drag_off_x, gy - ctx->wm_drag_off_y);
+    }
+#endif
+}
+
 /* Windows: cut the window's corners to Bluecurve's rounded shape (the
  * same pixel curve the outline follows). Square when maximized or
  * fullscreen, and with the system frame. */
@@ -300,10 +426,8 @@ static void wm_update_shape(lumen_output_ctx_t *ctx) {
     int w = 0, h = 0;
     SDL_GetWindowSize(ctx->window, &w, &h);
     if (mode == ctx->wm_shape_mode && (!mode || (w == ctx->wm_shape_w && h == ctx->wm_shape_h))) return;
-    SDL_SysWMinfo info;
-    SDL_VERSION(&info.version);
-    if (!SDL_GetWindowWMInfo(ctx->window, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
-    HWND hwnd = info.info.win.window;
+    HWND hwnd = wm_hwnd(ctx);
+    if (!hwnd) return;
     if (mode && w > 16 && h > 16) {
         HRGN rgn = CreateRectRgn(0, 5, w, h - 5);
         for (int k = 0; k < 5; k++) {
@@ -353,8 +477,8 @@ static SDL_HitTestResult SDLCALL wm_hit_test(SDL_Window *win, const SDL_Point *p
         if (r) return SDL_HITTEST_RESIZE_RIGHT;
         /* Title bar (not its buttons): the OS moves the window, and its
          * double-click maximizes (caught as SDL_WINDOWEVENT_MAXIMIZED).
-         * Maximized windows don't move: the title bar is then ours, and a
-         * double-click on it restores (draw_wm_titlebar). */
+         * When maximized the title bar is ours instead: draw_wm_titlebar
+         * restores on a double-click, or on a drag and then keeps dragging. */
         if (pt->y < (int)QQ_WM_TITLE_H && pt->x >= ctx->wm_drag_x0 && pt->x < ctx->wm_drag_x1)
             return SDL_HITTEST_DRAGGABLE;
     }
@@ -439,10 +563,31 @@ static float draw_wm_titlebar(lumen_output_ctx_t *ctx) {
             ImGui::PopStyleColor();
         }
 
-        /* maximized: the bar is ours (not draggable), so catch its double-click */
-        if (ctx->wm_maximized && ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered() &&
-            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-            wm_set_maximized(ctx, 0);
+        /* maximized: the bar is ours (the OS isn't told it's draggable, or
+         * it would just slide the full-size window around), so catch its
+         * double-click (restore) and drag (restore + keep dragging) here */
+        if (ctx->wm_maximized) {
+            const ImVec2 mp = ImGui::GetIO().MousePos;
+            const float lx = mp.x - vp->Pos.x, ly = mp.y - a.y;
+            const bool on_title = ly >= 0 && ly < H && lx >= ctx->wm_drag_x0 && lx < ctx->wm_drag_x1;
+            if (on_title && ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered()) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    ctx->wm_press = 0;
+                    wm_set_maximized(ctx, 0);
+                } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    ctx->wm_press = 1;
+                    ctx->wm_press_x = lx;
+                    ctx->wm_press_y = ly;
+                }
+            }
+        }
+        if (ctx->wm_press) {
+            if (!ctx->wm_maximized || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) ctx->wm_press = 0;
+            else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f)) {
+                ctx->wm_press = 0;
+                wm_drag_out_of_maximized(ctx, ctx->wm_press_x, ctx->wm_press_y, b.x - a.x);
+            }
+        }
 
         ImGui::PopStyleVar(3);
         /* the window menu */
@@ -2139,6 +2284,10 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
         ctx->controls_visible = 1;
         SDL_ShowCursor(SDL_ENABLE);
     }
+
+    /* a drag out of the maximized state (between frames: on Windows this
+     * runs the system's move loop until the button is released) */
+    wm_drag_continue(ctx);
 
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();

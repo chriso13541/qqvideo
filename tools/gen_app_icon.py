@@ -15,7 +15,7 @@ q's together, so the small icons use bigger, plain white letters instead.
 Usage:  python3 tools/gen_app_icon.py [--preview FILE] [--no-write]
 
 Writes:
-    resources/qqvideo.ico                  Windows icon, 16-256 px (PNG entries)
+    resources/qqvideo.ico                  Windows icon, 16-256 px (BMP entries, PNG at 256)
     resources/icons/qqvideo-<N>.png        Linux hicolor icons, 16-256 px
     resources/qqvideo_icon.h               64 px PNG for SDL_SetWindowIcon
 Needs Pillow (pip install pillow).
@@ -183,9 +183,35 @@ def png_bytes(im):
     return b.getvalue()
 
 
+def dib_bytes(im):
+    """A classic 32-bit BMP icon entry: BITMAPINFOHEADER (height doubled
+    for the mask), bottom-up BGRA pixels, then the 1-bit AND mask
+    (1 = transparent), each mask row padded to 32 bits."""
+    w, h = im.size
+    px = im.convert("RGBA").load()
+    hdr = struct.pack("<IiiHHIIiiII", 40, w, h * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    color = bytearray()
+    for y in range(h - 1, -1, -1):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            color += bytes((b, g, r, a))
+    stride = ((w + 31) // 32) * 4
+    mask = bytearray()
+    for y in range(h - 1, -1, -1):
+        row = bytearray(stride)
+        for x in range(w):
+            if px[x, y][3] == 0:
+                row[x // 8] |= 0x80 >> (x % 8)
+        mask += row
+    return hdr + bytes(color) + bytes(mask)
+
+
 def write_ico(path, images):
-    """ICO with a PNG entry per size (Windows Vista and later)."""
-    data = [png_bytes(im) for im in images]
+    """ICO in the layout Microsoft recommends: classic BMP entries up to
+    128 px and PNG only for 256 px. Every Windows icon reader (Explorer's
+    thumbnail cache, shortcuts, the taskbar, older resource tools) handles
+    BMP entries, while PNG ones at small sizes trip some of them up."""
+    data = [png_bytes(im) if im.size[0] >= 256 else dib_bytes(im) for im in images]
     out = io.BytesIO()
     out.write(struct.pack("<HHH", 0, 1, len(images)))
     offset = 6 + 16 * len(images)

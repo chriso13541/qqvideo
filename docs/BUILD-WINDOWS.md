@@ -218,6 +218,12 @@ CMake toolchain file (see the comment at its top).
   DLLs from their own folder, the `.exe`'s folder and the system folders
   (plus PATH's absolute folders as a fallback for dev builds), never from
   the current directory (see `core/plugin_loader.c`).
+- **Window frame:** on Windows qqvideo draws its own Bluecurve Grape title
+  bar and rounded frame instead of the native one (dragging, edge/corner
+  resizing, title double-click and the min/max/close buttons all
+  work). Tools > Preferences > General > "Bluecurve window frame" switches
+  back to the standard Windows frame. Linux keeps your window manager's frame
+  unless you turn the option on.
 - **Known gap:** some Windows code paths still use the "ANSI" file APIs,
   so paths with characters outside the system code page (e.g. a
   Japanese folder name on an English Windows) can fail. The file

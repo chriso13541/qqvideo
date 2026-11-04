@@ -28,6 +28,9 @@
  */
 #include "../../include/lumen_plugin.h"
 #include <SDL2/SDL.h>
+#if defined(_WIN32)
+#include <SDL2/SDL_syswm.h>   /* HWND, for rounding the window's corners (SetWindowRgn) */
+#endif
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
@@ -36,6 +39,7 @@
 #include "lumen_icons.h" /* Remix Icon subset + ICON_* macros (third_party/remixicon/) */
 #include "file_browser.h" /* built-in file picker (no zenity/kdialog needed) */
 #include "retro_style.h"  /* classic 3D-bevel look (with the patched ImGui) */
+#include "imgui_internal.h"  /* BeginViewportSideBar, RenderTextEllipsis: the title bar */
 
 /* App icon embedded as a PNG byte array -- used for SDL_SetWindowIcon
  * (the title-bar icon). The .ico file + Windows .rc handles the taskbar. */
@@ -83,6 +87,15 @@ struct lumen_output_ctx {
     Uint64        pause_started_ticks;
     Uint64        last_mouse_move_ticks; /* for fullscreen auto-hide (3s timeout) */
     int           resume_serial_seen;    /* last resume offer the banner started a timer for */
+
+    /* ---- qqvideo's own window frame: Bluecurve title bar instead of the
+     * system's (Preferences > General; on by default on Windows). ---- */
+    int           wm_frame;              /* window is borderless + our title bar is drawn */
+    int           wm_maximized;          /* "maximized" by us, to the screen's usable area */
+    SDL_Rect      wm_restore;            /* ... and the window rect to go back to */
+    SDL_Rect      wm_max_rect;
+    int           wm_drag_x0, wm_drag_x1; /* draggable part of the title bar (hit test) */
+    int           wm_shape_mode, wm_shape_w, wm_shape_h;   /* corner region applied (Windows) */
     Uint64        resume_last_tick;      /* banner countdown: time of the previous frame ... */
     Uint64        resume_elapsed_ms;     /* ... and playing (unpaused) time it's been shown */
     int           controls_visible;      /* 1 = draw chrome/cursor; 0 = hidden (fullscreen idle) */
@@ -244,6 +257,217 @@ static void handle_dropped_file(lumen_output_ctx_t *ctx, const char *path) {
     SDL_RaiseWindow(ctx->window);
 }
 
+/* ---- qqvideo's own window frame -------------------------------------------
+ * With Preferences > General > "Bluecurve window frame" on, the main window
+ * is borderless and draws its own Bluecurve Grape title bar: the menu
+ * (chevron) button on the left, the title, then minimize / maximize /
+ * close. Windows still does the moving and resizing (SDL hit-testing
+ * tells it which parts are title bar and edges), so dragging, Aero Snap
+ * and edge resizing behave normally.
+ *
+ * Maximize is done here rather than by Windows: SDL maximizes a borderless
+ * window to the full screen, over the taskbar (WM_GETMINMAXINFO in
+ * SDL_windowsevents.c). So Maximize -- the button, double-clicking the
+ * title, Win+Up, dragging to the top edge -- resizes the window to the
+ * display's usable area instead, and Restore puts the old rect back. */
+static bool wm_frame_visible(const lumen_output_ctx_t *ctx) { return ctx->wm_frame && !ctx->fullscreen; }
+
+static void wm_set_maximized(lumen_output_ctx_t *ctx, int on) {
+    if (on == ctx->wm_maximized) return;
+    if (on) {
+        SDL_GetWindowPosition(ctx->window, &ctx->wm_restore.x, &ctx->wm_restore.y);
+        SDL_GetWindowSize(ctx->window, &ctx->wm_restore.w, &ctx->wm_restore.h);
+        int d = SDL_GetWindowDisplayIndex(ctx->window);
+        SDL_Rect r;
+        if (SDL_GetDisplayUsableBounds(d < 0 ? 0 : d, &r) != 0 || r.w <= 0 || r.h <= 0) return;
+        ctx->wm_max_rect = r;
+        ctx->wm_maximized = 1;
+        SDL_SetWindowPosition(ctx->window, r.x, r.y);
+        SDL_SetWindowSize(ctx->window, r.w, r.h);
+    } else {
+        ctx->wm_maximized = 0;
+        SDL_SetWindowSize(ctx->window, ctx->wm_restore.w, ctx->wm_restore.h);
+        SDL_SetWindowPosition(ctx->window, ctx->wm_restore.x, ctx->wm_restore.y);
+    }
+}
+
+/* Windows: cut the window's corners to Bluecurve's rounded shape (the
+ * same pixel curve the outline follows). Square when maximized or
+ * fullscreen, and with the system frame. */
+static void wm_update_shape(lumen_output_ctx_t *ctx) {
+#if defined(_WIN32)
+    const int mode = (ctx->wm_frame && !ctx->fullscreen && !ctx->wm_maximized) ? 1 : 0;
+    int w = 0, h = 0;
+    SDL_GetWindowSize(ctx->window, &w, &h);
+    if (mode == ctx->wm_shape_mode && (!mode || (w == ctx->wm_shape_w && h == ctx->wm_shape_h))) return;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(ctx->window, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+    HWND hwnd = info.info.win.window;
+    if (mode && w > 16 && h > 16) {
+        HRGN rgn = CreateRectRgn(0, 5, w, h - 5);
+        for (int k = 0; k < 5; k++) {
+            const int in = qq_wm_corner_inset(k);
+            HRGN top = CreateRectRgn(in, k, w - in, k + 1);
+            HRGN bot = CreateRectRgn(in, h - 1 - k, w - in, h - k);
+            CombineRgn(rgn, rgn, top, RGN_OR);
+            CombineRgn(rgn, rgn, bot, RGN_OR);
+            DeleteObject(top);
+            DeleteObject(bot);
+        }
+        SetWindowRgn(hwnd, rgn, TRUE);       /* the system owns rgn from here */
+    } else {
+        SetWindowRgn(hwnd, NULL, TRUE);
+    }
+    ctx->wm_shape_mode = mode;
+    ctx->wm_shape_w = w;
+    ctx->wm_shape_h = h;
+#else
+    (void)ctx;
+#endif
+}
+
+/* Which part of the window is under the mouse, for the OS: the title bar
+ * moves the window, the edges resize it, everything else is ours. */
+static SDL_HitTestResult SDLCALL wm_hit_test(SDL_Window *win, const SDL_Point *pt, void *data) {
+    lumen_output_ctx_t *ctx = (lumen_output_ctx_t *)data;
+    if (!wm_frame_visible(ctx)) return SDL_HITTEST_NORMAL;
+    int w, h;
+    SDL_GetWindowSize(win, &w, &h);
+    if (!ctx->wm_maximized) {
+        const int B = 4, C = 12;              /* edge and corner grab sizes */
+        const bool l = pt->x < B, r = pt->x >= w - B, t = pt->y < B, b = pt->y >= h - B;
+        const bool lc = pt->x < C, rc = pt->x >= w - C, tc = pt->y < C, bc = pt->y >= h - C;
+        /* The rounded corners (SetWindowRgn) cut away the outermost pixels
+         * there, so the bottom corners also grab an 8x8 square, which is
+         * easy to hit diagonally. (Not the top: the title buttons sit there.) */
+        const int K = 8;
+        const bool bsq = pt->y >= h - K, lsq = pt->x < K, rsq = pt->x >= w - K;
+        if ((t && lc) || (l && tc)) return SDL_HITTEST_RESIZE_TOPLEFT;
+        if ((t && rc) || (r && tc)) return SDL_HITTEST_RESIZE_TOPRIGHT;
+        if ((b && lc) || (l && bc) || (bsq && lsq)) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        if ((b && rc) || (r && bc) || (bsq && rsq)) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        if (t) return SDL_HITTEST_RESIZE_TOP;
+        if (b) return SDL_HITTEST_RESIZE_BOTTOM;
+        if (l) return SDL_HITTEST_RESIZE_LEFT;
+        if (r) return SDL_HITTEST_RESIZE_RIGHT;
+        /* Title bar (not its buttons): the OS moves the window, and its
+         * double-click maximizes (caught as SDL_WINDOWEVENT_MAXIMIZED).
+         * Maximized windows don't move: the title bar is then ours, and a
+         * double-click on it restores (draw_wm_titlebar). */
+        if (pt->y < (int)QQ_WM_TITLE_H && pt->x >= ctx->wm_drag_x0 && pt->x < ctx->wm_drag_x1)
+            return SDL_HITTEST_DRAGGABLE;
+    }
+    return SDL_HITTEST_NORMAL;
+}
+
+/* Follow the preference: borderless + our title bar, or the system frame. */
+static void wm_apply_pref(lumen_output_ctx_t *ctx) {
+    const int want = ctx->state && ctx->state->pref_custom_frame;
+    /* SDL ignores border changes on a fullscreen window: wait until it isn't. */
+    if (want != ctx->wm_frame && !ctx->fullscreen) {
+        if (!want && ctx->wm_maximized) wm_set_maximized(ctx, 0);
+        SDL_SetWindowBordered(ctx->window, want ? SDL_FALSE : SDL_TRUE);
+        ctx->wm_frame = want;
+        ctx->min_w = 0;                       /* recompute the minimum size with/without the title bar */
+    }
+    wm_update_shape(ctx);
+}
+
+/* The Bluecurve title bar, as a strip along the top of the window (the
+ * menu bar then stacks below it). Returns its height. */
+static float draw_wm_titlebar(lumen_output_ctx_t *ctx) {
+    const float H = QQ_WM_TITLE_H;
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                               ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
+                               ImGuiWindowFlags_NoScrollWithMouse;
+    if (ImGui::BeginViewportSideBar("##qq_titlebar", vp, ImGuiDir_Up, H, f)) {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 a = ImGui::GetWindowPos();
+        const ImVec2 b(a.x + ImGui::GetWindowWidth(), a.y + H);
+        const bool active = (SDL_GetWindowFlags(ctx->window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+
+        if (ctx->wm_maximized) {   /* square: no outline/rounded corners to sit inside */
+            dl->AddRectFilled(a, ImVec2(b.x, a.y + 6), active ? IM_COL32(0x68, 0x5B, 0x8B, 255) : IM_COL32(0xCF, 0xD4, 0xE2, 255));
+            dl->AddRectFilled(a, ImVec2(b.x, a.y + 1), QQ_BLACK);
+        }
+        QQ_RetroTitleBar(dl, a, b, active);
+
+        const float cy = a.y + 11.0f;                         /* middle of the bar's gradient rows */
+        auto button = [&](const char *id, float cx, qq_wm_glyph g, const char *tip) {
+            ImGui::SetCursorScreenPos(ImVec2(cx - 9, cy - 8));
+            const bool clicked = ImGui::InvisibleButton(id, ImVec2(18, 16));
+            qq_wm_button(dl, ImVec2(cx, cy), g, active, ImGui::IsItemHovered(), ImGui::IsItemActive());
+            if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            return clicked;
+        };
+
+        /* left: the window menu (Bluecurve's chevron) */
+        const float menu_cx = a.x + 4 + 9;
+        if (button("##wm_menu", menu_cx, QQ_WM_MENU, NULL)) ImGui::OpenPopup("##wm_window_menu");
+        /* right: minimize, maximize/restore, close (2px apart, like the theme) */
+        const float close_cx = b.x - 4 - 9, max_cx = close_cx - 20, min_cx = max_cx - 20;
+        if (button("##wm_min", min_cx, QQ_WM_MINIMIZE, "Minimize")) SDL_MinimizeWindow(ctx->window);
+        if (button("##wm_max", max_cx, ctx->wm_maximized ? QQ_WM_RESTORE : QQ_WM_MAXIMIZE,
+                   ctx->wm_maximized ? "Restore" : "Maximize"))
+            wm_set_maximized(ctx, !ctx->wm_maximized);
+        if (button("##wm_close", close_cx, QQ_WM_CLOSE, "Close")) {
+            SDL_Event q; SDL_zero(q); q.type = SDL_QUIT; SDL_PushEvent(&q);
+        }
+
+        /* the draggable stretch, for wm_hit_test */
+        ctx->wm_drag_x0 = (int)(menu_cx + 9 + 2 - vp->Pos.x);
+        ctx->wm_drag_x1 = (int)(min_cx - 9 - 2 - vp->Pos.x);
+
+        /* title: white with a drop shadow when active, gray-green when not */
+        const char *title = ctx->last_title[0] ? ctx->last_title : "qqvideo";
+        const float tx = menu_cx + 9 + 6, tmax = min_cx - 9 - 8;
+        const float ty = cy - ImGui::GetFontSize() * 0.5f;
+        if (tmax > tx + 8) {
+            const ImVec2 sz = ImGui::CalcTextSize(title);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 150));
+                ImGui::RenderTextEllipsis(dl, ImVec2(tx + 1, ty + 1), ImVec2(tmax + 1, b.y), tmax + 1, tmax + 1, title, NULL, &sz);
+                ImGui::PopStyleColor();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, active ? IM_COL32_WHITE : IM_COL32(0x81, 0x8a, 0x7d, 255));
+            ImGui::RenderTextEllipsis(dl, ImVec2(tx, ty), ImVec2(tmax, b.y), tmax, tmax, title, NULL, &sz);
+            ImGui::PopStyleColor();
+        }
+
+        /* maximized: the bar is ours (not draggable), so catch its double-click */
+        if (ctx->wm_maximized && ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered() &&
+            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            wm_set_maximized(ctx, 0);
+
+        ImGui::PopStyleVar(3);
+        /* the window menu */
+        qq_retro_push_menu_colors();
+        if (ImGui::BeginPopup("##wm_window_menu")) {
+            if (ImGui::MenuItem(ctx->wm_maximized ? "Restore" : "Maximize")) wm_set_maximized(ctx, !ctx->wm_maximized);
+            if (ImGui::MenuItem("Minimize")) SDL_MinimizeWindow(ctx->window);
+            if (ImGui::MenuItem("Fullscreen", "F")) toggle_fullscreen(ctx);
+            ImGui::Separator();
+#if defined(_WIN32)
+            const char *close_key = "Alt+F4";
+#else
+            const char *close_key = NULL;
+#endif
+            if (ImGui::MenuItem("Close", close_key)) { SDL_Event q; SDL_zero(q); q.type = SDL_QUIT; SDL_PushEvent(&q); }
+            ImGui::EndPopup();
+        }
+        qq_retro_pop_menu_colors();
+    } else {
+        ImGui::PopStyleVar(3);
+    }
+    ImGui::End();
+    return H;
+}
+
 static int handle_events(lumen_output_ctx_t *ctx) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -295,6 +519,19 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                                      e.window.event == SDL_WINDOWEVENT_CLOSE &&
                                      e.window.windowID == SDL_GetWindowID(ctx->window));
         if (e.type == SDL_QUIT || is_main_window_close) return 1;
+
+        /* Our window frame: Windows' own maximize (title double-click,
+         * Win+Up, Snap to the top edge) would cover the taskbar on a
+         * borderless window -- undo it and maximize to the usable area. */
+        if (e.type == SDL_WINDOWEVENT && !for_pkg && e.window.event == SDL_WINDOWEVENT_MAXIMIZED &&
+            wm_frame_visible(ctx)) {
+            SDL_RestoreWindow(ctx->window);
+            if (!ctx->wm_maximized) wm_set_maximized(ctx, 1);
+            else {
+                SDL_SetWindowPosition(ctx->window, ctx->wm_max_rect.x, ctx->wm_max_rect.y);
+                SDL_SetWindowSize(ctx->window, ctx->wm_max_rect.w, ctx->wm_max_rect.h);
+            }
+        }
         if (e.type == SDL_MOUSEMOTION && !for_pkg) {
             ctx->last_mouse_move_ticks = SDL_GetTicks64();
             if (!ctx->controls_visible) {
@@ -561,6 +798,10 @@ static void prefs_page_general(lumen_output_ctx_t *ctx, lumen_playback_state_t *
     if (ImGui::RadioButton("Add it to the queue", st->pref_instance_enqueue == 1)) { st->pref_instance_enqueue = 1; st->prefs_dirty = 1; }
     ImGui::Unindent(24.0f);
     ImGui::EndDisabled();
+    ImGui::Spacing();
+    pref_check("Bluecurve window frame", &st->pref_custom_frame, st);
+    pref_note("qqvideo draws its own title bar and border, in the Bluecurve Grape style, "
+              "instead of the system's. Off: the normal frame from Windows or your desktop.");
     ImGui::Spacing();
     pref_check("Resize the window to fit each video", &st->pref_resize_window, st);
     pref_note("Off: the window keeps the size you gave it.");
@@ -1401,7 +1642,8 @@ static void compute_min_size(lumen_output_ctx_t *ctx) {
                 + st.ItemSpacing.x * 2;
     float w = st.WindowPadding.x + left + st.ItemSpacing.x + right + st.WindowPadding.x;
     ctx->min_w = (int)(w + 0.5f);
-    ctx->min_h = (int)(ImGui::GetFrameHeight() + LUMEN_CTRL_BAR_H + w * 9.0f / 16.0f + 0.5f);
+    ctx->min_h = (int)((ctx->wm_frame ? QQ_WM_TITLE_H : 0.0f) + ImGui::GetFrameHeight() + LUMEN_CTRL_BAR_H +
+                       w * 9.0f / 16.0f + 0.5f);
     SDL_SetWindowMinimumSize(ctx->window, ctx->min_w, ctx->min_h);
     printf("  [sdl2-video] minimum window size %dx%d\n", ctx->min_w, ctx->min_h);
 }
@@ -1902,7 +2144,10 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    float menu_h = ImGui::GetFrameHeight();
+    wm_apply_pref(ctx);
+    /* our title bar first: the menu bar then stacks below it */
+    const float title_h = wm_frame_visible(ctx) ? draw_wm_titlebar(ctx) : 0.0f;
+    float menu_h = title_h + ImGui::GetFrameHeight();   /* everything above the picture */
     float ctrl_h = 60.0f;
 
     /* In windowed mode, both bars are always visible.
@@ -1995,6 +2240,13 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
                           IM_COL32(52, 120, 230, 255), 1.5f);
     }
 
+    /* our frame's outline, rounded like the window's corners */
+    if (wm_frame_visible(ctx) && !ctx->wm_maximized) {
+        int ww, wh;
+        SDL_GetWindowSize(ctx->window, &ww, &wh);
+        qq_wm_frame_outline(ImGui::GetForegroundDrawList(), ImVec2(0, 0), ImVec2((float)ww, (float)wh));
+    }
+
     qq_retro_decorate_windows();
     ImGui::Render();
 
@@ -2039,6 +2291,13 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
 
 static int sdl2_open(lumen_output_ctx_t **out_ctx) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+#ifdef _WIN32
+    /* For the Bluecurve frame: keep WS_THICKFRAME|WS_MAXIMIZEBOX on the
+     * borderless window. Without them Windows ignores our hit-test answers
+     * for edge resizing and title double-click, and Aero Snap is off. SDL
+     * still reports a zero-size non-client area, so no native frame shows. */
+    SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
+#endif
 
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "lumen: SDL_InitSubSystem(VIDEO) failed: %s\n", SDL_GetError());
@@ -2068,6 +2327,8 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         LUMEN_IDLE_WINDOW_W, LUMEN_IDLE_WINDOW_H,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (ctx->window && SDL_SetWindowHitTest(ctx->window, wm_hit_test, ctx) != 0)
+        fprintf(stderr, "lumen: window hit-testing unavailable (%s) -- the Bluecurve frame can't be dragged\n", SDL_GetError());
     if (!ctx->window) {
         fprintf(stderr, "lumen: SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -2213,6 +2474,7 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
     int skip_resize = ctx->fullscreen
                    || (wflags & SDL_WINDOW_FULLSCREEN)  /* SDL fullscreen (any mode) */
                    || (wflags & SDL_WINDOW_MAXIMIZED)   /* OS title-bar maximize */
+                   || ctx->wm_maximized                 /* our title bar's maximize */
                    || keep_size;
 
     if (!skip_resize) {
@@ -2242,7 +2504,7 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
     } else {
         const char *reason = ctx->fullscreen            ? "SDL fullscreen"      :
                              (wflags & SDL_WINDOW_FULLSCREEN) ? "SDL fullscreen (flags)" :
-                             keep_size ? "resize off in Preferences" : "OS maximized";
+                             keep_size ? "resize off in Preferences" : "maximized";
         printf("  [sdl2-video] loaded stream %dx%d, window kept (%s)\n", width, height, reason);
     }
 

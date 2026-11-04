@@ -150,7 +150,7 @@ if (UNIX)
   target_link_libraries(qqvideo dl)
 endif()
 if (WIN32)
-  target_link_libraries(qqvideo comdlg32 ole32)
+  target_link_libraries(qqvideo comdlg32 ole32 gdi32)   # gdi32: window corner region
   # GUI app: no console window pops up next to the player. Build with
   # -DLUMEN_WIN_CONSOLE=ON to get one (log output, --list).
   option(LUMEN_WIN_CONSOLE "Windows: build a console app (shows log output)" OFF)

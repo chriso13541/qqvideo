@@ -44,6 +44,18 @@ void qq_retro_decorate_windows(void);
 void qq_retro_push_menu_colors(void);
 void qq_retro_pop_menu_colors(void);
 
+/* ---- Bluecurve window frame pieces (also used for qqvideo's own title
+ * bar on the main window, see output_sdl2.cpp) ---- */
+enum qq_wm_glyph { QQ_WM_CLOSE, QQ_WM_MAXIMIZE, QQ_WM_RESTORE, QQ_WM_MINIMIZE, QQ_WM_MENU };
+/* An 18x16 title-bar button centered on `center`. */
+void qq_wm_button(ImDrawList *dl, ImVec2 center, qq_wm_glyph glyph, bool active, bool hovered, bool pressed);
+/* The black outline with Bluecurve's rounded corners, around a-b. */
+void qq_wm_frame_outline(ImDrawList *dl, ImVec2 a, ImVec2 b);
+/* x of the outline on corner row 0..4 (row 0 is the edge); 0 below that.
+ * The same shape cuts the window's corners on Windows (SetWindowRgn). */
+int  qq_wm_corner_inset(int row);
+#define QQ_WM_TITLE_H 22.0f      /* Bluecurve's title bar height */
+
 /* Two-pixel bevel outline (no fill): tl_* on the top/left edges, br_* on
  * the bottom/right; outer ring first, then inner. */
 void qq_bevel(ImDrawList *dl, ImVec2 a, ImVec2 b, ImU32 tl_outer, ImU32 br_outer, ImU32 tl_inner, ImU32 br_inner);

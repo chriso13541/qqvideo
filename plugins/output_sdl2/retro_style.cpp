@@ -112,14 +112,32 @@ void QQ_RetroTitleBar(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool act
     }
 }
 
-void QQ_RetroCloseButton(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool active, bool hovered, bool pressed) {
-    /* 18x16, centered on ImGui's (smaller) close-button box. */
-    ImVec2 c = snap(ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f));
+/* Title-bar buttons, 18x16, centered on `c`. The lavender face, outline
+ * and bevel are shared; the glyph shapes are Bluecurve's (measured from
+ * the Grape xfwm4 pixmaps), drawn as pixel runs: {x, y, width}. */
+struct run_t { int x, y, w; };
+static const run_t GLYPH_CLOSE[] = {
+    {6, 4, 1}, {10, 4, 1}, {5, 5, 3}, {9, 5, 3}, {6, 6, 5}, {7, 7, 3},
+    {6, 8, 5}, {5, 9, 3}, {9, 9, 3}, {6, 10, 1}, {10, 10, 1}, {0, 0, 0} };
+static const run_t GLYPH_MAXIMIZE[] = {            /* a window: thick top, thin sides */
+    {5, 4, 7}, {5, 5, 7}, {5, 6, 7}, {5, 7, 1}, {11, 7, 1}, {5, 8, 1}, {11, 8, 1},
+    {5, 9, 1}, {11, 9, 1}, {5, 10, 7}, {0, 0, 0} };
+static const run_t GLYPH_RESTORE[] = {             /* two overlapping windows */
+    {7, 3, 6}, {12, 4, 1}, {12, 5, 1}, {12, 6, 1}, {12, 7, 1},
+    {5, 5, 6}, {5, 6, 6}, {5, 7, 6}, {5, 8, 1}, {10, 8, 1}, {5, 9, 1}, {10, 9, 1}, {5, 10, 6}, {0, 0, 0} };
+static const run_t GLYPH_MINIMIZE[] = {            /* a bar at the bottom */
+    {5, 8, 7}, {5, 9, 7}, {5, 10, 7}, {0, 0, 0} };
+static const run_t GLYPH_MENU[] = {                /* the chevron */
+    {5, 5, 1}, {11, 5, 1}, {4, 6, 3}, {10, 6, 3}, {5, 7, 3}, {9, 7, 3},
+    {6, 8, 5}, {7, 9, 3}, {8, 10, 1}, {0, 0, 0} };
+
+void qq_wm_button(ImDrawList *dl, ImVec2 center, qq_wm_glyph glyph, bool active, bool hovered, bool pressed) {
+    ImVec2 c = snap(center);
     ImVec2 o(c.x - 9, c.y - 8);
-    unsigned int outline, hl, fill_tl, fill_br, shadow, glyph;
-    if (pressed)     { outline = 0x74769B; hl = fill_tl = fill_br = shadow = 0xB0B7C8; glyph = 0x605973; }
-    else if (active) { outline = 0x74769B; hl = 0xF7F6FB; fill_tl = 0xDED9ED; fill_br = 0xEDE9F4; shadow = 0xBEC0D4; glyph = 0x605973; }
-    else             { outline = 0xA5ADC3; hl = 0xE0E3ED; fill_tl = 0xDFE2EC; fill_br = 0xD8DCE8; shadow = 0xDBDFEA; glyph = 0x979F98; }
+    unsigned int outline, hl, fill_tl, fill_br, shadow, gcol;
+    if (pressed)     { outline = 0x74769B; hl = fill_tl = fill_br = shadow = 0xB0B7C8; gcol = 0x605973; }
+    else if (active) { outline = 0x74769B; hl = 0xF7F6FB; fill_tl = 0xDED9ED; fill_br = 0xEDE9F4; shadow = 0xBEC0D4; gcol = 0x605973; }
+    else             { outline = 0xA5ADC3; hl = 0xE0E3ED; fill_tl = 0xDFE2EC; fill_br = 0xD8DCE8; shadow = 0xDBDFEA; gcol = 0x979F98; }
     ImU32 ftl = HEX(fill_tl), fbr = HEX(fill_br);
     if (hovered && !pressed) { ftl = rgb_tint(fill_tl, 0.45f); fbr = rgb_tint(fill_br, 0.45f); }
     const ImU32 fmid = IM_COL32(((((fill_tl >> 16) & 0xFF) + ((fill_br >> 16) & 0xFF)) / 2),
@@ -135,29 +153,35 @@ void QQ_RetroCloseButton(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool 
     px(dl, o, 1, 14, 1, 1, O);  px(dl, o, 16, 14, 1, 1, O);
     px(dl, o, 2, 1, 14, 1, L);  px(dl, o, 1, 2, 1, 12, L);              /* highlight */
     px(dl, o, 2, 14, 14, 1, S); px(dl, o, 16, 2, 1, 12, S);             /* shadow */
-    /* bold X */
-    const ImU32 G = HEX(glyph);
-    static const struct { int x, y, w; } X[] = {
-        {6, 4, 1}, {10, 4, 1}, {5, 5, 3}, {9, 5, 3}, {6, 6, 5}, {7, 7, 3},
-        {6, 8, 5}, {5, 9, 3}, {9, 9, 3}, {6, 10, 1}, {10, 10, 1},
-    };
-    for (const auto &r : X) px(dl, o, r.x, r.y, r.w, 1, G);
+    const run_t *g = glyph == QQ_WM_CLOSE ? GLYPH_CLOSE : glyph == QQ_WM_MAXIMIZE ? GLYPH_MAXIMIZE
+                   : glyph == QQ_WM_RESTORE ? GLYPH_RESTORE : glyph == QQ_WM_MINIMIZE ? GLYPH_MINIMIZE : GLYPH_MENU;
+    const ImU32 G = HEX(gcol);
+    for (; g->w; g++) px(dl, o, g->x, g->y, g->w, 1, G);
 }
 
-/* Outline + 4px light band around a titled window, following the rounded
- * corners. Drawn after the window's contents (the band sits inside
- * WindowPadding, so it never covers any). */
-static void grape_frame(ImDrawList *dl, ImVec2 a, ImVec2 b, float title_h) {
+void QQ_RetroCloseButton(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool active, bool hovered, bool pressed) {
+    /* centered on ImGui's (smaller) close-button box */
+    qq_wm_button(dl, ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f), QQ_WM_CLOSE, active, hovered, pressed);
+}
+
+int qq_wm_corner_inset(int row) { return row >= 0 && row < 5 ? CORNER[row] : 0; }
+
+/* Outline (+ optionally the 4px light band) around a titled window,
+ * following the rounded corners. Drawn after the window's contents (the
+ * band sits inside WindowPadding, so it never covers any). */
+static void grape_frame(ImDrawList *dl, ImVec2 a, ImVec2 b, float title_h, bool band = true) {
     ImVec2 p = snap(a), q = snap(b);
     const int W = (int)(q.x - p.x), H = (int)(q.y - p.y), T = (int)title_h;
     if (W < 16 || H < T + 12) return;
     const ImU32 O = QQ_BLACK, B = HEX(GRAPE_FRAME_BAND);
     /* light band: left/right below the title bar, bottom along the curve */
+    if (band) {
     px(dl, p, 1, T, 4, H - 5 - T, B);
     px(dl, p, W - 5, T, 4, H - 5 - T, B);
     for (int k = 1; k <= 4; k++) {               /* k = rows up from the bottom edge */
         const int in = CORNER[k] + 1;
         px(dl, p, in, H - 1 - k, W - 2 * in, 1, B);
+    }
     }
     /* outline: straight edges, then the four corners */
     px(dl, p, CORNER[0], 0, W - 2 * CORNER[0], 1, O);
@@ -177,6 +201,8 @@ static void grape_frame(ImDrawList *dl, ImVec2 a, ImVec2 b, float title_h) {
         }
     }
 }
+
+void qq_wm_frame_outline(ImDrawList *dl, ImVec2 a, ImVec2 b) { grape_frame(dl, a, b, 0.0f, false); }
 
 /* ---- color scheme ---------------------------------------------------- */
 
@@ -268,6 +294,7 @@ void qq_retro_decorate_windows(void) {
         if (!w->Active || w->Hidden) continue;           /* only windows drawn this frame */
         const ImGuiWindowFlags f = w->Flags;
         const bool main_menu_bar = strcmp(w->Name, "##MainMenuBar") == 0;
+        if (strcmp(w->Name, "##qq_titlebar") == 0) continue;   /* draws its own Bluecurve chrome */
         ImVec2 a = w->Pos, b = ImVec2(w->Pos.x + w->Size.x, w->Pos.y + w->Size.y);
         ImDrawList *dl = w->DrawList;
         dl->PushClipRect(a, b, false);

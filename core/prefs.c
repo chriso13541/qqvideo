@@ -33,6 +33,11 @@ void lumen_prefs_defaults(lumen_playback_state_t *st) {
     st->pref_audio_lang[0] = '\0';
     st->pref_system_dialog = 0;
     st->pref_resume = 1;
+#if defined(_WIN32)
+    st->pref_custom_frame = 1;     /* Windows' frame is the odd one out next to the Bluecurve UI */
+#else
+    st->pref_custom_frame = 0;     /* Linux: the desktop's window theme decides (e.g. Bluecurve) */
+#endif
 }
 
 /* Builds the config directory path; creates it if `create`. */
@@ -106,6 +111,7 @@ void lumen_prefs_load(lumen_playback_state_t *st) {
         else if (!strcmp(key, "subtitle_size"))   st->pref_sub_scale_pct = clampi(v, 50, 250);
         else if (!strcmp(key, "system_file_dialog")) st->pref_system_dialog = v != 0;
         else if (!strcmp(key, "resume_playback"))  st->pref_resume = v != 0;
+        else if (!strcmp(key, "custom_window_frame")) st->pref_custom_frame = v != 0;
     }
     fclose(f);
 }
@@ -141,6 +147,7 @@ int lumen_prefs_save(const lumen_playback_state_t *st) {
     fprintf(f, "audio_language = %s\n", st->pref_audio_lang);
     fprintf(f, "system_file_dialog = %d\n", st->pref_system_dialog ? 1 : 0);
     fprintf(f, "resume_playback = %d\n", st->pref_resume ? 1 : 0);
+    fprintf(f, "custom_window_frame = %d\n", st->pref_custom_frame ? 1 : 0);
     if (fclose(f) != 0) return -1;
     /* write-then-rename, so a crash mid-save can't leave a truncated file */
 #if defined(_WIN32)

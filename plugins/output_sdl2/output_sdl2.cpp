@@ -92,6 +92,7 @@ struct lumen_output_ctx {
     long          frames_dropped;
     long          frames_unseen;   /* uploaded, then replaced before ever being drawn */
     int           frame_undrawn;   /* the texture holds a frame not drawn yet */
+    int64_t       shown_pts;       /* pts of the frame in the texture */
     Uint64        last_ui_redraw_ticks;
     Uint64        last_video_redraw_ticks; /* last redraw for a new video frame (0 = none yet) */
     int           have_last_redraw;
@@ -2572,6 +2573,38 @@ static void draw_subtitles(lumen_output_ctx_t *ctx, const SDL_Rect &v, int win_h
     }
 }
 
+/* ---- Developer aids for frame pacing (off unless set) --------------------
+ * QQVIDEO_FRAME_LOG=<file>    one line per video frame put on screen:
+ *                              "<ms since start> <frame pts ms>"
+ * QQVIDEO_FAKE_REFRESH=<Hz>   after each present, wait for the next tick of
+ *                              an imaginary display at that refresh rate --
+ *                              what vsync does on a real monitor. For testing
+ *                              without one (headless, VMs). */
+static FILE *debug_frame_log(void) {
+    static int init = 0;
+    static FILE *f = NULL;
+    if (!init) {
+        init = 1;
+        const char *p = getenv("QQVIDEO_FRAME_LOG");
+        if (p && *p) f = fopen(p, "w");
+    }
+    return f;
+}
+
+static void debug_fake_vsync(void) {
+    static double hz = -1;
+    if (hz < 0) { const char *v = getenv("QQVIDEO_FAKE_REFRESH"); hz = v ? atof(v) : 0; }
+    if (hz <= 0) return;
+    const double period = 1000.0 / hz;
+    const Uint64 f = SDL_GetPerformanceFrequency();
+    const double now = (double)SDL_GetPerformanceCounter() * 1000.0 / (double)f;
+    const double next = (floor(now / period) + 1.0) * period;
+    while ((double)SDL_GetPerformanceCounter() * 1000.0 / (double)f < next) {
+        const double left = next - (double)SDL_GetPerformanceCounter() * 1000.0 / (double)f;
+        if (left > 1.5) SDL_Delay(1);
+    }
+}
+
 /* Video > Take Snapshot: draw the current frame -- cropped and at its
  * chosen aspect ratio, like on screen, but at the video's own resolution
  * rather than the window's -- into an offscreen texture, read it back and
@@ -2901,11 +2934,17 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
         double aspect;
         video_geometry(ctx, &src, &aspect);
         SDL_RenderCopy(ctx->renderer, ctx->texture, &src, &dest);
+        if (ctx->frame_undrawn) {                 /* a new frame goes on screen */
+            if (FILE *fl = debug_frame_log())
+                fprintf(fl, "%.3f %lld\n", (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(),
+                        (long long)ctx->shown_pts);
+        }
         ctx->frame_undrawn = 0;
     }
 
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ctx->renderer);
     SDL_RenderPresent(ctx->renderer);
+    debug_fake_vsync();
 
     /* Render the package manager window if it's open */
     if (ctx->pkg_window_open) pkg_render(ctx);
@@ -3260,6 +3299,7 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
         ctx->have_frame = 1;
         if (ctx->frame_undrawn) ctx->frames_unseen++;
         ctx->frame_undrawn = 1;
+        ctx->shown_pts = frame->pts;
         SDL_UpdateYUVTexture(ctx->texture, NULL,
             frame->video.planes[0], frame->video.stride[0],
             frame->video.planes[1], frame->video.stride[1],
@@ -3284,6 +3324,7 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
     ctx->have_frame = 1;
     if (ctx->frame_undrawn) ctx->frames_unseen++;
     ctx->frame_undrawn = 1;
+    ctx->shown_pts = frame->pts;
     SDL_UpdateYUVTexture(ctx->texture, NULL,
         frame->video.planes[0], frame->video.stride[0],
         frame->video.planes[1], frame->video.stride[1],

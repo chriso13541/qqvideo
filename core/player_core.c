@@ -573,9 +573,16 @@ static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vta
  * queued, or decoded while a seek was on its way, can never flash up. */
 
 #define LUMEN_VIDEO_LATE_DROP_MS 100    /* later than this: skip it (if more are queued) */
+/* How far ahead to decode video (without "Buffer ahead"): at least this
+ * many frames AND this much time. A count alone was 267 ms at 30 fps but
+ * only 33 ms at 240 fps -- less than the 40 ms the frame-skip logic wants
+ * as a cushion, so high-frame-rate video was always "behind" and lost
+ * its B-frames on any PC. (Per file: engine_t.vq_soft / vq_hard.) */
 #define VQ_SOFT        8                /* decode this far ahead normally */
 #define VQ_HARD        16               /* ...further only if audio is running low */
-#define VQ_MAX_BYTES   ((size_t)192 << 20)  /* a 4K frame is ~12 MB: bound memory, not count */
+#define VQ_SOFT_MS     150
+#define VQ_HARD_MS     300
+#define VQ_MAX_BYTES   ((size_t)384 << 20)  /* a 4K frame is ~12 MB: bound memory, not count */
 #define VQ_SLOTS       4096             /* ring capacity; with "Buffer ahead" on, time and
                                            memory limits apply long before this */
 #define AQ_CAP         8192             /* decoded audio frames (~3 min at 21 ms each) */
@@ -668,6 +675,7 @@ typedef struct {
     int     catch_skip;           /* set_skip level currently applied while catching up */
     int     catch_discarded;
     int     half_frame_ms;        /* half a video frame: tolerance for "the frame AT the target" */
+    int     vq_soft, vq_hard;     /* decode-ahead limits in frames for this file's frame rate */
     pkt_fifo_t afifo, vfifo;      /* decode thread only */
     int     active_audio;         /* stream index of the audio track that plays (-1 = none);
                                      main writes it together with a seek, see "audio switch" */
@@ -724,7 +732,7 @@ static int video_room(const engine_t *e) {
     if (e->buf_enabled)
         return e->vq_bytes < e->buf_max_bytes && e->vq_count < VQ_SLOTS - 1 &&
                video_ahead_ms(e) < e->buf_target_ms;
-    return e->vq_count < VQ_SOFT && e->vq_bytes < VQ_MAX_BYTES;
+    return e->vq_count < e->vq_soft && e->vq_bytes < VQ_MAX_BYTES;
 }
 static int audio_room(const engine_t *e) {
     if (e->aq_count >= AQ_CAP - 8) return 0;
@@ -738,7 +746,7 @@ static int audio_room(const engine_t *e) {
 static void push_frame(engine_t *e, lumen_frame_t *f, const lumen_decoder_vtable_t *dec) {
     int video = f->type == LUMEN_STREAM_VIDEO;
     pthread_mutex_lock(&e->lock);
-    int vcap = e->buf_enabled ? VQ_SLOTS : VQ_HARD;
+    int vcap = e->buf_enabled ? VQ_SLOTS : e->vq_hard;
     while (!e->abort && !e->seek_pending && (video ? e->vq_count >= vcap : e->aq_count >= AQ_CAP))
         pthread_cond_wait(&e->cond, &e->lock);
     if (e->abort || e->seek_pending) {
@@ -785,7 +793,9 @@ static void push_frame(engine_t *e, lumen_frame_t *f, const lumen_decoder_vtable
 typedef struct {
     int     level;        /* 0..2, current set_skip level */
     int     behind;       /* consecutive decoded frames that arrived (nearly) late */
-    int     warmup;       /* frames to ignore after start/seek while buffers refill */
+    int     warmup;       /* frames to ignore after start/seek while buffers refill... */
+    int64_t warmup_until; /* ...and media time (pts) to ignore: 30 frames is 1.2 s at 25 fps
+                             but 125 ms at 240 fps, before the audio device has even filled */
     int64_t hold_until;   /* pts: after a level change, give it time to take effect */
     int64_t comfy_since;  /* pts where the current comfortable stretch began, -1 = none */
     int64_t comfy_ms;     /* how long a comfortable stretch must last to step down */
@@ -801,6 +811,7 @@ static void skip_reset(skip_state_t *k) {
     if (k->comfy_ms <= 0) k->comfy_ms = SKIP_COMFY_MS;
     k->behind = 0;
     k->warmup = 30;
+    k->warmup_until = -1;                 /* set from the first frame's pts */
     k->hold_until = -1;
     k->comfy_since = -1;
 }
@@ -825,7 +836,8 @@ static void skip_policy(engine_t *e, stream_state_t *ss, skip_state_t *k, int64_
         if (k->level) { skip_change(ss, k, 0, pts); printf("lumen: frame skipping off\n"); }
         return;
     }
-    if (k->warmup > 0) { k->warmup--; return; }
+    if (k->warmup_until < 0) k->warmup_until = pts + 1000;
+    if (k->warmup > 0 || pts < k->warmup_until) { if (k->warmup > 0) k->warmup--; return; }
     if (pts < k->hold_until) return;
 
     /* The audio clock lives on the main thread; use its latest snapshot,
@@ -839,13 +851,17 @@ static void skip_policy(engine_t *e, stream_state_t *ss, skip_state_t *k, int64_
     if (!valid) return;
     int64_t slack = pts - clk;
 
-    if (reserve < 150 || slack < 40) {
+    /* Behind: video has under 40 ms of lead, or audio is running low AND
+     * video lacks a comfortable lead. (Audio alone running low is also
+     * what the end of a file looks like -- that's not a slow decoder.) */
+    if ((reserve < 150 && slack < 100) || slack < 40) {
         k->comfy_since = -1;
         if (++k->behind >= 6 && k->level < 2) {
             if (k->last_down >= 0 && pts - k->last_down < SKIP_REGRET_MS && k->comfy_ms < SKIP_COMFY_MAX_MS)
                 k->comfy_ms *= 2;
             skip_change(ss, k, k->level + 1, pts);
-            printf("lumen: decoding can't keep up -- %s\n", k->level == 1
+            printf("lumen: decoding can't keep up at %lld ms (slack %lld ms, audio reserve %d ms) -- %s\n",
+                   (long long)pts, (long long)slack, reserve, k->level == 1
                    ? "skipping non-reference frames (level 1)"
                    : "also skipping the deblocking filter (level 2)");
         }
@@ -1459,9 +1475,21 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     e->active_audio = active_audio_stream;
     e->has_audio = active_audio_stream >= 0;
     e->half_frame_ms = 20;                       /* ~24-25 fps if the rate is unknown */
+    double vfps = 0;
     for (int i = 0; i < table.stream_count; i++)
-        if (table.streams[i].type == LUMEN_STREAM_VIDEO && table.streams[i].frame_rate > 1.0)
-            e->half_frame_ms = (int)(500.0 / table.streams[i].frame_rate);
+        if (table.streams[i].type == LUMEN_STREAM_VIDEO && table.streams[i].frame_rate > 1.0) {
+            vfps = table.streams[i].frame_rate;
+            e->half_frame_ms = (int)(500.0 / vfps);
+        }
+    e->vq_soft = VQ_SOFT;
+    e->vq_hard = VQ_HARD;
+    if (vfps > 0) {                              /* at least VQ_SOFT_MS / VQ_HARD_MS of video */
+        int soft = (int)(vfps * VQ_SOFT_MS / 1000.0 + 0.5), hard = (int)(vfps * VQ_HARD_MS / 1000.0 + 0.5);
+        if (soft > e->vq_soft) e->vq_soft = soft;
+        if (hard > e->vq_hard) e->vq_hard = hard;
+        if (e->vq_hard > VQ_SLOTS - 2) e->vq_hard = VQ_SLOTS - 2;
+        if (e->vq_soft > e->vq_hard) e->vq_soft = e->vq_hard;
+    }
     if (pthread_create(&e->thread, NULL, decode_thread_main, e) == 0) {
         e->thread_started = 1;
     } else {
@@ -1470,6 +1498,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
 
     int stop_requested = !e->thread_started;
     int was_paused = 0;
+    long superseded = 0;          /* video frames skipped because a newer one was already due */
     /* "Buffer ahead": fill before playback starts (and after every seek);
      * if the buffer ever runs dry, stop and refill instead of stuttering. */
     int buffering = state->pref_buffer_enabled;
@@ -1755,7 +1784,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 else if (wall_anchor_valid)  clk = now - wall_anchor;
                 else                         clk = h->frame.pts;   /* first frame: show now, anchor on it */
                 int64_t d = h->frame.pts - clk;
-                if (stale || !vout || d <= 2) {
+                if (stale || !vout || d <= 1) {
                     vq_pop(e, &it);
                     got = 1;
                     more = e->vq_count > 0;
@@ -1767,12 +1796,23 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                      * stopped waiting for video). Without audio, keep the
                      * last one, or a slow silent video would never show. */
                     if (!stale && vout && -d > LUMEN_VIDEO_LATE_DROP_MS && (more || use_audio)) stale = 2;
+                    /* Superseded: the next frame is due already, so this one
+                     * would be replaced before the screen could show it --
+                     * video faster than the display (240 fps on 60 Hz), or
+                     * catching up after a slow present. Show only the newest
+                     * due frame; skip the upload of the others. Not "late":
+                     * this is the display's limit, not the decoder's. */
+                    if (!stale && vout && more) {
+                        const qitem_t *nx = &e->vq[e->vq_head];
+                        if (nx->serial == e->serial && nx->frame.pts - clk <= 0) stale = 3;
+                    }
                 }
             }
             pthread_mutex_unlock(&e->lock);
             if (!got) break;
             did_work = 1;
             if (stale == 2) out_stats->video_dropped++;
+            if (stale == 3) superseded++;
             if (!stale) {
                 state->position_ms = it.frame.pts;
                 if (vout) {
@@ -1811,7 +1851,9 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             }
         }
 
-        if (!did_work) sleep_ms(2);
+        /* Nothing due yet: nap briefly. 1 ms while video plays -- at 240 fps
+         * a frame lasts 4 ms, and 2 ms naps made frames up to that late. */
+        if (!did_work) sleep_ms(vout && e->has_video && !state->paused ? 1 : 2);
     }
 
     /* ---- stop the decode thread, then clean up ---- */
@@ -1834,8 +1876,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     out_stats->audio_frames = e->audio_frames;
     out_stats->frames_failed = e->frames_failed;
 
-    printf("lumen: done -- %d video frame(s) (%d dropped as late), %d audio frame(s), %d failed%s\n",
-           out_stats->video_frames, out_stats->video_dropped, out_stats->audio_frames, out_stats->frames_failed,
+    printf("lumen: done -- %d video frame(s) (%d dropped as late, %ld faster than the display), %d audio frame(s), %d failed%s\n",
+           out_stats->video_frames, out_stats->video_dropped, superseded, out_stats->audio_frames, out_stats->frames_failed,
            stop_requested ? " (stopped by output)" : "");
 
     /* Note: deliberately NOT closing vout/aout here -- the session owns

@@ -143,6 +143,24 @@ an edit list hides the lead-in from the previous keyframe. QuickTime
 hold make Matroska (`.mkv`; `.webm` for WebM), which keeps everything but
 starts at that keyframe, so up to a few seconds early.
 
+**High frame rates** (120/144/240 fps game captures, any refresh rate).
+The decoder keeps at least 150 ms of video ready whatever the frame rate
+(a fixed 8 frames was only 33 ms at 240 fps, which the catch-up logic
+mistook for a slow PC and started skipping B-frames). When frames come
+faster than the screen refreshes -- 240 fps on a 60 Hz monitor -- only
+the newest due frame is uploaded and shown; the others are skipped
+before the upload and don't count as "late". Decoded frames reuse a
+small pool of buffers instead of a fresh allocation each (3 MB per
+1080p frame). The log line at the end of each file says how many frames
+were "dropped as late" (the PC couldn't keep up) and how many were
+"faster than the display" (normal for 240 fps on a slower screen).
+
+To check frame pacing on your own machine (developer aids, off unless
+set): `QQVIDEO_FRAME_LOG=<file>` writes one line per frame put on screen
+(milliseconds since start, then the frame's timestamp), and
+`QQVIDEO_FAKE_REFRESH=<Hz>` makes each screen update wait for the next
+tick of an imaginary display at that rate, for testing without a real one.
+
 **On-screen notices.** Pausing, playing, seeking with the arrow keys
 (presses in a row add up: "+30s"), volume and mute changes, aspect ratio
 and crop changes and snapshots show a short white notice in the

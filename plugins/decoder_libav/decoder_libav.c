@@ -169,6 +169,58 @@ static void shift_10_to_8(const uint8_t *src, int sstride, uint8_t *dst, int dst
     }
 }
 
+/* ---- video frame buffers --------------------------------------------------
+ * All three planes of a frame live in one block, recycled through a small
+ * pool instead of malloc/free per frame: a 1080p frame is 3 MB, and at
+ * 240 fps that was 720 MB/s of fresh memory -- on Windows the heap hands
+ * blocks that big straight to the OS and back (zero-filled pages, page
+ * faults) every time. Frames are allocated on the decode thread and freed
+ * on the main thread, hence the (tiny) lock. Blocks of another size (the
+ * resolution changed) are simply freed. */
+#define VBUF_HDR   64                     /* keeps the planes 64-byte aligned */
+#define VBUF_POOL  32
+static void   *g_vbuf[VBUF_POOL];
+static int     g_vbuf_n;
+static size_t  g_vbuf_size;
+static char    g_vbuf_lock;
+
+static void vbuf_lock(void)   { while (__atomic_test_and_set(&g_vbuf_lock, __ATOMIC_ACQUIRE)) { } }
+static void vbuf_unlock(void) { __atomic_clear(&g_vbuf_lock, __ATOMIC_RELEASE); }
+
+static uint8_t *vbuf_get(size_t size) {
+    void *b = NULL;
+    vbuf_lock();
+    if (size != g_vbuf_size) {            /* new resolution: drop the old blocks */
+        for (int i = 0; i < g_vbuf_n; i++) free(g_vbuf[i]);
+        g_vbuf_n = 0;
+        g_vbuf_size = size;
+    } else if (g_vbuf_n > 0) {
+        b = g_vbuf[--g_vbuf_n];
+    }
+    vbuf_unlock();
+    if (!b) {
+        b = malloc(VBUF_HDR + size);
+        if (!b) return NULL;
+        *(size_t *)b = size;
+    }
+    return (uint8_t *)b + VBUF_HDR;
+}
+
+static void vbuf_put(uint8_t *plane0) {
+    if (!plane0) return;
+    void *b = plane0 - VBUF_HDR;
+    const size_t size = *(size_t *)b;
+    vbuf_lock();
+    if (size == g_vbuf_size && g_vbuf_n < VBUF_POOL) { g_vbuf[g_vbuf_n++] = b; b = NULL; }
+    vbuf_unlock();
+    free(b);
+}
+
+static void video_frame_release(lumen_frame_t *f) {
+    vbuf_put(f->video.planes[0]);         /* planes 1 and 2 are inside the same block */
+    for (int p = 0; p < 4; p++) f->video.planes[p] = NULL;
+}
+
 static int emit_video(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_t *out) {
     int w = avf->width, h = avf->height;
     int cw = (w + 1) / 2, ch = (h + 1) / 2;   /* round UP for odd sizes */
@@ -180,11 +232,13 @@ static int emit_video(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_
     out->video.pixel_format = LUMEN_PIXFMT_YUV420P;
 
     int pw[3] = { w, cw, cw }, ph[3] = { h, ch, ch };
-    for (int p = 0; p < 3; p++) {
-        out->video.planes[p] = (uint8_t *)malloc((size_t)pw[p] * ph[p]);
-        out->video.stride[p] = pw[p];
-        if (!out->video.planes[p]) return -1;
-    }
+    const size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
+    uint8_t *blk = vbuf_get(ysz + 2 * csz);
+    if (!blk) return -1;
+    out->video.planes[0] = blk;
+    out->video.planes[1] = blk + ysz;
+    out->video.planes[2] = blk + ysz + csz;
+    for (int p = 0; p < 3; p++) out->video.stride[p] = pw[p];
 
     enum AVPixelFormat fmt = (enum AVPixelFormat)avf->format;
     if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUVJ420P) {
@@ -257,7 +311,7 @@ static int emit(lumen_decoder_ctx_t *ctx, lumen_frame_t *out, int skip_samples, 
                                               : emit_audio(ctx, ctx->avframe, out);
     av_frame_unref(ctx->avframe);
     if (rc < 0) {
-        if (ctx->kind == LUMEN_PROBE_VIDEO) for (int p = 0; p < 4; p++) free(out->video.planes[p]);
+        if (ctx->kind == LUMEN_PROBE_VIDEO) video_frame_release(out);
         return -1;
     }
 
@@ -489,7 +543,7 @@ static int libav_drain(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
 
 static void libav_frame_free(lumen_frame_t *frame) {
     if (frame->type == LUMEN_STREAM_VIDEO) {
-        for (int p = 0; p < 4; p++) { free(frame->video.planes[p]); frame->video.planes[p] = NULL; }
+        video_frame_release(frame);
     } else if (frame->type == LUMEN_STREAM_SUBTITLE) {
         free(frame->subtitle.text);
         frame->subtitle.text = NULL;

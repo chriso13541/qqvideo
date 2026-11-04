@@ -280,13 +280,12 @@ static time_t to_time_t(fs::file_time_type ft) {
     return system_clock::to_time_t(sys);
 }
 
-static void load_dir(lumen_file_browser *fb, const std::string &dir) {
-    fb->cwd = dir;
-    fb->entries.clear();
-    fb->error.clear();
-    fb->selected = -1;
-    fb->view_dirty = true;
-    snprintf(fb->path_buf, sizeof(fb->path_buf), "%s", dir.c_str());
+static void rebuild_view(lumen_file_browser *fb);
+
+/* Reads `dir` into fb->entries. Callers go through load_dir(), which also
+ * rebuilds fb->view: the view holds indices into entries, so the two must
+ * never be out of step. */
+static void read_entries(lumen_file_browser *fb, const std::string &dir) {
 
     std::error_code ec;
     fs::directory_iterator it(u8_to_path(dir), fs::directory_options::skip_permission_denied, ec), end;
@@ -311,6 +310,25 @@ static void load_dir(lumen_file_browser *fb, const std::string &dir) {
                : lumen_fb_is_subtitle_ext(e.name.c_str()) ? 2 : 0;
         fb->entries.push_back(std::move(e));
     }
+}
+
+/* Switch to `dir`. Navigation happens in the middle of a frame (clicking a
+ * place in the sidebar, Back/Up, the location bar) and the file list is
+ * drawn later in that same frame, so the view is rebuilt right here. It
+ * used to be marked dirty and rebuilt at the start of the NEXT frame,
+ * leaving this frame's list indexing the old folder's entries in the new
+ * (cleared) vector: a use-after-free that crashed when going from a big
+ * folder with long names (Downloads) to a smaller one (Desktop). */
+static void load_dir(lumen_file_browser *fb, const std::string &dir) {
+    fb->view.clear();              /* first: nothing may index the old entries */
+    fb->selected = -1;
+    fb->scroll_to_sel = false;
+    fb->cwd = dir;
+    fb->entries.clear();
+    fb->error.clear();
+    snprintf(fb->path_buf, sizeof(fb->path_buf), "%s", dir.c_str());
+    read_entries(fb, dir);
+    rebuild_view(fb);
 }
 
 static bool ci_less(const std::string &a, const std::string &b) {
@@ -597,6 +615,7 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
         if (fb->scroll_to_sel && fb->selected >= 0) clip.IncludeItemByIndex(fb->selected);
         while (clip.Step()) {
             for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                if (fb->view[row] < 0 || fb->view[row] >= (int)fb->entries.size()) continue;   /* belt and braces */
                 const Entry &e = fb->entries[fb->view[row]];
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();

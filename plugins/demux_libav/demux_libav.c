@@ -28,6 +28,11 @@
 #include <libavutil/intreadwrite.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#if defined(_WIN32)
+#include <windows.h>      /* MultiByteToWideChar: removing a failed clip */
+#include <wchar.h>
+#endif
 
 #define PLUGIN_VERSION "0.3.0"
 
@@ -266,6 +271,206 @@ static void libav_close(lumen_demuxer_ctx_t *ctx) {
     free(ctx);
 }
 
+/* ---- Clips (Video > Clip Back / Clip Forward) ---------------------------
+ * Copies a stretch of the file into a new one without re-encoding: fast,
+ * lossless, and no encoders needed. The catch with copying is that a clip
+ * must start on a keyframe, so packets are copied from the last keyframe
+ * at or before start_ms, with timestamps shifted so start_ms becomes 0:
+ *   MP4 (from MP4/MOV sources): the frames before start_ms get negative
+ *        timestamps and the muxer writes an edit list, so players start
+ *        exactly at start_ms (what `ffmpeg -ss T -i in -c copy` does).
+ *   Matroska (everything else, any codec fits): no edit lists, so the
+ *        clip starts at that keyframe, up to a GOP early.
+ * Nothing is decoded: the input is opened with codec_whitelist "none". */
+
+static int has_ext(const char *path, const char *ext) {
+    size_t n = strlen(path), e = strlen(ext);
+    if (n < e) return 0;
+    for (size_t i = 0; i < e; i++) {
+        char c = path[n - e + i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != ext[i]) return 0;
+    }
+    return 1;
+}
+
+static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
+                             const char *out_dir, const char *stem,
+                             char *out_path, size_t out_size, char *err, size_t err_size) {
+    AVFormatContext *in = NULL, *out = NULL;
+    AVPacket *pkt = NULL;
+    AVDictionary *opts = NULL;
+    int *map = NULL, *done = NULL, ret = -1, header_written = 0, copied = 0, created = 0;
+    char fail[160] = "";
+    out_path[0] = '\0';
+    if (end_ms <= start_ms) { snprintf(err, err_size, "the clip is empty"); return -1; }
+
+    av_dict_set(&opts, "codec_whitelist", "none", 0);            /* copy only: never decode */
+    av_dict_set(&opts, "format_whitelist", FORMAT_WHITELIST, 0);
+    av_dict_set(&opts, "protocol_whitelist", "file", 0);
+    int rc = avformat_open_input(&in, path, NULL, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't open the video (%s)", fail); return -1; }
+    avformat_find_stream_info(in, NULL);      /* best effort: container headers usually suffice */
+
+    /* Output container: MP4 for MP4/MOV sources (exact start via edit
+     * list, plays everywhere), WebM for WebM, Matroska for the rest. */
+    const int from_mov = strstr(in->iformat->name, "mp4") != NULL;
+    int has_video = 0;
+    for (unsigned i = 0; i < in->nb_streams; i++)
+        if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC)) has_video = 1;
+    const char *fmt = from_mov ? "mp4" : has_ext(path, ".webm") ? "webm" : "matroska";
+    const char *ext = from_mov ? (has_video ? ".mp4" : ".m4a") : has_ext(path, ".webm") ? ".webm" : (has_video ? ".mkv" : ".mka");
+
+    /* A name that isn't taken yet: stem.ext, stem-2.ext, ... */
+    for (int n = 1; n < 100; n++) {
+        if (n == 1) snprintf(out_path, out_size, "%s%s%s%s", out_dir,
+#if defined(_WIN32)
+                             "\\",
+#else
+                             "/",
+#endif
+                             stem, ext);
+        else snprintf(out_path, out_size, "%s%s%s-%d%s", out_dir,
+#if defined(_WIN32)
+                      "\\",
+#else
+                      "/",
+#endif
+                      stem, n, ext);
+        if (avio_check(out_path, 0) < 0) break;               /* doesn't exist */
+        if (n == 99) { snprintf(err, err_size, "too many clips with this name"); goto end; }
+    }
+
+    if (avformat_alloc_output_context2(&out, NULL, fmt, out_path) < 0 || !out) {
+        snprintf(err, err_size, "this FFmpeg can't write %s files", fmt);
+        goto end;
+    }
+    map = (int *)calloc(in->nb_streams, sizeof(int));
+    done = (int *)calloc(in->nb_streams, sizeof(int));
+    if (!map || !done) { snprintf(err, err_size, "out of memory"); goto end; }
+
+    /* Streams: video, audio and subtitles the output container can hold. */
+    int vin = -1;
+    for (unsigned i = 0; i < in->nb_streams; i++) {
+        AVStream *ist = in->streams[i];
+        map[i] = -1;
+        if (!is_wanted(ist)) continue;
+        if (avformat_query_codec(out->oformat, ist->codecpar->codec_id, FF_COMPLIANCE_NORMAL) != 1) continue;
+        AVStream *ost = avformat_new_stream(out, NULL);
+        if (!ost || avcodec_parameters_copy(ost->codecpar, ist->codecpar) < 0) { snprintf(err, err_size, "out of memory"); goto end; }
+        /* Same container family: keep the codec tag (e.g. HEVC's hvc1,
+         * which Apple players need); otherwise let the muxer choose. */
+        if (!from_mov) ost->codecpar->codec_tag = 0;
+        ost->time_base = ist->time_base;
+        ost->disposition = ist->disposition;
+        av_dict_copy(&ost->metadata, ist->metadata, 0);        /* language, title */
+        map[i] = ost->index;
+        if (vin < 0 && ist->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) vin = (int)i;
+    }
+    if (out->nb_streams == 0) { snprintf(err, err_size, "nothing in this file can be copied into a clip"); goto end; }
+
+    /* Start: the keyframe at or before start_ms (on the video stream). */
+    const int64_t origin_us = compute_origin_us(in);
+    const int64_t start_us = start_ms * 1000 + origin_us, end_us = end_ms * 1000 + origin_us;
+    {
+        int si = vin >= 0 ? vin : av_find_default_stream_index(in);
+        AVStream *st = in->streams[si];
+        int64_t ts = av_rescale_q(start_us, AV_TIME_BASE_Q, st->time_base);
+        if (avformat_seek_file(in, si, INT64_MIN, ts, ts, 0) < 0)
+            av_seek_frame(in, -1, 0, AVSEEK_FLAG_BACKWARD);      /* fall back to the start */
+    }
+
+    if (!(out->oformat->flags & AVFMT_NOFILE)) {
+        rc = avio_open(&out->pb, out_path, AVIO_FLAG_WRITE);
+        if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't create %s (%s)", out_path, fail); goto end; }
+        created = 1;
+    }
+    if (from_mov) av_dict_set(&opts, "movflags", "+faststart", 0);   /* plays while downloading/streaming */
+    rc = avformat_write_header(out, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't start the clip (%s)", fail); goto end; }
+    header_written = 1;
+
+    pkt = av_packet_alloc();
+    if (!pkt) { snprintf(err, err_size, "out of memory"); goto end; }
+    int started = vin < 0;                  /* video: from its first keyframe on */
+    /* Done when every audio/video stream is past the end. (Not subtitles:
+     * a track with no cue after the end would read the whole rest of a
+     * two-hour film.) */
+    int remaining = 0;
+    for (unsigned i = 0; i < in->nb_streams; i++)
+        if (map[i] >= 0 && in->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) remaining++;
+    if (remaining == 0) remaining = 1;      /* subtitles only: stop on the cut-off below */
+    while (remaining > 0 && av_read_frame(in, pkt) >= 0) {
+        const int si = pkt->stream_index;
+        if (si < 0 || (unsigned)si >= in->nb_streams || map[si] < 0 || done[si]) { av_packet_unref(pkt); continue; }
+        AVStream *ist = in->streams[si], *ost = out->streams[map[si]];
+        const int64_t t = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+        if (t == AV_NOPTS_VALUE) { av_packet_unref(pkt); continue; }
+        const int64_t t_us = av_rescale_q(t, ist->time_base, AV_TIME_BASE_Q);
+        if (t_us > end_us + 10 * AV_TIME_BASE) { av_packet_unref(pkt); break; }   /* well past: stop */
+        /* Past the end (decode order: once dts > end, nothing later shows
+         * before it). Frames decoded before end but shown after are kept:
+         * earlier frames may need them. */
+        if (t_us > end_us) {
+            done[si] = 1;
+            if (ist->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) remaining--;
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (si == vin && !started) {
+            if (!(pkt->flags & AV_PKT_FLAG_KEY)) { av_packet_unref(pkt); continue; }
+            started = 1;
+        }
+        if (!started) { av_packet_unref(pkt); continue; }   /* audio etc. before the first keyframe */
+        /* Subtitles that ended before the clip starts: leave them out. */
+        if (ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            int64_t dur_us = pkt->duration > 0 ? av_rescale_q(pkt->duration, ist->time_base, AV_TIME_BASE_Q) : 0;
+            if (t_us + dur_us < start_us) { av_packet_unref(pkt); continue; }
+        }
+        /* Shift so start_ms is 0 (earlier frames go negative: see above). */
+        const int64_t shift = av_rescale_q(start_us, AV_TIME_BASE_Q, ist->time_base);
+        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= shift;
+        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= shift;
+        av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
+        pkt->stream_index = map[si];
+        pkt->pos = -1;
+        rc = av_interleaved_write_frame(out, pkt);              /* takes the packet's data */
+        if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't write the clip (%s)", fail); goto end; }
+        copied++;
+    }
+    if (copied == 0) { snprintf(err, err_size, "there's nothing in that part of the video"); goto end; }
+    rc = av_write_trailer(out);
+    header_written = 0;
+    if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't finish the clip (%s)", fail); goto end; }
+    ret = 0;
+
+end:
+    if (header_written) av_write_trailer(out);
+    av_packet_free(&pkt);
+    if (out) {
+        if (out->pb && !(out->oformat->flags & AVFMT_NOFILE)) avio_closep(&out->pb);
+        avformat_free_context(out);
+    }
+    avformat_close_input(&in);
+    free(map);
+    free(done);
+    if (ret != 0) {
+        if (created) {          /* don't leave a broken clip behind -- only ever the file we made */
+#if defined(_WIN32)
+            wchar_t w[1100];
+            if (MultiByteToWideChar(CP_UTF8, 0, out_path, -1, w, 1100) > 0) _wremove(w);
+#else
+            remove(out_path);
+#endif
+        }
+        out_path[0] = '\0';
+    }
+    return ret;
+}
+
 static const lumen_demuxer_vtable_t VTABLE = {
     .probe = libav_probe,
     .open = libav_open,
@@ -275,6 +480,7 @@ static const lumen_demuxer_vtable_t VTABLE = {
     .close = libav_close,
     .open_ex = libav_open_ex,
     .seek_ex = libav_seek_ex,
+    .export_clip = libav_export_clip,
 };
 
 static lumen_plugin_descriptor_t DESCRIPTOR = {

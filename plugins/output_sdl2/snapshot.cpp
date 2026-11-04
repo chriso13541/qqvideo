@@ -57,43 +57,71 @@ static std::string path_to_u8(const fs::path &p) {
 #endif
 }
 
-/* ---- where snapshots go ------------------------------------------------ */
-static fs::path pictures_dir(void) {
+/* ---- where snapshots and clips go -------------------------------------- */
+/* The user's Pictures or Videos folder. Windows: the shell's known folder
+ * (follows OneDrive/redirection). Linux: XDG user-dirs ("Bilder",
+ * "Vidéos"...), else ~/Pictures / ~/Videos. */
+static fs::path user_media_dir(bool videos) {
 #if defined(_WIN32)
-    /* FOLDERID_Pictures, spelled out so we needn't link libuuid */
+    /* FOLDERID_Pictures / FOLDERID_Videos, spelled out so we needn't link libuuid */
     static const GUID k_pictures = { 0x33E28130, 0x4E1E, 0x4676, { 0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB } };
+    static const GUID k_videos   = { 0x18989B1D, 0x99B5, 0x455B, { 0x84, 0x1C, 0xAB, 0x7C, 0x74, 0xE4, 0xDD, 0xFC } };
     PWSTR w = NULL;
     fs::path p;
-    if (SUCCEEDED(SHGetKnownFolderPath(k_pictures, KF_FLAG_CREATE, NULL, &w)) && w) p = fs::path(w);
+    if (SUCCEEDED(SHGetKnownFolderPath(videos ? k_videos : k_pictures, KF_FLAG_CREATE, NULL, &w)) && w) p = fs::path(w);
     if (w) CoTaskMemFree(w);
     if (!p.empty()) return p;
     wchar_t prof[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH);
-    return (n && n < MAX_PATH) ? fs::path(prof) / L"Pictures" : fs::path(L".");
+    return (n && n < MAX_PATH) ? fs::path(prof) / (videos ? L"Videos" : L"Pictures") : fs::path(L".");
 #else
     const char *h = getenv("HOME");
     std::string home = (h && *h) ? h : "/tmp";
-    /* XDG user dirs: "Pictures" may be "Bilder", "Images", ... */
+    const char *fallback = videos ? "Videos" : "Pictures";
     const char *cfg = getenv("XDG_CONFIG_HOME");
     std::string file = (cfg && *cfg) ? std::string(cfg) + "/user-dirs.dirs" : home + "/.config/user-dirs.dirs";
     if (FILE *f = fopen(file.c_str(), "r")) {
         char line[1024];
-        static const char want[] = "XDG_PICTURES_DIR=\"";
+        const std::string want = videos ? "XDG_VIDEOS_DIR=\"" : "XDG_PICTURES_DIR=\"";
         while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, want, sizeof(want) - 1)) continue;
-            std::string v = line + sizeof(want) - 1;
+            if (strncmp(line, want.c_str(), want.size())) continue;
+            std::string v = line + want.size();
             size_t q = v.find('"');
             if (q != std::string::npos) v.resize(q);
             if (!v.compare(0, 5, "$HOME")) v = home + v.substr(5);
             fclose(f);
-            /* "$HOME/" alone means "no Pictures folder": use the default */
+            /* "$HOME/" alone means "no such folder": use the default */
             if (!v.empty() && v != home && v != home + "/") return fs::path(v);
-            return fs::path(home) / "Pictures";
+            return fs::path(home) / fallback;
         }
         fclose(f);
     }
-    return fs::path(home) / "Pictures";
+    return fs::path(home) / fallback;
 #endif
+}
+
+static fs::path pictures_dir(void) { return user_media_dir(false); }
+
+int lumen_videos_dir(char *out, size_t out_size) {
+    fs::path p = user_media_dir(true);
+    std::error_code ec;
+    fs::create_directories(p, ec);
+    if (!fs::is_directory(p, ec)) return -1;
+    snprintf(out, out_size, "%s", path_to_u8(p).c_str());
+    return 0;
+}
+
+void lumen_media_stamp(const char *prefix, char *out, size_t out_size) {
+    time_t t = time(NULL);
+    struct tm lt;
+#if defined(_WIN32)
+    localtime_s(&lt, &t);
+#else
+    localtime_r(&t, &lt);
+#endif
+    char when[40];
+    strftime(when, sizeof(when), "%Y-%m-%d_%H-%M-%S", &lt);
+    snprintf(out, out_size, "%s-%s", prefix, when);
 }
 
 /* Create `p` for writing, failing if it already exists (never overwrite,
@@ -186,15 +214,8 @@ int lumen_snapshot_save(unsigned char *rgb, int w, int h, char *err, size_t err_
         return -1;
     }
 
-    time_t t = time(NULL);
-    struct tm lt;
-#if defined(_WIN32)
-    localtime_s(&lt, &t);
-#else
-    localtime_r(&t, &lt);
-#endif
     char stamp[64];
-    strftime(stamp, sizeof(stamp), "qqvideo-%Y-%m-%d_%H-%M-%S", &lt);
+    lumen_media_stamp("qqvideo", stamp, sizeof(stamp));
 
     snap_job *job = new snap_job;
     job->rgb = rgb;

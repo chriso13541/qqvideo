@@ -128,6 +128,18 @@ selected one's packets are decoded, the others' are dropped unread.
 Supported audio: AAC, MP3, Opus, Vorbis, FLAC, AC-3, E-AC-3, DTS (incl.
 DTS-HD MA), Dolby TrueHD, ALAC and PCM.
 
+**Clips.** Video > *Clip Back* (`Shift+Left`) saves the 15 seconds before
+the current position as a new video, *Clip Forward* (`Shift+Right`) the 15
+seconds from it; the length is set in Preferences > Playback (5-120 s).
+Clips go to your Videos folder as `qqvideo-clip-2026-11-04_00-22-15.mp4`,
+are copied rather than re-encoded (same quality, saved in about a
+second, while playback carries on) and keep every audio and subtitle
+track the container allows, with their languages. MP4/MOV sources make
+MP4 clips that start exactly on time (an edit list skips the lead-in to
+the previous keyframe); other sources make Matroska (`.mkv`, or `.webm`
+for WebM) clips, which start at that keyframe, so up to a few seconds
+early.
+
 **On-screen notices.** Pausing, playing, seeking with the arrow keys
 (presses in a row add up: "+30s"), volume and mute changes, aspect ratio
 and crop changes and snapshots show a short white notice in the

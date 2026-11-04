@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 23
+#define LUMEN_ABI_VERSION 24
 #define LUMEN_MAX_AUDIO_TRACKS 16
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
@@ -471,6 +471,21 @@ typedef struct {
 
     int  pref_custom_frame;      /* Preferences > General: qqvideo draws its own (Bluecurve)
                                     window frame instead of the system's */
+
+    /* ---- Clips (appended; Video > Clip Back / Clip Forward) ----
+     * UI -> core: clip_requested with the range and where to put it. The
+     * core has the demuxer copy that part of the file (export_clip) on a
+     * background thread and reports back through the clip_result_* fields,
+     * bumping clip_result_serial LAST (after the message is written). */
+    int     pref_clip_seconds;      /* Preferences > Playback: clip length, seconds */
+    int     clip_requested;
+    int64_t clip_start_ms, clip_end_ms;   /* on the position_ms timeline */
+    char    clip_out_dir[1024];     /* UTF-8, exists */
+    char    clip_stem[128];         /* file name without extension */
+    int     clip_busy;              /* core: a clip is being written */
+    int     clip_result_serial;
+    int     clip_result_ok;
+    char    clip_result_msg[1200];  /* the file's path, or why it failed */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */
@@ -527,6 +542,17 @@ typedef struct {
      * you started from, and pressing Right does nothing. Returns -1 if
      * there's no keyframe in that direction (e.g. forward near the end). */
     int (*seek_ex)(lumen_demuxer_ctx_t *ctx, int64_t target_ms, int flags);
+
+    /* v24, optional (NULL = this demuxer can't make clips). Copy the part
+     * of `path` between start_ms and end_ms (on the same timeline as the
+     * packets' pts_ms) into a NEW file in out_dir named stem + an
+     * extension the demuxer picks (e.g. ".mp4"), without re-encoding.
+     * Independent of any open demuxer context: the core calls it from its
+     * own thread while playback carries on. On success returns 0 with the
+     * file's full path in out_path; else -1 with a reason in err. */
+    int (*export_clip)(const char *path, int64_t start_ms, int64_t end_ms,
+                       const char *out_dir, const char *stem,
+                       char *out_path, size_t out_size, char *err, size_t err_size);
 } lumen_demuxer_vtable_t;
 
 /* ---------------------------------------------------------------------- */

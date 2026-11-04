@@ -70,6 +70,16 @@ static void prefs_open(lumen_output_ctx_t *ctx);
 static void pkg_close(lumen_output_ctx_t *ctx);
 static void pkg_render(lumen_output_ctx_t *ctx);
 
+/* qqvideo's Bluecurve frame on a dialog window (Preferences, Package
+ * Manager): fixed size, so just a title bar to drag it by and a close
+ * button, plus the outline and rounded corners. */
+struct wm_aux_t {
+    SDL_Window *win;
+    int         frame;                        /* borderless + our title bar */
+    int         close_x0;                     /* hit test: title bar stops here */
+    int         shape_mode, shape_w, shape_h; /* corner region applied (Windows) */
+};
+
 struct lumen_output_ctx {
     SDL_Window   *window;
     SDL_Renderer *renderer;
@@ -145,12 +155,14 @@ struct lumen_output_ctx {
     SDL_Window   *pkg_window;
     SDL_Renderer *pkg_renderer;
     int           pkg_window_open; /* 1 while the window is shown */
+    wm_aux_t      pkg_wm;
 
     /* ---- Preferences (third system window, same pattern) ---- */
     ImGuiContext *pref_imgui_ctx;
     SDL_Window   *pref_window;
     SDL_Renderer *pref_renderer;
     int           pref_window_open;
+    wm_aux_t      pref_wm;
     int           pref_page;              /* section shown in the sidebar */
     char          audio_devs[16][128];    /* output devices, listed when the window opens */
     int           audio_dev_count;
@@ -180,6 +192,7 @@ struct lumen_output_ctx {
     int             osd_seen_paused;   /* last state seen, to notice changes from any */
     int             osd_seen_vol;      /* source (keys, buttons, slider, wheel); -1 = */
     int             osd_seen_muted;    /* nothing seen yet */
+    int             clip_serial_seen;  /* last clip result shown */
 };
 
 /* ---- Video > Aspect Ratio / Crop ---------------------------------------
@@ -261,6 +274,30 @@ static void set_crop(lumen_output_ctx_t *ctx, int idx) {
 static void request_snapshot(lumen_output_ctx_t *ctx) {
     if (ctx->state && ctx->state->has_file && ctx->have_frame && ctx->texture) ctx->snapshot_requested = 1;
     else osd_show(ctx, 2000, "No video to take a snapshot of");
+}
+
+/* Video > Clip Back / Clip Forward: the clip length (Preferences >
+ * Playback) just before / from the current position, copied into a new
+ * file in the Videos folder by the core (see export_clip). */
+static void request_clip(lumen_output_ctx_t *ctx, bool back) {
+    lumen_playback_state_t *st = ctx->state;
+    if (!st || !st->has_file) { osd_show(ctx, 2000, "Open a video first"); return; }
+    if (st->clip_busy) { osd_show(ctx, 2000, "Still saving the last clip..."); return; }
+    const int64_t len = (int64_t)(st->pref_clip_seconds > 0 ? st->pref_clip_seconds : 15) * 1000;
+    const int64_t pos = st->position_ms > 0 ? st->position_ms : 0;
+    int64_t a = back ? pos - len : pos, b = back ? pos : pos + len;
+    if (a < 0) a = 0;
+    if (st->duration_ms > 0 && b > st->duration_ms) b = st->duration_ms;
+    if (b - a < 500) { osd_show(ctx, 2000, back ? "Nothing to clip before this point" : "Nothing left to clip"); return; }
+    if (lumen_videos_dir(st->clip_out_dir, sizeof(st->clip_out_dir)) != 0) {
+        osd_show(ctx, 4000, "Couldn't save the clip\nno Videos folder found or created");
+        return;
+    }
+    lumen_media_stamp("qqvideo-clip", st->clip_stem, sizeof(st->clip_stem));
+    st->clip_start_ms = a;
+    st->clip_end_ms = b;
+    st->clip_requested = 1;
+    osd_show(ctx, 10000, "Saving clip...");   /* replaced by the result */
 }
 
 /* Background thread for any file-picker dialog (Add to Queue or Open File).
@@ -526,14 +563,17 @@ static void wm_drag_continue(lumen_output_ctx_t *ctx) {
 /* Windows: cut the window's corners to Bluecurve's rounded shape (the
  * same pixel curve the outline follows). Square when maximized or
  * fullscreen, and with the system frame. */
-static void wm_update_shape(lumen_output_ctx_t *ctx) {
+/* Cut `win`'s corners to the shape (mode 1) or make it square again
+ * (mode 0). Cached per window: only redone when the mode or size changes. */
+static void wm_shape_window(SDL_Window *win, int mode, int *c_mode, int *c_w, int *c_h) {
 #if defined(_WIN32)
-    const int mode = (ctx->wm_frame && !ctx->fullscreen && !ctx->wm_maximized) ? 1 : 0;
     int w = 0, h = 0;
-    SDL_GetWindowSize(ctx->window, &w, &h);
-    if (mode == ctx->wm_shape_mode && (!mode || (w == ctx->wm_shape_w && h == ctx->wm_shape_h))) return;
-    HWND hwnd = wm_hwnd(ctx);
-    if (!hwnd) return;
+    SDL_GetWindowSize(win, &w, &h);
+    if (mode == *c_mode && (!mode || (w == *c_w && h == *c_h))) return;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+    HWND hwnd = info.info.win.window;
     if (mode && w > 16 && h > 16) {
         HRGN rgn = CreateRectRgn(0, 5, w, h - 5);
         for (int k = 0; k < 5; k++) {
@@ -549,12 +589,17 @@ static void wm_update_shape(lumen_output_ctx_t *ctx) {
     } else {
         SetWindowRgn(hwnd, NULL, TRUE);
     }
-    ctx->wm_shape_mode = mode;
-    ctx->wm_shape_w = w;
-    ctx->wm_shape_h = h;
+    *c_mode = mode;
+    *c_w = w;
+    *c_h = h;
 #else
-    (void)ctx;
+    (void)win; (void)mode; (void)c_mode; (void)c_w; (void)c_h;
 #endif
+}
+
+static void wm_update_shape(lumen_output_ctx_t *ctx) {
+    const int mode = (ctx->wm_frame && !ctx->fullscreen && !ctx->wm_maximized) ? 1 : 0;
+    wm_shape_window(ctx->window, mode, &ctx->wm_shape_mode, &ctx->wm_shape_w, &ctx->wm_shape_h);
 }
 
 /* Which part of the window is under the mouse, for the OS: the title bar
@@ -816,8 +861,13 @@ static int handle_events(lumen_output_ctx_t *ctx) {
              * keyframe before it" could land where you started. The new
              * position is the seek target right away, so repeated presses
              * (or holding the key) keep adding up. */
+            const bool shift_held = (e.key.keysym.mod & KMOD_SHIFT) != 0;
             if ((e.key.keysym.scancode == SDL_SCANCODE_RIGHT || e.key.keysym.scancode == SDL_SCANCODE_LEFT) &&
-                !ImGui::GetIO().WantCaptureKeyboard &&
+                shift_held && !e.key.repeat && !ImGui::GetIO().WantCaptureKeyboard && ctx->state) {
+                request_clip(ctx, e.key.keysym.scancode == SDL_SCANCODE_LEFT);   /* Shift+Left/Right: clip */
+            }
+            if ((e.key.keysym.scancode == SDL_SCANCODE_RIGHT || e.key.keysym.scancode == SDL_SCANCODE_LEFT) &&
+                !shift_held && !ImGui::GetIO().WantCaptureKeyboard &&
                 ctx->state && ctx->state->has_file) {
                 lumen_playback_state_t *st = ctx->state;
                 int fwd = e.key.keysym.scancode == SDL_SCANCODE_RIGHT;
@@ -936,23 +986,109 @@ sync:
     }
 }
 
+/* ---- the Bluecurve frame on dialog windows ---- */
+static SDL_HitTestResult SDLCALL aux_hit_test(SDL_Window *win, const SDL_Point *pt, void *data) {
+    (void)win;
+    const wm_aux_t *a = (const wm_aux_t *)data;
+    if (a->frame && pt->y < (int)QQ_WM_TITLE_H && pt->x < a->close_x0) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
+/* Follow Preferences > General > "Bluecurve window frame". The window
+ * grows by the title bar's height so the content keeps its size. */
+static void aux_apply_frame(lumen_output_ctx_t *ctx, wm_aux_t *a) {
+    if (!a->win) return;
+    const int want = ctx->state && ctx->state->pref_custom_frame;
+    if (want != a->frame) {
+        int w, h;
+        SDL_GetWindowSize(a->win, &w, &h);
+        SDL_SetWindowBordered(a->win, want ? SDL_FALSE : SDL_TRUE);
+        SDL_SetWindowSize(a->win, w, h + (want ? 1 : -1) * (int)QQ_WM_TITLE_H);
+        a->frame = want;
+    }
+    int w, h;
+    SDL_GetWindowSize(a->win, &w, &h);
+    a->close_x0 = w - 4 - 18 - 2;
+    wm_shape_window(a->win, a->frame, &a->shape_mode, &a->shape_w, &a->shape_h);
+}
+
+/* Draw the dialog's title bar in its (current) ImGui context, between
+ * NewFrame and Render. Afterwards the main viewport's work area excludes
+ * it: lay the content out in GetMainViewport()->WorkPos / WorkSize.
+ * Returns true if the close button was clicked. */
+static bool aux_titlebar(const wm_aux_t *a) {
+    if (!a->frame) return false;
+    bool close = false;
+    const float H = QQ_WM_TITLE_H;
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1, 1));
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                               ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
+                               ImGuiWindowFlags_NoScrollWithMouse;
+    if (ImGui::BeginViewportSideBar("##qq_titlebar", vp, ImGuiDir_Up, H, f)) {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetWindowPos();
+        const ImVec2 p1(p0.x + ImGui::GetWindowWidth(), p0.y + H);
+        const bool active = (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        QQ_RetroTitleBar(dl, p0, p1, active);
+        const float cy = p0.y + 11.0f, close_cx = p1.x - 4 - 9;
+        ImGui::SetCursorScreenPos(ImVec2(close_cx - 9, cy - 8));
+        close = ImGui::InvisibleButton("##aux_close", ImVec2(18, 16));
+        qq_wm_button(dl, ImVec2(close_cx, cy), QQ_WM_CLOSE, active, ImGui::IsItemHovered(), ImGui::IsItemActive());
+        /* title: as on the main window, white with a drop shadow when active */
+        const char *title = SDL_GetWindowTitle(a->win);
+        const float tx = p0.x + 8, tmax = close_cx - 9 - 8, ty = cy - ImGui::GetFontSize() * 0.5f;
+        if (title && tmax > tx + 8) {
+            const ImVec2 sz = ImGui::CalcTextSize(title);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 150));
+                ImGui::RenderTextEllipsis(dl, ImVec2(tx + 1, ty + 1), ImVec2(tmax + 1, p1.y), tmax + 1, tmax + 1, title, NULL, &sz);
+                ImGui::PopStyleColor();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, active ? IM_COL32_WHITE : IM_COL32(0x81, 0x8a, 0x7d, 255));
+            ImGui::RenderTextEllipsis(dl, ImVec2(tx, ty), ImVec2(tmax, p1.y), tmax, tmax, title, NULL, &sz);
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    return close;
+}
+
+/* The outline with rounded corners, over everything (call last). */
+static void aux_outline(const wm_aux_t *a) {
+    if (!a->frame) return;
+    int w, h;
+    SDL_GetWindowSize(a->win, &w, &h);
+    qq_wm_frame_outline(ImGui::GetForegroundDrawList(), ImVec2(0, 0), ImVec2((float)w, (float)h));
+}
+
 /* Creates a fixed-size auxiliary OS window (Package Manager, Preferences)
  * with its own renderer and its own ImGui context, so styles/fonts/state
  * stay independent from the video window. Leaves the main context current.
  * Returns false on failure (nothing left allocated). */
 static bool aux_window_create(lumen_output_ctx_t *ctx, const char *title, int w, int h,
-                              SDL_Window **win, SDL_Renderer **ren, ImGuiContext **ictx) {
-    /* Fixed size: close/minimize allowed, resize not. */
-    *win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_SHOWN);
+                              SDL_Window **win, SDL_Renderer **ren, ImGuiContext **ictx, wm_aux_t *wm) {
+    /* Fixed size: close/minimize allowed, resize not. Created hidden so
+     * the Bluecurve frame is in place before it first appears. */
+    *win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_HIDDEN);
     if (!*win) {
         fprintf(stderr, "lumen: SDL_CreateWindow(%s) failed: %s\n", title, SDL_GetError());
         return false;
     }
+    memset(wm, 0, sizeof(*wm));
+    wm->win = *win;
+    SDL_SetWindowHitTest(*win, aux_hit_test, wm);
+    aux_apply_frame(ctx, wm);
+    SDL_SetWindowPosition(*win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);   /* re-center at the final size */
+    SDL_ShowWindow(*win);
     *ren = SDL_CreateRenderer(*win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!*ren) *ren = SDL_CreateRenderer(*win, -1, SDL_RENDERER_SOFTWARE);
     if (!*ren) {
         SDL_DestroyWindow(*win);
         *win = NULL;
+        wm->win = NULL;
         return false;
     }
     *ictx = ImGui::CreateContext();
@@ -992,7 +1128,7 @@ static void pkg_open(lumen_output_ctx_t *ctx) {
         return; /* already created -- just un-hide */
     }
     if (!aux_window_create(ctx, "Lumen Package Manager", 600, 440,
-                           &ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx))
+                           &ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx, &ctx->pkg_wm))
         return;
     ctx->pkg_window_open = 1;
     printf("  [pkg] Package Manager window opened\n");
@@ -1018,7 +1154,7 @@ static void prefs_open(lumen_output_ctx_t *ctx) {
         return;
     }
     if (!aux_window_create(ctx, "qqvideo Preferences", 660, 520,
-                           &ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx))
+                           &ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx, &ctx->pref_wm))
         return;
     ctx->pref_window_open = 1;
 }
@@ -1064,8 +1200,9 @@ static void prefs_page_general(lumen_output_ctx_t *ctx, lumen_playback_state_t *
     ImGui::EndDisabled();
     ImGui::Spacing();
     pref_check("Bluecurve window frame", &st->pref_custom_frame, st);
-    pref_note("qqvideo draws its own title bar and border, in the Bluecurve Grape style, "
-              "instead of the system's. Off: the normal frame from Windows or your desktop.");
+    pref_note("qqvideo draws its own title bars and borders, in the Bluecurve Grape style, "
+              "instead of the system's -- on the player and on dialogs like this one. Off: "
+              "the normal frame from Windows or your desktop.");
     ImGui::Spacing();
     pref_check("Resize the window to fit each video", &st->pref_resize_window, st);
     pref_note("Off: the window keeps the size you gave it.");
@@ -1100,6 +1237,13 @@ static void prefs_page_playback(lumen_output_ctx_t *ctx, lumen_playback_state_t 
     pref_note("Seeks land on the exact time you pick. Off: jump to the nearest "
               "keyframe instead -- instant, but up to several seconds away.");
     pref_slider("Left/Right arrow jump", &st->pref_seek_step_s, 1, 60, "%d s", st);
+
+    ImGui::SeparatorText("Clips");
+    pref_slider("Clip length", &st->pref_clip_seconds, 5, 120, "%d s", st);
+    pref_note("Video > Clip Back (Shift+Left) saves this much of the video just before the "
+              "current position; Clip Forward (Shift+Right), this much starting from it. The "
+              "clip is copied, not re-encoded: same quality, saved in a moment, to your "
+              "Videos folder.");
 
     ImGui::SeparatorText("Buffering");
     pref_check("Buffer ahead", &st->pref_buffer_enabled, st);
@@ -1242,15 +1386,16 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
     if (!ctx->pref_window || !ctx->pref_window_open || !ctx->pref_imgui_ctx || !ctx->state) return;
     lumen_playback_state_t *st = ctx->state;
 
+    aux_apply_frame(ctx, &ctx->pref_wm);
     ImGui::SetCurrentContext(ctx->pref_imgui_ctx);
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    int win_w, win_h;
-    SDL_GetWindowSize(ctx->pref_window, &win_w, &win_h);
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImVec2((float)win_w, (float)win_h));
+    const bool close_clicked = aux_titlebar(&ctx->pref_wm);   /* Bluecurve frame, if on */
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
     ImGui::Begin("##prefs", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
@@ -1288,10 +1433,11 @@ static void prefs_render(lumen_output_ctx_t *ctx) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextWrapped("%s", saved_note);
     ImGui::PopStyleColor();
-    if (ImGui::Button("Close")) { SDL_HideWindow(ctx->pref_window); ctx->pref_window_open = 0; }
+    if (ImGui::Button("Close") || close_clicked) { SDL_HideWindow(ctx->pref_window); ctx->pref_window_open = 0; }
 
     ImGui::End();
     qq_retro_decorate_windows();
+    aux_outline(&ctx->pref_wm);
     ImGui::Render();
     SDL_SetRenderDrawColor(ctx->pref_renderer, 240, 240, 240, 255);
     SDL_RenderClear(ctx->pref_renderer);
@@ -1313,18 +1459,20 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
 
     lumen_playback_state_t *state = ctx->state;
 
+    aux_apply_frame(ctx, &ctx->pkg_wm);
     ImGui::SetCurrentContext(ctx->pkg_imgui_ctx);
 
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    /* Single full-window ImGui panel -- the OS provides the title bar/
-     * min/close decorations; we just fill the client area. */
-    int win_w, win_h;
-    SDL_GetWindowSize(ctx->pkg_window, &win_w, &win_h);
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImVec2((float)win_w, (float)win_h));
+    /* Single full-window ImGui panel below the title bar (ours when the
+     * Bluecurve frame is on, else the OS's). */
+    const bool close_clicked = aux_titlebar(&ctx->pkg_wm);
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    const int win_w = (int)vp->WorkSize.x, win_h = (int)vp->WorkSize.y;   /* the content area */
 
     ImGuiWindowFlags wf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                           ImGuiWindowFlags_NoMove    | ImGuiWindowFlags_NoScrollbar |
@@ -1541,12 +1689,13 @@ static void pkg_render(lumen_output_ctx_t *ctx) {
     float btn_w = 80.0f;
     ImGui::SetCursorPosX((float)win_w - btn_w - ImGui::GetStyle().WindowPadding.x);
     ImGui::SetCursorPosY((float)win_h - ImGui::GetFrameHeightWithSpacing() - ImGui::GetStyle().WindowPadding.y);
-    if (ImGui::Button("Close", ImVec2(btn_w, 0))) {
+    if (ImGui::Button("Close", ImVec2(btn_w, 0)) || close_clicked) {
         pkg_close(ctx);
     }
 
     ImGui::End();
     qq_retro_decorate_windows();
+    aux_outline(&ctx->pkg_wm);
     ImGui::Render();
 
     SDL_SetRenderDrawColor(ctx->pkg_renderer, 240, 240, 240, 255);
@@ -1689,6 +1838,17 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Take Snapshot", "Shift+S", false, has_video && ctx->have_frame)) request_snapshot(ctx);
+            {
+                const int len = state->pref_clip_seconds > 0 ? state->pref_clip_seconds : 15;
+                char back[64], fwd[64];
+                snprintf(back, sizeof(back), "Clip Back %d s##clipb", len);
+                snprintf(fwd, sizeof(fwd), "Clip Forward %d s##clipf", len);
+                const bool can = state->has_file && !state->clip_busy;
+                if (ImGui::MenuItem(back, "Shift+Left", false, can)) request_clip(ctx, true);
+                ImGui::SetItemTooltip("Save the %d s before the current position as a new video", len);
+                if (ImGui::MenuItem(fwd, "Shift+Right", false, can)) request_clip(ctx, false);
+                ImGui::SetItemTooltip("Save %d s from the current position as a new video", len);
+            }
             if (!has_video) ImGui::SetItemTooltip("Open a video first");
             ImGui::EndMenu();
         }
@@ -2455,7 +2615,7 @@ static void take_snapshot(lumen_output_ctx_t *ctx) {
 }
 
 /* Notice what changed since the last frame, whoever changed it: the
- * keyboard, the control bar, a click on the picture, the mouse wheel. */
+ * keyboard, the control bar, the volume slider, the mouse wheel. */
 static void osd_watch(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *st = ctx->state;
     int ok;
@@ -2463,6 +2623,14 @@ static void osd_watch(lumen_output_ctx_t *ctx) {
     if (lumen_snapshot_poll(&ok, msg, sizeof(msg))) {
         if (ok) osd_show(ctx, 4000, "Snapshot saved\n%s", msg);
         else    osd_show(ctx, 6000, "Couldn't save the snapshot\n%s", msg);
+    }
+    if (st) {
+        const int serial = __atomic_load_n(&st->clip_result_serial, __ATOMIC_ACQUIRE);
+        if (serial != ctx->clip_serial_seen) {
+            ctx->clip_serial_seen = serial;
+            if (st->clip_result_ok) osd_show(ctx, 4000, "Clip saved\n%s", st->clip_result_msg);
+            else                    osd_show(ctx, 6000, "Couldn't save the clip\n%s", st->clip_result_msg);
+        }
     }
     if (!st || !st->has_file) {             /* idle: start afresh with the next file */
         ctx->osd_seen_paused = ctx->osd_seen_vol = ctx->osd_seen_muted = -1;
@@ -2753,6 +2921,10 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
      * still reports a zero-size non-client area, so no native frame shows. */
     SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
 #endif
+    /* A click on a qqvideo window that isn't focused should still press
+     * what's under it (Play, a dialog's close button), as in any other
+     * app. SDL's default swallows that first click on Windows. */
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
 
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "lumen: SDL_InitSubSystem(VIDEO) failed: %s\n", SDL_GetError());
@@ -3143,6 +3315,7 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
     /* Tear down the package manager window and its own ImGui context */
     aux_window_destroy(&ctx->pkg_window, &ctx->pkg_renderer, &ctx->pkg_imgui_ctx);
     aux_window_destroy(&ctx->pref_window, &ctx->pref_renderer, &ctx->pref_imgui_ctx);
+    ctx->pkg_wm.win = ctx->pref_wm.win = NULL;
 
     /* Tear down the main window's ImGui context */
     ImGui::SetCurrentContext(ctx->main_imgui_ctx);

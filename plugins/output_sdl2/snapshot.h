@@ -28,3 +28,12 @@ int lumen_snapshot_poll(int *ok, char *msg, size_t msg_size);
 /* Wait (up to max_ms) for saves still in progress, so quitting right
  * after a snapshot doesn't leave half a PNG behind. */
 void lumen_snapshot_wait(int max_ms);
+
+/* The user's Videos folder (Windows known folder / XDG_VIDEOS_DIR /
+ * ~/Videos), created if missing, as UTF-8. Video > Clip saves there.
+ * Returns 0, or -1 if it can't be found or made. */
+int lumen_videos_dir(char *out, size_t out_size);
+
+/* "<prefix>-2026-11-04_00-22-15" for the local time now: the shared
+ * naming of snapshots and clips. */
+void lumen_media_stamp(const char *prefix, char *out, size_t out_size);

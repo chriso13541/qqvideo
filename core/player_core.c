@@ -422,6 +422,83 @@ static int audio_clock(lumen_session_t *session, const lumen_audio_output_vtable
     return 1;
 }
 
+/* ---- Clips (Video > Clip Back / Clip Forward) -------------------------
+ * The UI asks with state->clip_requested; the demuxer plugin's
+ * export_clip copies that part of the file on a thread of its own, so
+ * playback carries on. Its result goes back through state->clip_result_*,
+ * with the serial bumped last so the UI never sees a half-written message.
+ * One clip at a time; the thread is joined before the demuxer plugin is
+ * unloaded (its code runs in that library). */
+typedef struct {
+    lumen_playback_state_t *st;
+    const lumen_demuxer_vtable_t *dmx;
+    char    path[1024];
+    int64_t start_ms, end_ms;
+    char    dir[1024];
+    char    stem[128];
+} clip_job_t;
+
+typedef struct {
+    pthread_t thread;
+    int       running;          /* a thread to join */
+} clip_worker_t;
+
+static void *clip_thread_main(void *arg) {
+    clip_job_t *job = (clip_job_t *)arg;
+    lumen_playback_state_t *st = job->st;
+    char out[1024], err[512] = "";
+    int rc = job->dmx->export_clip(job->path, job->start_ms, job->end_ms, job->dir, job->stem,
+                                   out, sizeof(out), err, sizeof(err));
+    st->clip_result_ok = rc == 0;
+    snprintf(st->clip_result_msg, sizeof(st->clip_result_msg), "%s", rc == 0 ? out : (err[0] ? err : "unknown error"));
+    if (rc == 0) printf("lumen: clip saved: %s\n", out);
+    else         fprintf(stderr, "lumen: clip failed: %s\n", st->clip_result_msg);
+    __atomic_store_n(&st->clip_busy, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&st->clip_result_serial, 1, __ATOMIC_RELEASE);   /* last: the message is ready */
+    free(job);
+    return NULL;
+}
+
+static void clip_report(lumen_playback_state_t *st, const char *msg) {
+    st->clip_result_ok = 0;
+    snprintf(st->clip_result_msg, sizeof(st->clip_result_msg), "%s", msg);
+    __atomic_add_fetch(&st->clip_result_serial, 1, __ATOMIC_RELEASE);
+}
+
+static void clip_poll(clip_worker_t *w, lumen_playback_state_t *st,
+                      const lumen_demuxer_vtable_t *dmx, const char *path) {
+    if (w->running && !__atomic_load_n(&st->clip_busy, __ATOMIC_ACQUIRE)) {
+        pthread_join(w->thread, NULL);          /* finished: reap it */
+        w->running = 0;
+    }
+    if (!st->clip_requested) return;
+    st->clip_requested = 0;
+    if (!dmx->export_clip) { clip_report(st, "this kind of file can't be clipped"); return; }
+    if (w->running) { clip_report(st, "still saving the previous clip -- try again in a moment"); return; }
+    clip_job_t *job = (clip_job_t *)calloc(1, sizeof(*job));
+    if (!job) { clip_report(st, "out of memory"); return; }
+    job->st = st;
+    job->dmx = dmx;
+    snprintf(job->path, sizeof(job->path), "%s", path);
+    job->start_ms = st->clip_start_ms;
+    job->end_ms = st->clip_end_ms;
+    snprintf(job->dir, sizeof(job->dir), "%s", st->clip_out_dir);
+    snprintf(job->stem, sizeof(job->stem), "%s", st->clip_stem);
+    __atomic_store_n(&st->clip_busy, 1, __ATOMIC_RELEASE);
+    if (pthread_create(&w->thread, NULL, clip_thread_main, job) != 0) {
+        __atomic_store_n(&st->clip_busy, 0, __ATOMIC_RELEASE);
+        free(job);
+        clip_report(st, "couldn't start saving the clip");
+        return;
+    }
+    w->running = 1;
+}
+
+static void clip_wait(clip_worker_t *w) {
+    if (w->running) pthread_join(w->thread, NULL);
+    w->running = 0;
+}
+
 /* Pumps both outputs' UI and checks for anything that ends playback of
  * this file. Returns 1 (and fills out_stats) if playback must stop. */
 static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vtable_t *aout,
@@ -1390,6 +1467,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
 
     int64_t resume_next_save = now_ms() + 30000;
 
+    clip_worker_t clipper = { 0 };
     while (!stop_requested) {
         /* Pumping the session's video output EVERY iteration keeps the SDL
          * event loop alive even when this file has no decodable video. */
@@ -1397,6 +1475,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             stop_requested = 1;
             break;
         }
+        clip_poll(&clipper, state, dmx, path);         /* Video > Clip Back / Forward */
 
         /* Save the resume position every 30 s too, not only on close, so a
          * crash or power cut doesn't lose it. */
@@ -1697,6 +1776,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             lumen_unload_plugin(&streams[i].decoder_plugin);
         }
     }
+    clip_wait(&clipper);          /* a clip still being saved runs code in the demuxer plugin */
     dmx->close(dctx);
     lumen_unload_plugin(&demux_plugin);
     for (int i = 0; i < LUMEN_MAX_SUB_TRACKS; i++) lumen_sub_track_free(&sub_tracks[i]);

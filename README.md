@@ -128,6 +128,20 @@ selected one's packets are decoded, the others' are dropped unread.
 Supported audio: AAC, MP3, Opus, Vorbis, FLAC, AC-3, E-AC-3, DTS (incl.
 DTS-HD MA), Dolby TrueHD, ALAC and PCM.
 
+**Video menu** (between Audio and Subtitles), with VLC's choices and keys:
+*Aspect Ratio* sets the shape of the whole picture (Default, 16:9, 4:3,
+1:1, 16:10, 2.21:1, 2.35:1, 2.39:1, 5:4; `A` cycles), for video encoded
+at the wrong shape. *Crop* trims the picture to a shape, evenly from the
+sides or from top and bottom (16:10, 16:9, 4:3, 1.85:1, 2.21:1, 2.35:1,
+2.39:1, 5:3, 5:4, 1:1; `C` cycles): e.g. 2.35:1 removes the black bars
+of a 'scope film encoded as 16:9. Both reset to Default for each new
+video. *Take Snapshot* (`Shift+S`) saves the current frame as a PNG in
+your Pictures folder (Windows: the shell's Pictures folder, OneDrive
+included; Linux: `XDG_PICTURES_DIR`, else `~/Pictures`), named
+`qqvideo-2026-11-04_00-22-15.png`. It's the frame as shown, cropped and
+at the chosen aspect ratio, at the video's own resolution, without the
+subtitles or controls. Existing files are never overwritten.
+
 **Resume playback.** Stop a video partway and the next time you open it, a
 "Resume from 12:34?" banner appears at the top right, just under the menu
 bar. It lasts for the first 10 seconds of playback (the countdown pauses
@@ -890,3 +904,4 @@ To actually build on Windows:
   non-open-source license.
 - [tinyfiledialogs](https://sourceforge.net/projects/tinyfiledialogs/) (zlib) -- file dialogs
 - [stb_image](https://github.com/nothings/stb) (public domain / MIT) -- window icon
+- [stb_image_write](https://github.com/nothings/stb) v1.16 (public domain / MIT) -- snapshot PNGs

@@ -85,6 +85,7 @@ if (SDL2_FOUND)
       plugins/output_sdl2/output_sdl2.cpp
       plugins/output_sdl2/file_browser.cpp
       plugins/output_sdl2/retro_style.cpp
+      plugins/output_sdl2/snapshot.cpp
       plugins/output_sdl2_audio/output_sdl2_audio.c
       third_party/imgui/imgui.cpp
       third_party/imgui/imgui_draw.cpp
@@ -150,7 +151,7 @@ if (UNIX)
   target_link_libraries(qqvideo dl)
 endif()
 if (WIN32)
-  target_link_libraries(qqvideo comdlg32 ole32 gdi32)   # gdi32: window corner region
+  target_link_libraries(qqvideo comdlg32 ole32 gdi32 shell32)   # gdi32: window corners; shell32: Pictures folder
   # GUI app: no console window pops up next to the player. Build with
   # -DLUMEN_WIN_CONSOLE=ON to get one (log output, --list).
   option(LUMEN_WIN_CONSOLE "Windows: build a console app (shows log output)" OFF)

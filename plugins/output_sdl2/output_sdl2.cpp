@@ -41,6 +41,7 @@
 #include "lumen_icons.h" /* Remix Icon subset + ICON_* macros (third_party/remixicon/) */
 #include "file_browser.h" /* built-in file picker (no zenity/kdialog needed) */
 #include "retro_style.h"  /* classic 3D-bevel look (with the patched ImGui) */
+#include "snapshot.h"     /* Video > Take Snapshot: PNG to the Pictures folder */
 #include "imgui_internal.h"  /* BeginViewportSideBar, RenderTextEllipsis: the title bar */
 
 /* App icon embedded as a PNG byte array -- used for SDL_SetWindowIcon
@@ -51,6 +52,7 @@
 #include "stb_image.h"
 #include "qqvideo_icon.h"
 #include <stdlib.h>
+#include <stdarg.h>   /* show_toast */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>   /* lroundf: volume steps */
@@ -160,7 +162,83 @@ struct lumen_output_ctx {
     struct PkgDisabledPair { char demuxer[64]; char codec_plugin[64]; };
     PkgDisabledPair pkg_disabled[32];
     int             pkg_disabled_count;
+
+    /* Video menu: aspect ratio / crop (indexes into k_aspects / k_crops,
+     * 0 = Default; reset for each new video, like VLC), snapshots, and a
+     * short notice in the corner ("Aspect ratio: 16:9", "Snapshot saved") */
+    int             aspect_idx;
+    int             crop_idx;
+    int             snapshot_requested;
+    char            toast[1300];
+    Uint64          toast_until;
 };
+
+/* ---- Video > Aspect Ratio / Crop ---------------------------------------
+ * Same choices as VLC. Aspect Ratio says what shape the whole picture is
+ * (Default: its pixels are square, i.e. width:height). Crop then trims it
+ * to the chosen shape, evenly from both sides or top and bottom -- e.g.
+ * 2.35:1 to get rid of black bars in a 16:9 encode of a 'scope film. */
+struct ratio_choice { const char *label; double r; };
+static const ratio_choice k_aspects[] = {
+    { "Default", 0 }, { "16:9", 16.0 / 9 }, { "4:3", 4.0 / 3 }, { "1:1", 1.0 }, { "16:10", 1.6 },
+    { "2.21:1", 2.21 }, { "2.35:1", 2.35 }, { "2.39:1", 2.39 }, { "5:4", 1.25 },
+};
+static const ratio_choice k_crops[] = {
+    { "Default", 0 }, { "16:10", 1.6 }, { "16:9", 16.0 / 9 }, { "4:3", 4.0 / 3 }, { "1.85:1", 1.85 },
+    { "2.21:1", 2.21 }, { "2.35:1", 2.35 }, { "2.39:1", 2.39 }, { "5:3", 5.0 / 3 }, { "5:4", 1.25 },
+    { "1:1", 1.0 },
+};
+#define LUMEN_N_ASPECTS ((int)(sizeof(k_aspects) / sizeof(k_aspects[0])))
+#define LUMEN_N_CROPS   ((int)(sizeof(k_crops) / sizeof(k_crops[0])))
+
+/* The part of the decoded picture to show (src, in pixels) and the shape
+ * to show it at (*aspect, width / height). */
+static void video_geometry(const lumen_output_ctx_t *ctx, SDL_Rect *src, double *aspect) {
+    const int w = ctx->width, h = ctx->height;
+    *src = { 0, 0, w, h };
+    const double ar = k_aspects[ctx->aspect_idx].r;
+    const double dar = ar > 0 ? ar : (double)w / (double)h;     /* the whole picture's shape */
+    const double cr = k_crops[ctx->crop_idx].r;
+    *aspect = dar;
+    if (cr <= 0) return;
+    if (dar > cr * 1.001) {               /* wider than the crop: trim the sides */
+        int cw = (int)lround(w * cr / dar) & ~1;
+        if (cw < 2) cw = 2;
+        src->x = ((w - cw) / 2) & ~1;
+        src->w = cw;
+    } else if (dar < cr / 1.001) {        /* taller: trim top and bottom */
+        int ch = (int)lround(h * dar / cr) & ~1;
+        if (ch < 2) ch = 2;
+        src->y = ((h - ch) / 2) & ~1;
+        src->h = ch;
+    }
+    *aspect = cr;
+}
+
+/* A notice in the top-left corner for a few seconds. */
+static void show_toast(lumen_output_ctx_t *ctx, int ms, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ctx->toast, sizeof(ctx->toast), fmt, ap);
+    va_end(ap);
+    ctx->toast_until = SDL_GetTicks64() + (Uint64)ms;
+}
+
+static void set_aspect(lumen_output_ctx_t *ctx, int idx) {
+    ctx->aspect_idx = ((idx % LUMEN_N_ASPECTS) + LUMEN_N_ASPECTS) % LUMEN_N_ASPECTS;
+    show_toast(ctx, 2000, "Aspect ratio: %s", k_aspects[ctx->aspect_idx].label);
+}
+
+static void set_crop(lumen_output_ctx_t *ctx, int idx) {
+    ctx->crop_idx = ((idx % LUMEN_N_CROPS) + LUMEN_N_CROPS) % LUMEN_N_CROPS;
+    show_toast(ctx, 2000, "Crop: %s", k_crops[ctx->crop_idx].label);
+}
+
+/* Video > Take Snapshot: done at the next redraw, which has the frame. */
+static void request_snapshot(lumen_output_ctx_t *ctx) {
+    if (ctx->state && ctx->state->has_file && ctx->have_frame && ctx->texture) ctx->snapshot_requested = 1;
+    else show_toast(ctx, 2000, "No video to take a snapshot of");
+}
 
 /* Background thread for any file-picker dialog (Add to Queue or Open File).
  * Runs independently of the decode/render loop. The purpose field in ctx
@@ -765,6 +843,18 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 !ImGui::GetIO().WantCaptureKeyboard &&
                 ctx->state && ctx->state->has_file) {
                 ctx->state->paused = !ctx->state->paused;
+            }
+            /* VLC's keys: A cycles the aspect ratio, C the crop, Shift+S
+             * takes a snapshot. (Plain keys only: Ctrl+C etc. stay free.) */
+            {
+                const Uint16 mods = e.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI | KMOD_SHIFT);
+                const bool free_key = !ImGui::GetIO().WantCaptureKeyboard && ctx->state && ctx->state->has_file &&
+                                      !e.key.repeat;
+                if (free_key && mods == 0 && e.key.keysym.scancode == SDL_SCANCODE_A) set_aspect(ctx, ctx->aspect_idx + 1);
+                if (free_key && mods == 0 && e.key.keysym.scancode == SDL_SCANCODE_C) set_crop(ctx, ctx->crop_idx + 1);
+                if (free_key && (mods & KMOD_SHIFT) && !(mods & ~KMOD_SHIFT) &&
+                    e.key.keysym.scancode == SDL_SCANCODE_S)
+                    request_snapshot(ctx);
             }
         }
     }
@@ -1549,6 +1639,35 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Video")) {
+            const bool has_video = state->has_file && ctx->texture;
+            if (ImGui::MenuItem("Fullscreen", "F", ctx->fullscreen != 0)) toggle_fullscreen(ctx);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Aspect Ratio", has_video)) {
+                for (int i = 0; i < LUMEN_N_ASPECTS; i++) {
+                    char item[64];
+                    snprintf(item, sizeof(item), "%s##ar%d", k_aspects[i].label, i);
+                    if (ImGui::MenuItem(item, NULL, ctx->aspect_idx == i)) set_aspect(ctx, i);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Press A to cycle");
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Crop", has_video)) {
+                for (int i = 0; i < LUMEN_N_CROPS; i++) {
+                    char item[64];
+                    snprintf(item, sizeof(item), "%s##crop%d", k_crops[i].label, i);
+                    if (ImGui::MenuItem(item, NULL, ctx->crop_idx == i)) set_crop(ctx, i);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Press C to cycle");
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Take Snapshot", "Shift+S", false, has_video && ctx->have_frame)) request_snapshot(ctx);
+            if (!has_video) ImGui::SetItemTooltip("Open a video first");
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Subtitles")) {
             bool has_file = state->has_file != 0;
             if (ImGui::MenuItem("Add Subtitle Track...", NULL, false, has_file && !dialog_open)) {
@@ -2187,7 +2306,9 @@ static bool video_dest_rect(lumen_output_ctx_t *ctx, int win_w, int win_h,
         dest->x = 0; dest->y = area_y; dest->w = win_w; dest->h = area_h;
         return true;
     }
-    double video_aspect = (double)ctx->width / (double)ctx->height;
+    SDL_Rect src;
+    double video_aspect;                  /* Video > Aspect Ratio / Crop */
+    video_geometry(ctx, &src, &video_aspect);
     double area_aspect  = (double)win_w / (double)area_h;
     if (area_aspect > video_aspect) {
         dest->h = area_h;
@@ -2267,6 +2388,73 @@ static void draw_subtitles(lumen_output_ctx_t *ctx, const SDL_Rect &v, int win_h
     }
 }
 
+/* Video > Take Snapshot: draw the current frame -- cropped and at its
+ * chosen aspect ratio, like on screen, but at the video's own resolution
+ * rather than the window's -- into an offscreen texture, read it back and
+ * hand it to snapshot.cpp to save as a PNG on a background thread. */
+static void take_snapshot(lumen_output_ctx_t *ctx) {
+    SDL_Rect src;
+    double aspect;
+    video_geometry(ctx, &src, &aspect);
+    int out_h = src.h;
+    int out_w = (int)lround(src.h * aspect) & ~1;
+    SDL_RendererInfo ri;
+    if (SDL_GetRendererInfo(ctx->renderer, &ri) == 0) {   /* stay within the GPU's texture limit */
+        const int mw = ri.max_texture_width, mh = ri.max_texture_height;
+        if (mw > 0 && out_w > mw) { out_h = (int)((long long)out_h * mw / out_w); out_w = mw; }
+        if (mh > 0 && out_h > mh) { out_w = (int)((long long)out_w * mh / out_h); out_h = mh; }
+    }
+    if (out_w < 2 || out_h < 2) { show_toast(ctx, 4000, "Couldn't take a snapshot (no picture)"); return; }
+
+    unsigned char *rgb = (unsigned char *)malloc((size_t)out_w * out_h * 3);
+    SDL_Texture *tgt = rgb ? SDL_CreateTexture(ctx->renderer, SDL_PIXELFORMAT_ARGB8888,
+                                               SDL_TEXTUREACCESS_TARGET, out_w, out_h) : NULL;
+    bool ok = false;
+    if (tgt && SDL_SetRenderTarget(ctx->renderer, tgt) == 0) {
+        SDL_SetRenderDrawColor(ctx->renderer, 0, 0, 0, 255);
+        SDL_RenderClear(ctx->renderer);
+        ok = SDL_RenderCopy(ctx->renderer, ctx->texture, &src, NULL) == 0 &&
+             SDL_RenderReadPixels(ctx->renderer, NULL, SDL_PIXELFORMAT_RGB24, rgb, out_w * 3) == 0;
+        SDL_SetRenderTarget(ctx->renderer, NULL);
+    }
+    if (!ok) {
+        show_toast(ctx, 4000, "Couldn't take a snapshot (%s)", SDL_GetError());
+        free(rgb);
+    } else {
+        char err[256];
+        if (lumen_snapshot_save(rgb, out_w, out_h, err, sizeof(err)) != 0)   /* takes rgb */
+            show_toast(ctx, 4000, "Couldn't save the snapshot: %s", err);
+        else
+            show_toast(ctx, 10000, "Saving snapshot...");
+    }
+    if (tgt) SDL_DestroyTexture(tgt);
+}
+
+/* The corner notice: aspect ratio / crop changes, snapshots. */
+static void draw_toast(lumen_output_ctx_t *ctx, float top) {
+    int ok;
+    char msg[sizeof(ctx->toast) - 64];
+    if (lumen_snapshot_poll(&ok, msg, sizeof(msg))) {
+        if (ok) show_toast(ctx, 4000, "Snapshot saved: %s", msg);
+        else    show_toast(ctx, 6000, "Couldn't save the snapshot: %s", msg);
+    }
+    if (!ctx->toast[0] || SDL_GetTicks64() >= ctx->toast_until) return;
+    int win_w, win_h;
+    SDL_GetWindowSize(ctx->window, &win_w, &win_h);
+    ImGui::SetNextWindowPos(ImVec2(8.0f, floorf(top + 8.0f)), ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2((float)win_w - 16.0f, FLT_MAX));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 5.0f));
+    ImGui::Begin("##qq_toast", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
+                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImGui::PushTextWrapPos((float)win_w - 32.0f);
+    ImGui::TextUnformatted(ctx->toast);
+    ImGui::PopTextWrapPos();
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 /* Redraw the window (UI + current video frame), at most ~60 times a
  * second. `new_frame`: a video frame was just uploaded -- draw it NOW,
  * whatever the rate limit says. Otherwise it would wait for the next
@@ -2335,6 +2523,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
     /* "Resume from 12:34?" banner, under the menu bar (or at the very top
      * in fullscreen, where the menu bar is hidden). */
     draw_resume_banner(ctx, show_menu ? menu_h : 0.0f);
+    draw_toast(ctx, show_menu ? menu_h : 0.0f);         /* "Crop: 16:9", "Snapshot saved" */
 
     /* Built-in file browser (modal over everything else). */
     if (lumen_fb_is_open(ctx->fb)) {
@@ -2435,6 +2624,11 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
         }
     }
 
+    if (ctx->snapshot_requested) {            /* before drawing: it borrows the renderer */
+        ctx->snapshot_requested = 0;
+        if (ctx->texture && ctx->have_frame) take_snapshot(ctx);
+    }
+
     SDL_SetRenderDrawColor(ctx->renderer, 0, 0, 0, 255);
     SDL_RenderClear(ctx->renderer);
 
@@ -2445,7 +2639,10 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
             SDL_SetTextureScaleMode(ctx->texture, smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
             ctx->applied_scale_smooth = smooth;
         }
-        SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dest);
+        SDL_Rect src;
+        double aspect;
+        video_geometry(ctx, &src, &aspect);
+        SDL_RenderCopy(ctx->renderer, ctx->texture, &src, &dest);
         ctx->frame_undrawn = 0;
     }
 
@@ -2623,6 +2820,9 @@ static int sdl2_load_stream(lumen_output_ctx_t *ctx, int width, int height, int 
     }
     ctx->width = width;
     ctx->have_frame = 0;
+    ctx->aspect_idx = 0;                  /* Video > Aspect Ratio / Crop: per video, like VLC */
+    ctx->crop_idx = 0;
+    ctx->snapshot_requested = 0;
     ctx->applied_scale_smooth = -1;       /* new texture: re-apply the scale mode */
     ctx->height = height;
 
@@ -2833,6 +3033,7 @@ static int sdl2_present(lumen_output_ctx_t *ctx, const lumen_frame_t *frame) {
 
 static void sdl2_close(lumen_output_ctx_t *ctx) {
     if (!ctx) return;
+    lumen_snapshot_wait(5000);            /* let a snapshot being saved finish */
     printf("  [sdl2-video] closed -- %ld frames rendered, %ld dropped (too stale to bother), "
            "%ld replaced before reaching the screen\n",
            ctx->frames_rendered, ctx->frames_dropped, ctx->frames_unseen);

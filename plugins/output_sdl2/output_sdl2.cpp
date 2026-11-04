@@ -1768,6 +1768,46 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Video")) {
+            const bool has_video = state->has_file && ctx->texture;
+            if (ImGui::MenuItem("Fullscreen", "F", ctx->fullscreen != 0)) toggle_fullscreen(ctx);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Aspect Ratio", has_video)) {
+                for (int i = 0; i < LUMEN_N_ASPECTS; i++) {
+                    char item[64];
+                    snprintf(item, sizeof(item), "%s##ar%d", k_aspects[i].label, i);
+                    if (ImGui::MenuItem(item, NULL, ctx->aspect_idx == i)) set_aspect(ctx, i);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Press A to cycle");
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Crop", has_video)) {
+                for (int i = 0; i < LUMEN_N_CROPS; i++) {
+                    char item[64];
+                    snprintf(item, sizeof(item), "%s##crop%d", k_crops[i].label, i);
+                    if (ImGui::MenuItem(item, NULL, ctx->crop_idx == i)) set_crop(ctx, i);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Press C to cycle");
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Take Snapshot", "Shift+S", false, has_video && ctx->have_frame)) request_snapshot(ctx);
+            {
+                const int len = state->pref_clip_seconds > 0 ? state->pref_clip_seconds : 15;
+                char back[64], fwd[64];
+                snprintf(back, sizeof(back), "Clip Back %d s##clipb", len);
+                snprintf(fwd, sizeof(fwd), "Clip Forward %d s##clipf", len);
+                const bool can = state->has_file && !state->clip_busy;
+                if (ImGui::MenuItem(back, "Shift+Left", false, can)) request_clip(ctx, true);
+                ImGui::SetItemTooltip("Save the %d s before the current position as a new video", len);
+                if (ImGui::MenuItem(fwd, "Shift+Right", false, can)) request_clip(ctx, false);
+                ImGui::SetItemTooltip("Save %d s from the current position as a new video", len);
+            }
+            if (!has_video) ImGui::SetItemTooltip("Open a video first");
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Audio")) {
             bool has_file = state->has_file != 0;
             /* Audio Track: every audio stream in the file; exactly one plays. */
@@ -1810,46 +1850,6 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
                 }
                 ImGui::EndMenu();
             }
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Video")) {
-            const bool has_video = state->has_file && ctx->texture;
-            if (ImGui::MenuItem("Fullscreen", "F", ctx->fullscreen != 0)) toggle_fullscreen(ctx);
-            ImGui::Separator();
-            if (ImGui::BeginMenu("Aspect Ratio", has_video)) {
-                for (int i = 0; i < LUMEN_N_ASPECTS; i++) {
-                    char item[64];
-                    snprintf(item, sizeof(item), "%s##ar%d", k_aspects[i].label, i);
-                    if (ImGui::MenuItem(item, NULL, ctx->aspect_idx == i)) set_aspect(ctx, i);
-                }
-                ImGui::Separator();
-                ImGui::TextDisabled("Press A to cycle");
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("Crop", has_video)) {
-                for (int i = 0; i < LUMEN_N_CROPS; i++) {
-                    char item[64];
-                    snprintf(item, sizeof(item), "%s##crop%d", k_crops[i].label, i);
-                    if (ImGui::MenuItem(item, NULL, ctx->crop_idx == i)) set_crop(ctx, i);
-                }
-                ImGui::Separator();
-                ImGui::TextDisabled("Press C to cycle");
-                ImGui::EndMenu();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Take Snapshot", "Shift+S", false, has_video && ctx->have_frame)) request_snapshot(ctx);
-            {
-                const int len = state->pref_clip_seconds > 0 ? state->pref_clip_seconds : 15;
-                char back[64], fwd[64];
-                snprintf(back, sizeof(back), "Clip Back %d s##clipb", len);
-                snprintf(fwd, sizeof(fwd), "Clip Forward %d s##clipf", len);
-                const bool can = state->has_file && !state->clip_busy;
-                if (ImGui::MenuItem(back, "Shift+Left", false, can)) request_clip(ctx, true);
-                ImGui::SetItemTooltip("Save the %d s before the current position as a new video", len);
-                if (ImGui::MenuItem(fwd, "Shift+Right", false, can)) request_clip(ctx, false);
-                ImGui::SetItemTooltip("Save %d s from the current position as a new video", len);
-            }
-            if (!has_video) ImGui::SetItemTooltip("Open a video first");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Subtitles")) {

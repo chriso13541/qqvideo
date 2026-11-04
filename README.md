@@ -119,7 +119,7 @@ styling tags are stripped and text is drawn outlined at the bottom of the
 picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
 VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
 
-**Audio menu** (between File and Subtitles): *Audio Track* lists every
+**Audio menu** (between Video and Subtitles): *Audio Track* lists every
 audio stream -- language, title, channels, codec -- and switches live
 (resuming from the current position; `B` cycles tracks); *Audio Device*
 moves the sound to another output immediately. Preferences > Audio can
@@ -152,7 +152,7 @@ top-left corner of the picture that fades in and out, like a TV's.
 the rest of the scale follows (50% = 0.65x). Peaks that the boost would
 push past full scale are rounded off smoothly instead of clipping.
 
-**Video menu** (between Audio and Subtitles), with VLC's choices and keys:
+**Video menu** (between File and Audio), with VLC's choices and keys:
 *Aspect Ratio* sets the shape of the whole picture (Default, 16:9, 4:3,
 1:1, 16:10, 2.21:1, 2.35:1, 2.39:1, 5:4; `A` cycles), for video encoded
 at the wrong shape. *Crop* trims the picture to a shape, evenly from the

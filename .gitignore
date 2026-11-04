@@ -84,3 +84,7 @@ Thumbs.db:encryptable
 desktop.ini
 ehthumbs.db
 $RECYCLE.BIN/
+
+# Python bytecode (tools/*.py)
+__pycache__/
+*.pyc

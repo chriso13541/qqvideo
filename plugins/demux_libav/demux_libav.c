@@ -20,6 +20,8 @@
  *                       name the system libavcodec has for each (e.g.
  *                       AV1 -> "libdav1d,libaom-av1,av1").
  *   format_whitelist -- only the container formats this plugin claims.
+ *   protocol_whitelist -- "file" only: nothing is fetched from the network
+ *                       or read through pipe:/concat:/subfile: tricks.
  */
 #include "../../include/lumen_plugin.h"
 #include "../common/libav_common.h"
@@ -138,6 +140,12 @@ static int libav_open_ex(lumen_demuxer_ctx_t **out_ctx, const char *path,
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "codec_whitelist", codec_wl, 0);
     av_dict_set(&opts, "format_whitelist", FORMAT_WHITELIST, 0);
+    /* Local files only. Without this, libavformat treats a "path" that
+     * looks like a URL as one -- "http://", "tcp:", "pipe:", "concat:",
+     * "subfile," -- and the formats it reads can name further inputs,
+     * so a file could make the player open network connections or read
+     * other local files. Nothing qqvideo opens is meant to be a URL. */
+    av_dict_set(&opts, "protocol_whitelist", "file", 0);
 
     AVFormatContext *fmt_ctx = NULL;
     int rc = avformat_open_input(&fmt_ctx, path, NULL, &opts);

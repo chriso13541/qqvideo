@@ -58,6 +58,13 @@ static int parse_manifest_into(const char *manifest_path, const char *plugin_dir
 
     const char *lib = mj_get_string(root, "library", NULL);
     if (!lib) { mj_free(root); return -1; }
+    /* A bare name only: "../../somewhere/evil" or an absolute path would
+     * make the registry load a library from outside the plugin folder. */
+    if (!lib[0] || strchr(lib, '/') || strchr(lib, '\\') || strstr(lib, "..") || strchr(lib, ':')) {
+        fprintf(stderr, "lumen: ignoring %s: \"library\" must be a bare name\n", manifest_path);
+        mj_free(root);
+        return -1;
+    }
     /* `lib` in the manifest is a bare base name (e.g. "demux_synthetic"),
      * NOT a filename with extension. The actual filename is platform-
      * specific (libdemux_synthetic.so on Linux/macOS,

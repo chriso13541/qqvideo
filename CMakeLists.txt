@@ -105,6 +105,10 @@ if (WIN32)
   # the qqvideo icon rather than the generic application icon.
   enable_language(RC)
   set(WIN_RC resources/qqvideo.rc)
+  # CMake doesn't see the .ico the .rc pulls in: without this, a new icon
+  # (tools/gen_app_icon.py) wouldn't make the resource rebuild.
+  set_source_files_properties(resources/qqvideo.rc PROPERTIES
+      OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/resources/qqvideo.ico")
 else()
   set(WIN_RC "")
 endif()
@@ -196,7 +200,7 @@ if (LUMEN_SYSTEM_FFMPEG)
   #   <prefix>/bin/qqvideo
   #   <prefix>/<libdir>/qqvideo/plugins/   decoder_libav, demux_libav + manifests
   #   <prefix>/share/applications/qqvideo.desktop
-  #   <prefix>/share/icons/hicolor/64x64/apps/qqvideo.png
+  #   <prefix>/share/icons/hicolor/<N>x<N>/apps/qqvideo.png   (16 ... 256)
   # Default prefix is /usr/local, which app launchers already search.
   if (UNIX)
     set(_lumen_plugin_install_dir "${CMAKE_INSTALL_LIBDIR}/qqvideo/plugins")
@@ -216,9 +220,12 @@ if (LUMEN_SYSTEM_FFMPEG)
     endforeach()
     install(FILES resources/qqvideo.desktop
             DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
-    install(FILES resources/qqvideo_64.png
-            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/64x64/apps"
-            RENAME qqvideo.png)
+    # The app icon at every size desktops ask for (tools/gen_app_icon.py).
+    foreach(_sz 16 24 32 48 64 128 256)
+      install(FILES resources/icons/qqvideo-${_sz}.png
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/${_sz}x${_sz}/apps"
+              RENAME qqvideo.png)
+    endforeach()
 
     # Refresh launcher + icon caches so qqvideo shows up immediately.
     # Skipped for staged installs (DESTDIR), e.g. when building a .deb.

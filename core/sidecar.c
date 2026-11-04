@@ -147,13 +147,24 @@ static int cand_cmp(const void *a, const void *b) {
 
 /* ---- labels ----------------------------------------------------------- */
 
+/* What follows the movie name in a (possibly truncated) copy of a subtitle
+ * file name. `buf` may be shorter than the real name -- file names can be
+ * 255 bytes and the copies are 128 -- so never step past its end: a long
+ * movie name used to make `buf + strlen(stem)` point outside the buffer
+ * (found with AddressSanitizer: 150-character names overran the stack). */
+static const char *after_stem(const char *buf, const char *file_name, const char *stem) {
+    if (!stem || !name_matches(file_name, stem)) return buf;
+    size_t sl = strlen(stem), bl = strlen(buf);
+    return sl < bl ? buf + sl : buf + bl;          /* "" when the stem filled the copy */
+}
+
 const char *lumen_sidecar_language(const char *file_name, const char *stem) {
-    char tmp[128];
+    char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s", file_name);
     char *dot = strrchr(tmp, '.');
     if (dot) *dot = '\0';
-    const char *rest = (stem && name_matches(file_name, stem)) ? tmp + strlen(stem) : tmp;
-    char buf[128];
+    const char *rest = after_stem(tmp, file_name, stem);
+    char buf[256];
     snprintf(buf, sizeof(buf), "%s", rest);
     const char *lang = NULL;
     for (char *tok = strtok(buf, "._- []()"); tok && !lang; tok = strtok(NULL, "._- []()")) {
@@ -164,7 +175,7 @@ const char *lumen_sidecar_language(const char *file_name, const char *stem) {
 }
 
 void lumen_sidecar_label(const char *file_name, const char *stem, char *out, size_t n) {
-    char base[128];
+    char base[256];
     snprintf(base, sizeof(base), "%s", file_name);
     char *dot = strrchr(base, '.');
     char fmt[8] = "SUB";
@@ -175,12 +186,11 @@ void lumen_sidecar_label(const char *file_name, const char *stem, char *out, siz
     }
     /* Only look at what follows the movie name: "Movie.2019.en" must not
      * read "2019" or words from the title as a language. */
-    const char *rest = base;
-    if (stem && name_matches(file_name, stem)) rest = base + strlen(stem);
+    const char *rest = after_stem(base, file_name, stem);
 
     const char *lang = NULL;
     int sdh = 0, forced = 0;
-    char tmp[128];
+    char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s", rest);
     for (char *tok = strtok(tmp, "._- []()"); tok; tok = strtok(NULL, "._- []()")) {
         if (!strcasecmp(tok, "forced")) { forced = 1; continue; }

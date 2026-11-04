@@ -369,6 +369,13 @@ static void push_pkg_entries_system(lumen_session_t *session, const lumen_regist
 #endif /* LUMEN_SYSTEM_FFMPEG */
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    /* Take the current directory out of the DLL search path for anything
+     * loaded from here on (plugins, SDL's runtime loads): when qqvideo is
+     * started by opening a video from a folder like Downloads, that folder
+     * is the current directory, and a DLL planted there must not load. */
+    SetDllDirectoryA("");
+#endif
     char exe_dir[1024];
     char auto_packages_dir[1100];
     get_exe_dir(exe_dir, sizeof(exe_dir));

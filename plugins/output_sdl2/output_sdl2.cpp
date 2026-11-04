@@ -82,6 +82,9 @@ struct lumen_output_ctx {
     int           was_paused;      /* detects the pause->resume transition, not just current state */
     Uint64        pause_started_ticks;
     Uint64        last_mouse_move_ticks; /* for fullscreen auto-hide (3s timeout) */
+    int           resume_serial_seen;    /* last resume offer the banner started a timer for */
+    Uint64        resume_last_tick;      /* banner countdown: time of the previous frame ... */
+    Uint64        resume_elapsed_ms;     /* ... and playing (unpaused) time it's been shown */
     int           controls_visible;      /* 1 = draw chrome/cursor; 0 = hidden (fullscreen idle) */
     int           last_queue_pos;        /* (unused since the title compares text; kept for layout) */
     char          last_title[512];       /* window title currently set */
@@ -579,6 +582,14 @@ static void prefs_page_general(lumen_output_ctx_t *ctx, lumen_playback_state_t *
 }
 
 static void prefs_page_playback(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
+    ImGui::SeparatorText("Resume");
+    pref_check("Offer to resume unfinished videos", &st->pref_resume, st);
+    pref_note("Remembers where you stopped in videos longer than 2 minutes, and offers to "
+              "continue from there for the first 10 seconds the next time you open one. "
+              "Watching to the end forgets it. Off: nothing new is recorded.");
+    if (ImGui::Button("Forget all saved positions")) st->resume_clear_requested = 1;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Deletes resume.txt from the config folder");
+
     ImGui::SeparatorText("Seeking");
     pref_check("Precise seeking", &st->precise_seek, st);
     pref_note("Seeks land on the exact time you pick. Off: jump to the nearest "
@@ -1569,6 +1580,69 @@ static void draw_volume_bar(lumen_output_ctx_t *ctx, float width) {
         ImGui::SetTooltip(state->muted ? "Volume %d%% (muted)" : "Volume %d%%", (int)lroundf(state->volume * 100.0f));
 }
 
+/* "Resume from 12:34?" -- top right, just under the menu bar, out of the
+ * picture's way. Shown for the first 10 seconds of playback (the countdown
+ * pauses with the video), with Resume and a close button; the strip along
+ * the bottom shows the time left. The core sets resume_offer_ms when it
+ * opens a file it has a saved position for (core/resume.h). */
+#define LUMEN_RESUME_OFFER_MS 10000
+static void draw_resume_banner(lumen_output_ctx_t *ctx, float top) {
+    lumen_playback_state_t *st = ctx->state;
+    if (!st) return;
+    Uint64 now = SDL_GetTicks64();
+    if (st->resume_offer_serial != ctx->resume_serial_seen) {     /* a new offer: restart */
+        ctx->resume_serial_seen = st->resume_offer_serial;
+        ctx->resume_elapsed_ms = 0;
+        ctx->resume_last_tick = now;
+    }
+    if (!st->has_file || st->resume_offer_ms <= 0) return;
+    if (!st->paused) ctx->resume_elapsed_ms += now - ctx->resume_last_tick;
+    ctx->resume_last_tick = now;
+    if (ctx->resume_elapsed_ms >= LUMEN_RESUME_OFFER_MS) { st->resume_offer_ms = 0; return; }
+
+    int win_w, win_h;
+    SDL_GetWindowSize(ctx->window, &win_w, &win_h);
+    const float margin = 8.0f;
+    ImGui::SetNextWindowPos(ImVec2(floorf((float)win_w - margin), floorf(top + margin)), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    ImGuiWindowFlags wf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
+    ImGui::Begin("##resume_offer", NULL, wf);
+
+    char when[16];
+    format_ms(st->resume_offer_ms, when, sizeof(when));
+    ImVec2 row_start = ImGui::GetCursorScreenPos();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Resume from %s?", when);
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_PLAY " Resume##resume_go")) {
+        st->seek_target_ms = st->resume_offer_ms;
+        st->seek_flags = LUMEN_SEEK_BACKWARD;
+        st->seek_requested = 1;
+        st->resume_offer_ms = 0;
+    }
+    ImGui::SameLine();
+    const float x_sz = ImGui::GetFrameHeight();
+    if (ImGui::Button("\xC3\x97##resume_x", ImVec2(x_sz, x_sz)))   /* U+00D7 multiplication sign */
+        st->resume_offer_ms = 0;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Dismiss -- keep playing from the start");
+
+    /* countdown strip, the width of the row, shrinking from the right */
+    const float row_w = ImGui::GetItemRectMax().x - row_start.x;
+    const float left = 1.0f - (float)ctx->resume_elapsed_ms / (float)LUMEN_RESUME_OFFER_MS;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    p.x = floorf(p.x); p.y = floorf(p.y);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + row_w, p.y + 3), IM_COL32(190, 190, 190, 255));
+    dl->AddRectFilled(p, ImVec2(p.x + floorf(row_w * left), p.y + 3), IM_COL32(52, 120, 230, 255));
+    ImGui::Dummy(ImVec2(row_w, 3));
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 static void draw_controls(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *state = ctx->state;
     if (!state) return;
@@ -1845,6 +1919,10 @@ static void maybe_redraw(lumen_output_ctx_t *ctx) {
     if (show_menu)     draw_menu_bar(ctx);
     if (show_controls) draw_queue_panel(ctx);
     if (show_controls) draw_controls(ctx);
+
+    /* "Resume from 12:34?" banner, under the menu bar (or at the very top
+     * in fullscreen, where the menu bar is hidden). */
+    draw_resume_banner(ctx, show_menu ? menu_h : 0.0f);
 
     /* Built-in file browser (modal over everything else). */
     if (lumen_fb_is_open(ctx->fb)) {

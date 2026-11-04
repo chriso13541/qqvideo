@@ -4,6 +4,7 @@
 #include "sidecar.h"
 #include "prefs.h"
 #include "instance.h"
+#include "resume.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -340,6 +341,10 @@ lumen_idle_result_t lumen_session_idle(lumen_session_t *session) {
             session->state.prefs_dirty = 0;
             lumen_prefs_save(&session->state);
         }
+        if (session->state.resume_clear_requested) {
+            session->state.resume_clear_requested = 0;
+            lumen_resume_clear();
+        }
         if (session->have_vout && session->vout->pump_ui &&
             session->vout->pump_ui(session->vout_ctx, &session->state)) {
             return LUMEN_IDLE_QUIT; /* window closed / ESC */
@@ -417,6 +422,10 @@ static int pump_and_check(lumen_session_t *session, const lumen_audio_output_vta
         state->prefs_dirty = 0;
         if (lumen_prefs_save(state) != 0)
             fprintf(stderr, "lumen: couldn't save preferences to %s\n", state->prefs_path);
+    }
+    if (state->resume_clear_requested) {        /* Preferences > Playback > Forget */
+        state->resume_clear_requested = 0;
+        lumen_resume_clear();
     }
     if (session->have_vout && session->vout->pump_ui &&
         session->vout->pump_ui(session->vout_ctx, state)) {
@@ -1038,6 +1047,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     state->position_ms = 0;
     state->duration_ms = 0;
     state->has_file = 0;
+    state->resume_offer_ms = 0;
     reset_subtitle_state(state);   /* None is the default for every new file */
 
     const lumen_registry_entry_t *demux_entry = lumen_registry_find_demuxer_by_ext(reg, file_ext(path));
@@ -1080,6 +1090,18 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     state->has_file = 1;
     state->duration_ms = (int64_t)(table.duration_sec * 1000.0);
     printf("lumen: demuxer found %d stream(s), duration=%.1fs\n", table.stream_count, table.duration_sec);
+
+    /* Played this one before and stopped partway? Offer to continue: the
+     * UI shows "Resume from 12:34?" for the first 10 s (core/resume.h). */
+    {
+        int64_t saved = 0;
+        if (state->pref_resume && lumen_resume_lookup(path, &saved) &&
+            saved > 0 && saved < state->duration_ms) {
+            state->resume_offer_ms = saved;
+            state->resume_offer_serial++;
+            printf("lumen: stopped at %lld ms last time -- offering to resume\n", (long long)saved);
+        }
+    }
 
     /* Preferences > Video > Decoding threads. decoder_libav reads this at
      * open time (the plugin ABI has no settings channel), so set it before
@@ -1357,12 +1379,21 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     int64_t wall_anchor = 0;      /* wall-clock pacing: frame pts p is due at wall_anchor + p */
     int wall_anchor_valid = 0;
 
+    int64_t resume_next_save = now_ms() + 30000;
+
     while (!stop_requested) {
         /* Pumping the session's video output EVERY iteration keeps the SDL
          * event loop alive even when this file has no decodable video. */
         if (pump_and_check(session, aout, state, out_stats)) {
             stop_requested = 1;
             break;
+        }
+
+        /* Save the resume position every 30 s too, not only on close, so a
+         * crash or power cut doesn't lose it. */
+        if (state->pref_resume && now_ms() >= resume_next_save) {
+            lumen_resume_update(path, state->position_ms, state->duration_ms);
+            resume_next_save = now_ms() + 30000;
         }
 
         /* Subtitles: load a newly added file, then publish what's on
@@ -1661,6 +1692,11 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     lumen_unload_plugin(&demux_plugin);
     for (int i = 0; i < LUMEN_MAX_SUB_TRACKS; i++) lumen_sub_track_free(&sub_tracks[i]);
     reset_subtitle_state(state);
+
+    /* Remember where this file was stopped (or forget it if finished). */
+    if (state->pref_resume)
+        lumen_resume_update(path, state->position_ms, state->duration_ms);
+    state->resume_offer_ms = 0;
 
     state->has_file = 0;     /* back to idle rendering once the caller goes there */
     state->position_ms = 0;  /* reset so seek bar and timers show 0:00 in idle */

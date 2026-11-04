@@ -461,6 +461,13 @@ typedef struct {
      * read the playback state; only the built-in output does). ---- */
     int  pref_system_dialog;     /* 1 = use the desktop's file picker (zenity/kdialog/Win32)
                                     instead of qqvideo's built-in file browser */
+
+    /* ---- Resume playback (appended; see core/resume.h) ---- */
+    int     pref_resume;            /* Preferences > Playback: offer to resume unfinished videos */
+    int     resume_offer_serial;    /* core: bumped for each new offer, so the UI restarts its timer */
+    int64_t resume_offer_ms;        /* core -> UI: >0 = offer "Resume from here?" for this file;
+                                       the UI sets it back to 0 when the offer is taken/dismissed */
+    int     resume_clear_requested; /* UI -> core: forget all saved positions */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

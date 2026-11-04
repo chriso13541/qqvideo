@@ -116,6 +116,7 @@ add_executable(qqvideo
     core/subtitles.c
     core/sidecar.c
     core/prefs.c
+    core/resume.c
     core/instance.c
     core/packages.c
     core/plugin_loader.c

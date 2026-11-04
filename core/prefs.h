@@ -14,4 +14,8 @@ void lumen_prefs_defaults(lumen_playback_state_t *st);
 void lumen_prefs_load(lumen_playback_state_t *st);     /* also fills st->prefs_path */
 int  lumen_prefs_save(const lumen_playback_state_t *st);
 
+/* qqvideo's per-user config folder (where preferences.ini lives);
+ * created if `create`. Returns 0 on success. */
+int  lumen_prefs_config_dir(char *out, size_t n, int create);
+
 #endif

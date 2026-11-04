@@ -128,6 +128,20 @@ selected one's packets are decoded, the others' are dropped unread.
 Supported audio: AAC, MP3, Opus, Vorbis, FLAC, AC-3, E-AC-3, DTS (incl.
 DTS-HD MA), Dolby TrueHD, ALAC and PCM.
 
+**Resume playback.** Stop a video partway and the next time you open it, a
+"Resume from 12:34?" banner appears at the top right, just under the menu
+bar. It lasts for the first 10 seconds of playback (the countdown pauses
+with the video), with **Resume** and a close button. Positions are kept
+in `resume.txt` next to `preferences.ini`: one line per video (position,
+length, file size, full path), the 300 most recently played. A file is
+recognized by path *and* size, so a different video saved under the same
+name isn't offered. Clips under 2 minutes aren't remembered. Positions in
+the first 30 seconds don't overwrite a saved one, so opening a file and
+closing it again keeps its spot. Watching to the end (the last 5%, at
+least the last 30 s) forgets it. The position is also saved every 30 s
+while playing, so a crash doesn't lose it. Preferences > Playback turns
+it off or forgets everything.
+
 **Single instance** (Preferences > General, Linux): with "Only one qqvideo
 window" on, launching `qqvideo file.mkv` while it's running hands the file
 to the running window (play now or add to the queue) and exits, via a

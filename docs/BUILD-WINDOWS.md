@@ -1,4 +1,79 @@
-# Building qqvideo for Windows on Linux
+# Building qqvideo for Windows
+
+Two ways, same result:
+
+- **[On Windows with MSYS2](#on-windows-with-msys2)**: the simplest if you're on
+  Windows anyway; MSYS2's packages provide SDL2 and (optionally) FFmpeg.
+- **[On Linux, cross-compiling](#on-linux-cross-compiling)**: no Windows machine
+  needed.
+
+Either way `tools/build-windows.sh` produces `dist/qqvideo-<version>-win64/` (and a
+`.zip`) that runs on any Windows PC, with every DLL it needs alongside.
+
+## On Windows with MSYS2
+
+1. Install [MSYS2](https://www.msys2.org) and open the **MSYS2 UCRT64** shell
+   (Start menu). Not the plain "MSYS2 MSYS" one, which builds for MSYS2's own
+   POSIX layer instead of Windows.
+2. Install the build tools and SDL2:
+
+   ```sh
+   pacman -S --needed git zip make diffutils \
+       mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake \
+       mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf \
+       mingw-w64-ucrt-x86_64-SDL2
+   ```
+3. Pick an FFmpeg (see below), then clone and build:
+
+   ```sh
+   git clone https://github.com/chriso13541/qqvideo && cd qqvideo
+   tools/build-windows.sh                          # with MSYS2's FFmpeg
+   tools/build-windows.sh --ffmpeg ~/ffmpeg-lgpl   # or with your own build
+   ```
+
+**Which FFmpeg?**
+
+| | MSYS2's package | Your own build |
+|---|---|---|
+| Install | `pacman -S mingw-w64-ucrt-x86_64-ffmpeg` | build it once (below) |
+| Version | whatever MSYS2 ships (9.0.2 in Nov 2026; has the PixelSmash fix) | any, e.g. 8.1.3 to match your Linux system |
+| License | **GPL-3.0**: a release bundling it must be offered under GPL-compatible terms, with source | **LGPL** (the default build) |
+| Size | large: it links x264, x265, dav1d, libvpx and dozens more, all bundled | the five FFmpeg DLLs, nothing else |
+| Updates | `pacman -Syu`, then rebuild | rebuild FFmpeg yourself |
+
+MSYS2's package is quickest for trying things out. For releases, your own
+LGPL build is smaller and keeps qqvideo's license your choice. Building it in
+MSYS2 is the same as on Linux, minus the cross-compile options:
+
+```sh
+pacman -S --needed mingw-w64-ucrt-x86_64-nasm
+git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src && cd ffmpeg-src
+./configure --prefix="$HOME/ffmpeg-lgpl" \
+    --enable-shared --disable-static --disable-programs --disable-doc --disable-debug \
+    --disable-autodetect --enable-w32threads
+make -j"$(nproc)" && make install
+```
+
+(`--disable-autodetect --enable-w32threads` keeps it from pulling in other
+MSYS2 libraries while keeping multithreaded decoding; see the Linux section
+for the reasoning.)
+
+**Quick development builds** without packaging work too:
+
+```sh
+cmake -S . -B build -G Ninja -DLUMEN_SYSTEM_FFMPEG=ON -DLUMEN_WIN_CONSOLE=ON
+cmake --build build
+./build/bin/qqvideo.exe --list
+```
+
+Run it from the UCRT64 shell: FFmpeg's DLLs are then found through PATH
+(`C:\msys64\ucrt64\bin`). qqvideo says so once per plugin: *"its DLLs were found
+through PATH"*. Double-clicking that build in Explorer won't find them; the
+packaged `dist/` folder has everything next to the `.exe` and runs anywhere.
+(The current directory is never searched for plugin DLLs, PATH fallback or
+not, so a DLL planted next to a video can't be loaded.)
+
+## On Linux, cross-compiling
 
 You cross-compile three things with MinGW-w64, all from Linux:
 
@@ -12,7 +87,7 @@ The Windows build uses the same two FFmpeg plugins as Linux
 Playback Rules. (The older per-codec `packages/` flow only has MP4,
 H.264 and AAC buildable so far.)
 
-## 1. Cross compiler
+### 1. Cross compiler
 
 **Gentoo** (crossdev):
 
@@ -36,7 +111,7 @@ library does.)
 
 **Debian/Ubuntu**: `sudo apt install mingw-w64 cmake pkg-config nasm zip curl`
 
-## 2. FFmpeg for Windows
+### 2. FFmpeg for Windows
 
 Build the **same FFmpeg release your Linux system runs**, so both builds
 have the same codec fixes. A Linux `.so` can't be linked into a Windows
@@ -100,7 +175,7 @@ existing package's `plugins/` folder, without rebuilding qqvideo. For a new
 major version (8 → 9) the DLL names change: re-run the script, which
 notices the different FFmpeg and rebuilds the plugins from scratch.
 
-## 3. qqvideo
+### 3. qqvideo
 
 ```sh
 tools/build-windows.sh --ffmpeg ~/qqvideo-win-deps/ffmpeg
@@ -118,10 +193,13 @@ licenses/              ImGui, Remix Icon, SDL2, FFmpeg, tinyfiledialogs
 BUILDINFO.txt          qqvideo commit, compiler, FFmpeg release, SDL2 version
 ```
 
-Copy the folder (or the zip) to a Windows PC and run `qqvideo.exe`. The
-script checks every DLL each binary imports. Each one must either be
-bundled or part of Windows, so a missing DLL shows up here, not on
-someone else's machine.
+Copy the folder (or the zip) to a Windows PC and run `qqvideo.exe`.
+DLLs are bundled by following imports. Starting from `qqvideo.exe` and the
+plugins, every DLL they import (and everything *those* import) is copied in:
+next to the `.exe` if the `.exe` needs it, otherwise into `plugins/`. So
+nothing unneeded is shipped (no `avfilter`, `avdevice`), and anything that
+can't be found and isn't part of Windows is reported here, not on someone
+else's machine.
 
 Options: `--console` builds a console `.exe` instead. It shows the log
 output and makes `qqvideo.exe --list` (the available codecs) work. `-j N`
@@ -137,7 +215,8 @@ CMake toolchain file (see the comment at its top).
   on real Windows before a release.
 - **Where things go on Windows:** preferences and the file browser's
   recent folders live in `%APPDATA%\qqvideo\`. Plugins load their FFmpeg
-  DLLs only from their own folder and the system folders, never from
+  DLLs from their own folder, the `.exe`'s folder and the system folders
+  (plus PATH's absolute folders as a fallback for dev builds), never from
   the current directory (see `core/plugin_loader.c`).
 - **Known gap:** some Windows code paths still use the "ANSI" file APIs,
   so paths with characters outside the system code page (e.g. a

@@ -177,9 +177,9 @@ probing; with it, libavcodec refuses (`Codec (magicyuv) not on
 whitelist`) and the stream is skipped. The upside of the trade: CVE fixes
 arrive with normal distro updates.
 
-**Windows builds** are cross-compiled from Linux with the same two
-FFmpeg plugins: `tools/build-windows.sh --ffmpeg <dir>` makes a ready-to-ship
-folder and zip. Toolchain, FFmpeg and packaging steps are in
+**Windows builds** use the same two FFmpeg plugins, built either natively
+in MSYS2 or cross-compiled from Linux: `tools/build-windows.sh` makes a
+ready-to-ship folder and zip in both cases. Toolchain, FFmpeg and packaging steps are in
 `docs/BUILD-WINDOWS.md`. (The older per-codec `packages/` flow,
 `-DLUMEN_SYSTEM_FFMPEG=OFF`, is still there; see `packages/BUILD.md`.)
 

@@ -149,5 +149,7 @@ struct ImVec2;
 void QQ_RetroRaised(ImDrawList* dl, const ImVec2& a, const ImVec2& b, unsigned int face, bool pressed);
 // Sunken well (text box, checkbox, slider track), filled with `fill`.
 void QQ_RetroSunken(ImDrawList* dl, const ImVec2& a, const ImVec2& b, unsigned int fill);
-// Title bar: blue gradient when active, gray when not.
+// Title bar (Bluecurve Grape): striped purple gradient when active, light when not.
 void QQ_RetroTitleBar(ImDrawList* dl, const ImVec2& a, const ImVec2& b, bool active);
+// Title-bar close button (Bluecurve Grape), centered on the a-b box.
+void QQ_RetroCloseButton(ImDrawList* dl, const ImVec2& a, const ImVec2& b, bool active, bool hovered, bool pressed);

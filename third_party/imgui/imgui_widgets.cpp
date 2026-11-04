@@ -867,23 +867,24 @@ bool ImGui::CloseButton(ImGuiID id, const ImVec2& pos)
         return pressed;
 
     // Render
-#ifdef IMGUI_QQ_RETRO   // qqvideo: always-visible raised [x] button with a black cross
-    QQ_RetroRaised(window->DrawList, bb.Min, bb.Max, GetColorU32(ImGuiCol_Button), held && hovered);
+#ifdef IMGUI_QQ_RETRO   // qqvideo: Bluecurve-style close button (drawn by the hook)
+    const bool qq_active = g.NavWindow && window->RootWindowForTitleBarHighlight == g.NavWindow->RootWindowForTitleBarHighlight;
+    QQ_RetroCloseButton(window->DrawList, bb.Min, bb.Max, qq_active, hovered, held && hovered);
     RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
-    ImU32 cross_col = IM_COL32_BLACK;
+    return pressed;
 #else
     ImU32 bg_col = GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered);
     if (hovered)
         window->DrawList->AddRectFilled(bb.Min, bb.Max, bg_col);
     RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
     ImU32 cross_col = GetColorU32(ImGuiCol_Text);
-#endif
     ImVec2 cross_center = bb.GetCenter() - ImVec2(0.5f, 0.5f);
     float cross_extent = g.FontSize * 0.5f * 0.7071f - 1.0f;
     window->DrawList->AddLine(cross_center + ImVec2(+cross_extent, +cross_extent), cross_center + ImVec2(-cross_extent, -cross_extent), cross_col, 1.0f);
     window->DrawList->AddLine(cross_center + ImVec2(+cross_extent, -cross_extent), cross_center + ImVec2(-cross_extent, +cross_extent), cross_col, 1.0f);
 
     return pressed;
+#endif
 }
 
 bool ImGui::CollapseButton(ImGuiID id, const ImVec2& pos)

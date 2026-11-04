@@ -6850,9 +6850,15 @@ void ImGui::RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& titl
     }
     //if (g.IO.KeyShift) window->DrawList->AddRect(layout_r.Min, layout_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
     //if (g.IO.KeyCtrl) window->DrawList->AddRect(clip_r.Min, clip_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
-#ifdef IMGUI_QQ_RETRO   // qqvideo: white title on the active (blue) bar, light gray on inactive
+#ifdef IMGUI_QQ_RETRO   // qqvideo: Bluecurve title text -- white with a drop shadow when active, gray-green when not
     const bool qq_active = g.NavWindow && window->RootWindowForTitleBarHighlight == g.NavWindow->RootWindowForTitleBarHighlight;
-    PushStyleColor(ImGuiCol_Text, qq_active ? IM_COL32_WHITE : IM_COL32(212, 208, 200, 255));
+    if (qq_active)
+    {
+        PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 150));
+        RenderTextClipped(layout_r.Min + ImVec2(1, 1), layout_r.Max + ImVec2(1, 1), name, NULL, &text_size, style.WindowTitleAlign, &clip_r);
+        PopStyleColor();
+    }
+    PushStyleColor(ImGuiCol_Text, qq_active ? IM_COL32_WHITE : IM_COL32(0x81, 0x8a, 0x7d, 255));
     RenderTextClipped(layout_r.Min, layout_r.Max, name, NULL, &text_size, style.WindowTitleAlign, &clip_r);
     PopStyleColor();
 #else

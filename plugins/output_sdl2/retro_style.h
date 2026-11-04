@@ -25,6 +25,11 @@
 #define QQ_BLACK     IM_COL32(  0,   0,   0, 255)
 #define QQ_NAVY      IM_COL32( 10,  36, 106, 255)
 
+/* Corner rounding for titled windows (Bluecurve frame). Push it as
+ * ImGuiStyleVar_WindowRounding around such a window: ImGui's rounded
+ * background then sits just inside the pixel-drawn rounded outline. */
+#define QQ_WM_ROUNDING 9.0f
+
 /* Apply colors and sizes to the CURRENT ImGui context (call once per
  * context, after ImGui::StyleColorsLight()). */
 void qq_retro_apply_style(void);

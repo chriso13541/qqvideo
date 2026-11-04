@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.13)   # target_link_options
 project(qqvideo C CXX)
 
 set(CMAKE_C_STANDARD 99)
@@ -103,6 +103,7 @@ endif()
 if (WIN32)
   # Windows resource file embeds the ICO so Explorer and the taskbar show
   # the qqvideo icon rather than the generic application icon.
+  enable_language(RC)
   set(WIN_RC resources/qqvideo.rc)
 else()
   set(WIN_RC "")
@@ -145,6 +146,18 @@ if (UNIX)
 endif()
 if (WIN32)
   target_link_libraries(qqvideo comdlg32 ole32)
+  # GUI app: no console window pops up next to the player. Build with
+  # -DLUMEN_WIN_CONSOLE=ON to get one (log output, --list).
+  option(LUMEN_WIN_CONSOLE "Windows: build a console app (shows log output)" OFF)
+  if (NOT LUMEN_WIN_CONSOLE)
+    set_target_properties(qqvideo PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
+endif()
+if (MINGW)
+  # Fold the GCC runtimes into the binaries instead of shipping
+  # libgcc_s_seh-1.dll / libstdc++-6.dll next to them.
+  set(_lumen_mingw_static -static-libgcc -static-libstdc++)
+  target_link_options(qqvideo PRIVATE ${_lumen_mingw_static})
 endif()
 
 # ---- System-FFmpeg plugins ------------------------------------------------
@@ -165,6 +178,9 @@ if (LUMEN_SYSTEM_FFMPEG)
     add_library(${_p} MODULE plugins/${_p}/${_p}.c)
     target_include_directories(${_p} PRIVATE include)
     target_link_libraries(${_p} PRIVATE PkgConfig::LIBAV)
+    if (MINGW)
+      target_link_options(${_p} PRIVATE ${_lumen_mingw_static})
+    endif()
     set_target_properties(${_p} PROPERTIES
         PREFIX "lib"
         LIBRARY_OUTPUT_DIRECTORY "${_lumen_plugin_dir}")

@@ -3,6 +3,9 @@
 # ─── Build directories ───────────────────────────────────────────────────────
 # Main build output
 build/
+build-win64/
+build-win64-deps/
+dist/
 cmake-build-*/
 
 # CMake-generated files that appear at project root

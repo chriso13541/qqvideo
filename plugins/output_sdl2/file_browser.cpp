@@ -22,8 +22,10 @@
 
 #include "imgui.h"
 #include "lumen_icons.h"
+#include "retro_style.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -455,16 +457,19 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
         /* Fill most of the window, within sensible bounds. */
         float w = std::min(760.0f, io.DisplaySize.x - 24.0f);
         float h = std::min(500.0f, io.DisplaySize.y - 24.0f);
+        w = floorf(w); h = floorf(h);
         ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        /* Centered on whole pixels: the Bluecurve frame is drawn pixel by
+         * pixel, and a window at x.5 would leave it half a pixel off from
+         * ImGui's own (anti-aliased) background. */
+        ImGui::SetNextWindowPos(ImVec2(floorf((io.DisplaySize.x - w) * 0.5f), floorf((io.DisplaySize.y - h) * 0.5f)),
+                                ImGuiCond_Always);
     }
     ImGui::SetNextWindowSizeConstraints(ImVec2(360, 260), ImVec2(io.DisplaySize.x, io.DisplaySize.y));
 
-    /* Square, bordered, like the control bar and an old common dialog. */
-    /* Square corners; the frames themselves are the retro bevels drawn by
-     * retro_style.cpp (raised dialog, sunken panes and text boxes). */
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    /* Rounded Bluecurve window frame; square widgets inside. The frames are
+     * drawn by retro_style.cpp (window frame, sunken panes and text boxes). */
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, QQ_WM_ROUNDING);   /* Bluecurve frame corners */
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 0.0f);
@@ -476,8 +481,17 @@ lumen_fb_result lumen_fb_draw(lumen_file_browser *fb, char *out, size_t out_size
     ImGui::PushStyleColor(ImGuiCol_PopupBg, face);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 1));   /* white panes, like a list view */
 
+    /* No highlight on the window edge while hovering it to resize (ImGui
+     * draws one in the separator color; Bluecurve frames don't light up).
+     * Only for Begin: popped again right after, so table column separators
+     * inside keep their hover color. */
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
+
     bool keep_open = true;
-    if (!ImGui::BeginPopupModal(popup_id.c_str(), &keep_open, ImGuiWindowFlags_NoSavedSettings)) {
+    const bool visible = ImGui::BeginPopupModal(popup_id.c_str(), &keep_open, ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleColor(2);
+    if (!visible) {
         ImGui::PopStyleVar(6);
         ImGui::PopStyleColor(2);
         if (fb->open && !fb->just_opened) {   /* closed via the title-bar X */

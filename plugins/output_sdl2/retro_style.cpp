@@ -39,11 +39,143 @@ void QQ_RetroSunken(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, unsigned i
     qq_bevel(dl, p, q, QQ_SHADOW, QQ_HILIGHT, QQ_DKSHADOW, QQ_LIGHT);
 }
 
+/* ---- window decorations: Bluecurve "Grape" ----------------------------
+ * Titled windows (the file browser) are drawn like the Bluecurve Grape
+ * window-manager theme from Red Hat Linux 8/9: a purple title bar with a
+ * fine diagonal stripe texture, white title text with a drop shadow, a
+ * rounded lavender close button, and a black outline with rounded corners
+ * around a light 4px border. Colors measured from the theme's xfwm4
+ * pixmaps; everything is drawn here, pixel by pixel. */
+
+#define HEX(c) IM_COL32(((c) >> 16) & 0xFF, ((c) >> 8) & 0xFF, (c) & 0xFF, 0xFF)
+
+/* Active title bar, top to bottom, between the top outline and the bottom
+ * line: a highlight, then a "cylinder" gradient darkest in the middle. */
+static const unsigned int GRAPE_TITLE_ACTIVE[20] = {
+    0x816ABB, 0x685B8B, 0x625587, 0x5D4F82, 0x57497E, 0x52437A, 0x504179,
+    0x4E3F77, 0x4C3D76, 0x4B3B74, 0x493974, 0x4B3B74, 0x4E3E78, 0x52437B,
+    0x56477E, 0x5B4D82, 0x615487, 0x685B8C, 0x6F6291, 0x746795,
+};
+static const unsigned int GRAPE_TITLE_INACTIVE[20] = {
+    0xD5D9E7, 0xCFD4E2, 0xC9CFDE, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA,
+    0xC3C9DA, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA, 0xC3C9DA,
+    0xC3C9DA, 0xC3C9DA, 0xC1C7D8, 0xBEC5D6, 0xBCC2D4, 0xBCC2D4,
+};
+#define GRAPE_TITLE_BOTTOM_ACTIVE   0x080808
+#define GRAPE_TITLE_BOTTOM_INACTIVE 0xADB4C9
+#define GRAPE_FRAME_BAND            0xE6E6E6   /* the 4px border inside the outline */
+
+/* Rounded corners: x of the outline pixel on the first five rows (row 0 is
+ * the horizontal edge, which starts at x = 5). Mirrored for the other
+ * corners. ImGui's own rounded window background (QQ_WM_ROUNDING) sits
+ * just inside this curve, so nothing shows outside it. */
+static const int CORNER[5] = { 5, 3, 2, 1, 1 };
+
+static inline ImU32 rgb_scale(unsigned int c, float k) {
+    return IM_COL32((int)(((c >> 16) & 0xFF) * k), (int)(((c >> 8) & 0xFF) * k), (int)((c & 0xFF) * k), 0xFF);
+}
+static inline ImU32 rgb_tint(unsigned int c, float t) {      /* mix toward white */
+    auto m = [t](int v) { return (int)(v + (255 - v) * t); };
+    return IM_COL32(m((c >> 16) & 0xFF), m((c >> 8) & 0xFF), m(c & 0xFF), 0xFF);
+}
+static inline void px(ImDrawList *dl, ImVec2 o, float x, float y, float w, float h, ImU32 c) {
+    dl->AddRectFilled(ImVec2(o.x + x, o.y + y), ImVec2(o.x + x + w, o.y + y + h), c);
+}
+
 void QQ_RetroTitleBar(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool active) {
     ImVec2 p = snap(a), q = snap(b);
-    ImU32 l = active ? QQ_NAVY : IM_COL32(128, 128, 128, 255);
-    ImU32 r = active ? IM_COL32(166, 202, 240, 255) : IM_COL32(192, 192, 192, 255);
-    dl->AddRectFilledMultiColor(p, q, l, r, r, l);   /* left-to-right gradient */
+    const int W = (int)(q.x - p.x), H = (int)(q.y - p.y);
+    const unsigned int *rows = active ? GRAPE_TITLE_ACTIVE : GRAPE_TITLE_INACTIVE;
+    if (W < 16 || H < 6) { dl->AddRectFilled(p, q, HEX(rows[10])); return; }
+    const int n = H - 2;                       /* gradient rows: 1 .. H-2 */
+    for (int y = 1; y < H; y++) {
+        const int inset = y < 5 ? CORNER[y] + 1 : 0;   /* inside the rounded corner */
+        if (y == H - 1) {                       /* bottom line under the bar */
+            px(dl, p, inset, y, W - 2 * inset, 1, HEX(active ? GRAPE_TITLE_BOTTOM_ACTIVE : GRAPE_TITLE_BOTTOM_INACTIVE));
+            continue;
+        }
+        const int i = y - 1;
+        const int idx = n > 1 ? (i * 19 + (n - 1) / 2) / (n - 1) : 0;   /* resample the 20-row table */
+        const unsigned int base = rows[idx];
+        px(dl, p, inset, y, W - 2 * inset, 1, HEX(base));
+        /* The Bluecurve stripes: every 5px a darker pixel with a lighter one
+         * beside it, shifting one pixel left per row, so they read as fine
+         * embossed diagonals. Not on the highlight rows or the last row. */
+        if (active && idx >= 2 && idx <= 18) {
+            const ImU32 dark = rgb_scale(base, 0.645f), light = rgb_tint(base, 0.275f);
+            int x0 = ((3 - y) % 5 + 5) % 5;              /* (x + y) % 5 == 3 */
+            for (int x = x0; x < W - inset; x += 5) {
+                if (x >= inset)         px(dl, p, x, y, 1, 1, dark);
+                if (x + 1 < W - inset && x + 1 >= inset) px(dl, p, x + 1, y, 1, 1, light);
+            }
+        }
+    }
+}
+
+void QQ_RetroCloseButton(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool active, bool hovered, bool pressed) {
+    /* 18x16, centered on ImGui's (smaller) close-button box. */
+    ImVec2 c = snap(ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f));
+    ImVec2 o(c.x - 9, c.y - 8);
+    unsigned int outline, hl, fill_tl, fill_br, shadow, glyph;
+    if (pressed)     { outline = 0x74769B; hl = fill_tl = fill_br = shadow = 0xB0B7C8; glyph = 0x605973; }
+    else if (active) { outline = 0x74769B; hl = 0xF7F6FB; fill_tl = 0xDED9ED; fill_br = 0xEDE9F4; shadow = 0xBEC0D4; glyph = 0x605973; }
+    else             { outline = 0xA5ADC3; hl = 0xE0E3ED; fill_tl = 0xDFE2EC; fill_br = 0xD8DCE8; shadow = 0xDBDFEA; glyph = 0x979F98; }
+    ImU32 ftl = HEX(fill_tl), fbr = HEX(fill_br);
+    if (hovered && !pressed) { ftl = rgb_tint(fill_tl, 0.45f); fbr = rgb_tint(fill_br, 0.45f); }
+    const ImU32 fmid = IM_COL32(((((fill_tl >> 16) & 0xFF) + ((fill_br >> 16) & 0xFF)) / 2),
+                                ((((fill_tl >> 8) & 0xFF) + ((fill_br >> 8) & 0xFF)) / 2),
+                                (((fill_tl & 0xFF) + (fill_br & 0xFF)) / 2), 0xFF);
+    /* face: a diagonal gradient, top-left to bottom-right */
+    dl->AddRectFilledMultiColor(ImVec2(o.x + 2, o.y + 2), ImVec2(o.x + 16, o.y + 14),
+                                ftl, hovered && !pressed ? ftl : fmid, fbr, hovered && !pressed ? fbr : fmid);
+    const ImU32 O = HEX(outline), L = HEX(hl), S = HEX(shadow);
+    px(dl, o, 2, 0, 14, 1, O);  px(dl, o, 2, 15, 14, 1, O);             /* top / bottom edge */
+    px(dl, o, 0, 2, 1, 12, O);  px(dl, o, 17, 2, 1, 12, O);             /* left / right edge */
+    px(dl, o, 1, 1, 1, 1, O);   px(dl, o, 16, 1, 1, 1, O);              /* rounded corners */
+    px(dl, o, 1, 14, 1, 1, O);  px(dl, o, 16, 14, 1, 1, O);
+    px(dl, o, 2, 1, 14, 1, L);  px(dl, o, 1, 2, 1, 12, L);              /* highlight */
+    px(dl, o, 2, 14, 14, 1, S); px(dl, o, 16, 2, 1, 12, S);             /* shadow */
+    /* bold X */
+    const ImU32 G = HEX(glyph);
+    static const struct { int x, y, w; } X[] = {
+        {6, 4, 1}, {10, 4, 1}, {5, 5, 3}, {9, 5, 3}, {6, 6, 5}, {7, 7, 3},
+        {6, 8, 5}, {5, 9, 3}, {9, 9, 3}, {6, 10, 1}, {10, 10, 1},
+    };
+    for (const auto &r : X) px(dl, o, r.x, r.y, r.w, 1, G);
+}
+
+/* Outline + 4px light band around a titled window, following the rounded
+ * corners. Drawn after the window's contents (the band sits inside
+ * WindowPadding, so it never covers any). */
+static void grape_frame(ImDrawList *dl, ImVec2 a, ImVec2 b, float title_h) {
+    ImVec2 p = snap(a), q = snap(b);
+    const int W = (int)(q.x - p.x), H = (int)(q.y - p.y), T = (int)title_h;
+    if (W < 16 || H < T + 12) return;
+    const ImU32 O = QQ_BLACK, B = HEX(GRAPE_FRAME_BAND);
+    /* light band: left/right below the title bar, bottom along the curve */
+    px(dl, p, 1, T, 4, H - 5 - T, B);
+    px(dl, p, W - 5, T, 4, H - 5 - T, B);
+    for (int k = 1; k <= 4; k++) {               /* k = rows up from the bottom edge */
+        const int in = CORNER[k] + 1;
+        px(dl, p, in, H - 1 - k, W - 2 * in, 1, B);
+    }
+    /* outline: straight edges, then the four corners */
+    px(dl, p, CORNER[0], 0, W - 2 * CORNER[0], 1, O);
+    px(dl, p, CORNER[0], H - 1, W - 2 * CORNER[0], 1, O);
+    px(dl, p, 0, 5, 1, H - 10, O);
+    px(dl, p, W - 1, 5, 1, H - 10, O);
+    for (int k = 1; k <= 4; k++) {
+        px(dl, p, CORNER[k], k, 1, 1, O);         px(dl, p, W - 1 - CORNER[k], k, 1, 1, O);
+        px(dl, p, CORNER[k], H - 1 - k, 1, 1, O); px(dl, p, W - 1 - CORNER[k], H - 1 - k, 1, 1, O);
+    }
+    /* corner runs, so the curve is closed (e.g. row 1 spans x3..x4) */
+    for (int k = 1; k <= 4; k++) {
+        const int run = CORNER[k - 1] - CORNER[k];
+        if (run > 1) {
+            px(dl, p, CORNER[k] + 1, k, run - 1, 1, O);         px(dl, p, W - CORNER[k - 1], k, run - 1, 1, O);
+            px(dl, p, CORNER[k] + 1, H - 1 - k, run - 1, 1, O); px(dl, p, W - CORNER[k - 1], H - 1 - k, run - 1, 1, O);
+        }
+    }
 }
 
 /* ---- color scheme ---------------------------------------------------- */
@@ -140,7 +272,10 @@ void qq_retro_decorate_windows(void) {
         ImDrawList *dl = w->DrawList;
         dl->PushClipRect(a, b, false);
 
-        if (f & ImGuiWindowFlags_Tooltip) {
+        if (!(f & (ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Tooltip))) {
+            /* titled windows (file browser): Bluecurve Grape frame */
+            grape_frame(dl, a, b, w->TitleBarHeight);
+        } else if (f & ImGuiWindowFlags_Tooltip) {
             /* tooltips: a plain 1px black frame, as they were */
             ImVec2 p = snap(a), q = snap(b);
             dl->AddRect(p, q, QQ_BLACK);

@@ -13,15 +13,15 @@ removing the define gives stock ImGui back.
 browser and Tools > Preferences.
 
 ## imconfig.h
-- `#define IMGUI_QQ_RETRO 1` and declarations of the three hooks:
-  `QQ_RetroRaised`, `QQ_RetroSunken`, `QQ_RetroTitleBar`.
+- `#define IMGUI_QQ_RETRO 1` and declarations of the hooks:
+  `QQ_RetroRaised`, `QQ_RetroSunken`, `QQ_RetroTitleBar`, `QQ_RetroCloseButton`.
 
 ## imgui_widgets.cpp
 | Function | Change |
 |---|---|
 | `ButtonEx` | Frame drawn with `QQ_RetroRaised`; pressed = sunken, label shifted 1px down-right. |
 | `ArrowButtonEx` | Raised frame. |
-| `CloseButton` | Always-visible raised `[x]` button with a black cross. |
+| `CloseButton` | Drawn entirely by `QQ_RetroCloseButton` (Bluecurve-style rounded lavender button; active/inactive/pressed). |
 | `Checkbox` | Box drawn with `QQ_RetroSunken`. |
 | `DragScalar` | Sunken frame. |
 | `SliderScalar` | Sunken track; grab drawn raised, full track height. |
@@ -34,10 +34,10 @@ browser and Tools > Preferences.
 ## imgui.cpp
 | Function | Change |
 |---|---|
-| `RenderWindowDecorations` | Title bar drawn with `QQ_RetroTitleBar` (navy-to-light-blue gradient when active, gray when not). |
-| `RenderWindowTitleBarContents` | Title text white when active, light gray when not. |
+| `RenderWindowDecorations` | Title bar drawn with `QQ_RetroTitleBar` (Bluecurve Grape: striped purple gradient when active, light blue-gray when not). |
+| `RenderWindowTitleBarContents` | Title text white with a drop shadow when active, gray-green when not. |
 
 Not patched (done from qqvideo's own code instead): bevel frames around
-windows, popups, menus and bordered child panes
-(`qq_retro_decorate_windows`), colors and sizes (`qq_retro_apply_style`),
+popups, menus and bordered child panes, and the rounded Bluecurve frame
+around titled windows (`qq_retro_decorate_windows`), colors and sizes (`qq_retro_apply_style`),
 and the navy menu highlight (`qq_retro_push_menu_colors`).

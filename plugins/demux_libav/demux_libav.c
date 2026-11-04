@@ -26,6 +26,7 @@
 #include "../../include/lumen_plugin.h"
 #include "../common/libav_common.h"
 #include <libavutil/intreadwrite.h>
+#include <libavcodec/bsf.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -129,18 +130,25 @@ static int64_t compute_origin_us(AVFormatContext *fmt_ctx) {
     return fmt_ctx->start_time != AV_NOPTS_VALUE ? fmt_ctx->start_time : 0;
 }
 
-static int libav_open_ex(lumen_demuxer_ctx_t **out_ctx, const char *path,
-                         lumen_stream_table_t *out_table,
-                         const char *const *allowed, int allowed_count) {
-    char codec_wl[1024] = "";
+/* libavformat's codec_whitelist for an allow-list of fourccs: every
+ * decoder name the system libavcodec has for each. */
+static void build_codec_whitelist(const char *const *allowed, int allowed_count, char *codec_wl, size_t sz) {
+    codec_wl[0] = '\0';
     for (int i = 0; i < allowed_count; i++) {
         const lumen_libav_codec_t *c = lumen_libav_by_fourcc(allowed[i]);
-        if (c) append_decoder_names(codec_wl, sizeof(codec_wl), c->id);
+        if (c) append_decoder_names(codec_wl, sz, c->id);
     }
     /* An EMPTY whitelist would mean "no restriction" to libavformat --
      * the opposite of what an empty allow-list means. Use a name no
      * decoder has so nothing can be opened during probing. */
-    if (!codec_wl[0]) strcpy(codec_wl, "none");
+    if (!codec_wl[0]) snprintf(codec_wl, sz, "none");
+}
+
+static int libav_open_ex(lumen_demuxer_ctx_t **out_ctx, const char *path,
+                         lumen_stream_table_t *out_table,
+                         const char *const *allowed, int allowed_count) {
+    char codec_wl[1024];
+    build_codec_whitelist(allowed, allowed_count, codec_wl, sizeof(codec_wl));
 
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "codec_whitelist", codec_wl, 0);
@@ -208,6 +216,7 @@ static int libav_read_packet(lumen_demuxer_ctx_t *ctx, lumen_packet_t *out_pkt) 
         out_pkt->pts = ctx->avpkt->pts;
         out_pkt->stream_index = si;
         out_pkt->keyframe = (ctx->avpkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+        out_pkt->discard = (ctx->avpkt->flags & AV_PKT_FLAG_DISCARD) ? 1 : 0;   /* edit-list lead-in */
 
         /* Millisecond timing on the video frame clock (see origin_us). */
         int64_t ts = ctx->avpkt->pts != AV_NOPTS_VALUE ? ctx->avpkt->pts : ctx->avpkt->dts;
@@ -281,7 +290,15 @@ static void libav_close(lumen_demuxer_ctx_t *ctx) {
  *        exactly at start_ms (what `ffmpeg -ss T -i in -c copy` does).
  *   Matroska (everything else, any codec fits): no edit lists, so the
  *        clip starts at that keyframe, up to a GOP early.
- * Nothing is decoded: the input is opened with codec_whitelist "none". */
+ * QuickTime .mov sources make .mov clips (MOV keeps codec tags MP4
+ * refuses, e.g. PCM audio's 'sowt').
+ *
+ * The input is analysed (avformat_find_stream_info) with the same codec
+ * allow-list as playback: without decoders, libavformat can't work out
+ * what the container doesn't store -- decode timestamps of B-frame video
+ * in Matroska, AAC's sample rate in MPEG-TS, MP3's frame size in AVI --
+ * and the muxer refused those packets ("Invalid argument"). Nothing is
+ * decoded beyond that analysis: packets are copied as they are. */
 
 static int has_ext(const char *path, const char *ext) {
     size_t n = strlen(path), e = strlen(ext);
@@ -294,24 +311,111 @@ static int has_ext(const char *path, const char *ext) {
     return 1;
 }
 
-static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
+/* Packets held back until the clip's real start is known (see below). */
+typedef struct { AVPacket **p; int n, cap; } clip_lead_t;
+
+static void clip_lead_clear(clip_lead_t *l) {
+    for (int i = 0; i < l->n; i++) av_packet_free(&l->p[i]);
+    l->n = 0;
+}
+
+/* Takes pkt's contents (pkt is left empty). */
+static int clip_lead_push(clip_lead_t *l, AVPacket *pkt) {
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 256;
+        AVPacket **p = (AVPacket **)realloc(l->p, (size_t)cap * sizeof(*p));
+        if (!p) return -1;
+        l->p = p;
+        l->cap = cap;
+    }
+    AVPacket *c = av_packet_alloc();
+    if (!c) return -1;
+    av_packet_move_ref(c, pkt);
+    l->p[l->n++] = c;
+    return 0;
+}
+
+/* Write one packet of the clip: shift it so start_us is 0 (frames before
+ * it go negative -- an edit list hides them in MP4/MOV), convert to the
+ * output stream's time base and hand it to the muxer, which takes its
+ * data. Subtitles that ended before the start are left out. */
+static int clip_write_one(AVFormatContext *out, AVFormatContext *in, const int *map, int64_t *last_dts,
+                          AVPacket *pkt, int64_t start_us, int *copied) {
+    AVStream *ist = in->streams[pkt->stream_index], *ost = out->streams[map[pkt->stream_index]];
+    if (ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+        const int64_t t = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        const int64_t end = av_rescale_q(t, ist->time_base, AV_TIME_BASE_Q) +
+                            (pkt->duration > 0 ? av_rescale_q(pkt->duration, ist->time_base, AV_TIME_BASE_Q) : 0);
+        if (end < start_us) { av_packet_unref(pkt); return 0; }
+    }
+    const int64_t shift = av_rescale_q(start_us, AV_TIME_BASE_Q, ist->time_base);
+    if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= shift;
+    if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= shift;
+    av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
+    /* Safety net for files whose timestamps the analysis couldn't fully
+     * repair: muxers refuse a missing pts or a dts that goes backwards. */
+    if (pkt->pts == AV_NOPTS_VALUE) pkt->pts = pkt->dts;
+    int64_t *last = &last_dts[ost->index];
+    if (pkt->dts != AV_NOPTS_VALUE && *last != AV_NOPTS_VALUE && pkt->dts <= *last) {
+        pkt->dts = *last + 1;
+        if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) pkt->pts = pkt->dts;
+    }
+    if (pkt->dts != AV_NOPTS_VALUE) *last = pkt->dts;
+    pkt->stream_index = ost->index;
+    pkt->pos = -1;
+    int rc = av_interleaved_write_frame(out, pkt);
+    if (rc >= 0) (*copied)++;
+    return rc;
+}
+
+/* Through the stream's bitstream filter first, if it has one (MPEG-4
+ * Part 2: DivX/Xvid "packed B-frames" -- see below). pkt=NULL flushes. */
+static int clip_write(AVFormatContext *out, AVFormatContext *in, const int *map, int64_t *last_dts,
+                      AVBSFContext **bsf, int si, AVPacket *pkt, int64_t start_us, int *copied) {
+    if (!bsf[si]) return pkt ? clip_write_one(out, in, map, last_dts, pkt, start_us, copied) : 0;
+    int rc = av_bsf_send_packet(bsf[si], pkt);        /* takes pkt's data; NULL = end of stream */
+    if (rc < 0) { if (pkt) av_packet_unref(pkt); return rc; }
+    AVPacket *o = av_packet_alloc();
+    if (!o) return AVERROR(ENOMEM);
+    while ((rc = av_bsf_receive_packet(bsf[si], o)) >= 0) {
+        o->stream_index = si;
+        rc = clip_write_one(out, in, map, last_dts, o, start_us, copied);
+        av_packet_unref(o);
+        if (rc < 0) break;
+    }
+    av_packet_free(&o);
+    return (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) ? 0 : rc;
+}
+
+static int libav_export_clip(const char *path, const char *const *allowed, int allowed_count,
+                             int64_t start_ms, int64_t end_ms,
                              const char *out_dir, const char *stem,
                              char *out_path, size_t out_size, char *err, size_t err_size) {
     AVFormatContext *in = NULL, *out = NULL;
     AVPacket *pkt = NULL;
     AVDictionary *opts = NULL;
     int *map = NULL, *done = NULL, ret = -1, header_written = 0, copied = 0, created = 0;
+    int64_t *last_dts = NULL;           /* per output stream, for the timestamp safety net */
+    clip_lead_t lead = { NULL, 0, 0 };
+    AVBSFContext **bsf = NULL;          /* per input stream, mostly NULL */
     char fail[160] = "";
     out_path[0] = '\0';
     if (end_ms <= start_ms) { snprintf(err, err_size, "the clip is empty"); return -1; }
 
-    av_dict_set(&opts, "codec_whitelist", "none", 0);            /* copy only: never decode */
+    char codec_wl[1024];
+    build_codec_whitelist(allowed, allowed_count, codec_wl, sizeof(codec_wl));
+    av_dict_set(&opts, "codec_whitelist", codec_wl, 0);         /* analysis only, see above */
     av_dict_set(&opts, "format_whitelist", FORMAT_WHITELIST, 0);
     av_dict_set(&opts, "protocol_whitelist", "file", 0);
     int rc = avformat_open_input(&in, path, NULL, &opts);
     av_dict_free(&opts);
     if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't open the video (%s)", fail); return -1; }
     avformat_find_stream_info(in, NULL);      /* best effort: container headers usually suffice */
+    /* Fill in missing display times (pts) from the frames that follow.
+     * AVI stores only the decode order: with B-frames, its reference
+     * frames come without a pts, and giving them their decode time put
+     * them on screen in the wrong order. */
+    in->flags |= AVFMT_FLAG_GENPTS;
 
     /* Output container: MP4 for MP4/MOV sources (exact start via edit
      * list, plays everywhere), WebM for WebM, Matroska for the rest. */
@@ -320,8 +424,26 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
     for (unsigned i = 0; i < in->nb_streams; i++)
         if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
             !(in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC)) has_video = 1;
-    const char *fmt = from_mov ? "mp4" : has_ext(path, ".webm") ? "webm" : "matroska";
-    const char *ext = from_mov ? (has_video ? ".mp4" : ".m4a") : has_ext(path, ".webm") ? ".webm" : (has_video ? ".mkv" : ".mka");
+    /* MP4 when everything in the file fits it: its edit list makes the
+     * clip start exactly on time, where Matroska has to start at the
+     * keyframe before (up to ~10 s early with long GOPs). So MKV/TS/AVI
+     * sources with, say, H.264 + AAC make MP4 clips too. Anything with
+     * subtitles or codecs MP4 can't hold stays Matroska -- nothing is
+     * dropped. WebM stays WebM. */
+    int mp4_ok = has_video;
+    const AVOutputFormat *mp4 = av_guess_format("mp4", NULL, NULL);
+    for (unsigned i = 0; i < in->nb_streams && mp4_ok; i++) {
+        const AVStream *st = in->streams[i];
+        if (!is_wanted(st)) continue;
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+            !mp4 || avformat_query_codec(mp4, st->codecpar->codec_id, FF_COMPLIANCE_NORMAL) != 1) mp4_ok = 0;
+    }
+    const int quicktime = from_mov && (has_ext(path, ".mov") || has_ext(path, ".qt"));
+    const int webm = has_ext(path, ".webm");
+    const char *fmt = quicktime ? "mov" : from_mov ? "mp4" : webm ? "webm" : mp4_ok ? "mp4" : "matroska";
+    const char *ext = quicktime ? ".mov" : from_mov ? (has_video ? ".mp4" : ".m4a")
+                    : webm ? ".webm" : mp4_ok ? ".mp4" : (has_video ? ".mkv" : ".mka");
+    const int mov_family = quicktime || !strcmp(fmt, "mp4");
 
     /* A name that isn't taken yet: stem.ext, stem-2.ext, ... */
     for (int n = 1; n < 100; n++) {
@@ -349,7 +471,10 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
     }
     map = (int *)calloc(in->nb_streams, sizeof(int));
     done = (int *)calloc(in->nb_streams, sizeof(int));
-    if (!map || !done) { snprintf(err, err_size, "out of memory"); goto end; }
+    last_dts = (int64_t *)malloc(in->nb_streams * sizeof(int64_t));
+    bsf = (AVBSFContext **)calloc(in->nb_streams, sizeof(*bsf));
+    if (!map || !done || !last_dts || !bsf) { snprintf(err, err_size, "out of memory"); goto end; }
+    for (unsigned i = 0; i < in->nb_streams; i++) last_dts[i] = AV_NOPTS_VALUE;
 
     /* Streams: video, audio and subtitles the output container can hold. */
     int vin = -1;
@@ -360,26 +485,47 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
         if (avformat_query_codec(out->oformat, ist->codecpar->codec_id, FF_COMPLIANCE_NORMAL) != 1) continue;
         AVStream *ost = avformat_new_stream(out, NULL);
         if (!ost || avcodec_parameters_copy(ost->codecpar, ist->codecpar) < 0) { snprintf(err, err_size, "out of memory"); goto end; }
-        /* Same container family: keep the codec tag (e.g. HEVC's hvc1,
-         * which Apple players need); otherwise let the muxer choose. */
-        if (!from_mov) ost->codecpar->codec_tag = 0;
+        /* Keep the codec tag when it's valid in the output (e.g. HEVC's
+         * hvc1, which Apple players need); otherwise let the muxer pick. */
+        if (!from_mov || !out->oformat->codec_tag ||
+            av_codec_get_id(out->oformat->codec_tag, ist->codecpar->codec_tag) != ist->codecpar->codec_id)
+            ost->codecpar->codec_tag = 0;
         ost->time_base = ist->time_base;
         ost->disposition = ist->disposition;
         av_dict_copy(&ost->metadata, ist->metadata, 0);        /* language, title */
+        /* MPEG-4 Part 2 (DivX/Xvid, mostly from AVI) can store a P- and a
+         * B-frame in one packet ("packed B-frames"); copied as they are,
+         * players show frames out of order. This filter splits them (and
+         * leaves other MPEG-4 streams alone). Skipped if FFmpeg lacks it. */
+        if (ist->codecpar->codec_id == AV_CODEC_ID_MPEG4) {
+            const AVBitStreamFilter *f = av_bsf_get_by_name("mpeg4_unpack_bframes");
+            if (f && av_bsf_alloc(f, &bsf[i]) >= 0) {
+                avcodec_parameters_copy(bsf[i]->par_in, ist->codecpar);
+                bsf[i]->time_base_in = ist->time_base;
+                if (av_bsf_init(bsf[i]) < 0) av_bsf_free(&bsf[i]);
+                else avcodec_parameters_copy(ost->codecpar, bsf[i]->par_out), ost->codecpar->codec_tag = 0;
+            }
+        }
         map[i] = ost->index;
         if (vin < 0 && ist->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) vin = (int)i;
     }
     if (out->nb_streams == 0) { snprintf(err, err_size, "nothing in this file can be copied into a clip"); goto end; }
 
-    /* Start: the keyframe at or before start_ms (on the video stream). */
+    /* Start: the keyframe at or before start_ms (on the video stream).
+     * MPEG-TS/PS have no index and seeking in them is approximate (it can
+     * land just after that keyframe): start reading 10 s early there.
+     * The lead-in buffer below then keeps only the LAST keyframe before
+     * start_ms, so reading early never makes the clip longer. */
     const int64_t origin_us = compute_origin_us(in);
     const int64_t start_us = start_ms * 1000 + origin_us, end_us = end_ms * 1000 + origin_us;
     {
+        const int no_index = strstr(in->iformat->name, "mpeg") != NULL;      /* mpegts, mpeg (PS) */
+        int64_t seek_us = start_us - (no_index ? 10 * (int64_t)AV_TIME_BASE : 0);
         int si = vin >= 0 ? vin : av_find_default_stream_index(in);
         AVStream *st = in->streams[si];
-        int64_t ts = av_rescale_q(start_us, AV_TIME_BASE_Q, st->time_base);
-        if (avformat_seek_file(in, si, INT64_MIN, ts, ts, 0) < 0)
-            av_seek_frame(in, -1, 0, AVSEEK_FLAG_BACKWARD);      /* fall back to the start */
+        int64_t ts = av_rescale_q(seek_us, AV_TIME_BASE_Q, st->time_base);
+        if (seek_us <= origin_us || avformat_seek_file(in, si, INT64_MIN, ts, ts, 0) < 0)
+            av_seek_frame(in, -1, 0, AVSEEK_FLAG_BACKWARD);      /* from the start of the file */
     }
 
     if (!(out->oformat->flags & AVFMT_NOFILE)) {
@@ -387,7 +533,7 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
         if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't create %s (%s)", out_path, fail); goto end; }
         created = 1;
     }
-    if (from_mov) av_dict_set(&opts, "movflags", "+faststart", 0);   /* plays while downloading/streaming */
+    if (mov_family) av_dict_set(&opts, "movflags", "+faststart", 0);   /* plays while downloading/streaming */
     rc = avformat_write_header(out, &opts);
     av_dict_free(&opts);
     if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't start the clip (%s)", fail); goto end; }
@@ -395,7 +541,11 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
 
     pkt = av_packet_alloc();
     if (!pkt) { snprintf(err, err_size, "out of memory"); goto end; }
-    int started = vin < 0;                  /* video: from its first keyframe on */
+    /* Lead-in: from a video keyframe at or before start_ms, packets are
+     * held here until the video passes start_ms; a later keyframe that's
+     * still before start_ms replaces them. So the clip begins at the last
+     * keyframe before start_ms. (No video: nothing to wait for.) */
+    int lead_done = vin < 0, have_key = 0;
     /* Done when every audio/video stream is past the end. (Not subtitles:
      * a track with no cue after the end would read the whole rest of a
      * two-hour film.) */
@@ -406,7 +556,7 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
     while (remaining > 0 && av_read_frame(in, pkt) >= 0) {
         const int si = pkt->stream_index;
         if (si < 0 || (unsigned)si >= in->nb_streams || map[si] < 0 || done[si]) { av_packet_unref(pkt); continue; }
-        AVStream *ist = in->streams[si], *ost = out->streams[map[si]];
+        AVStream *ist = in->streams[si];
         const int64_t t = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
         if (t == AV_NOPTS_VALUE) { av_packet_unref(pkt); continue; }
         const int64_t t_us = av_rescale_q(t, ist->time_base, AV_TIME_BASE_Q);
@@ -420,27 +570,39 @@ static int libav_export_clip(const char *path, int64_t start_ms, int64_t end_ms,
             av_packet_unref(pkt);
             continue;
         }
-        if (si == vin && !started) {
-            if (!(pkt->flags & AV_PKT_FLAG_KEY)) { av_packet_unref(pkt); continue; }
-            started = 1;
+        if (!lead_done) {
+            const int key = si == vin && (pkt->flags & AV_PKT_FLAG_KEY);
+            if (key && t_us <= start_us) {                /* a (later) keyframe before start: begin here */
+                clip_lead_clear(&lead);
+                have_key = 1;
+            } else if (key && !have_key) {
+                have_key = 1;                             /* none before start: the first one after it */
+            }
+            if (!have_key) { av_packet_unref(pkt); continue; }
+            if (si == vin && t_us > start_us) {           /* the video reached start: out it all goes */
+                for (int k = 0; k < lead.n; k++) {
+                    rc = clip_write(out, in, map, last_dts, bsf, lead.p[k]->stream_index, lead.p[k], start_us, &copied);
+                    if (rc < 0) break;
+                }
+                clip_lead_clear(&lead);
+                lead_done = 1;
+                if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't write the clip (%s)", fail); goto end; }
+            } else {
+                if (clip_lead_push(&lead, pkt) < 0) { snprintf(err, err_size, "out of memory"); goto end; }
+                continue;
+            }
         }
-        if (!started) { av_packet_unref(pkt); continue; }   /* audio etc. before the first keyframe */
-        /* Subtitles that ended before the clip starts: leave them out. */
-        if (ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-            int64_t dur_us = pkt->duration > 0 ? av_rescale_q(pkt->duration, ist->time_base, AV_TIME_BASE_Q) : 0;
-            if (t_us + dur_us < start_us) { av_packet_unref(pkt); continue; }
-        }
-        /* Shift so start_ms is 0 (earlier frames go negative: see above). */
-        const int64_t shift = av_rescale_q(start_us, AV_TIME_BASE_Q, ist->time_base);
-        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= shift;
-        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= shift;
-        av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
-        pkt->stream_index = map[si];
-        pkt->pos = -1;
-        rc = av_interleaved_write_frame(out, pkt);              /* takes the packet's data */
+        rc = clip_write(out, in, map, last_dts, bsf, si, pkt, start_us, &copied);
         if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't write the clip (%s)", fail); goto end; }
-        copied++;
     }
+    for (int k = 0; k < lead.n; k++) {             /* the clip ended before the video passed start */
+        rc = clip_write(out, in, map, last_dts, bsf, lead.p[k]->stream_index, lead.p[k], start_us, &copied);
+        if (rc < 0) { av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't write the clip (%s)", fail); goto end; }
+    }
+    for (unsigned i = 0; i < in->nb_streams; i++)           /* whatever the filters still hold */
+        if (bsf[i] && (rc = clip_write(out, in, map, last_dts, bsf, (int)i, NULL, start_us, &copied)) < 0) {
+            av_strerror(rc, fail, sizeof(fail)); snprintf(err, err_size, "couldn't write the clip (%s)", fail); goto end;
+        }
     if (copied == 0) { snprintf(err, err_size, "there's nothing in that part of the video"); goto end; }
     rc = av_write_trailer(out);
     header_written = 0;
@@ -454,9 +616,14 @@ end:
         if (out->pb && !(out->oformat->flags & AVFMT_NOFILE)) avio_closep(&out->pb);
         avformat_free_context(out);
     }
+    if (bsf) for (unsigned i = 0; in && i < in->nb_streams; i++) av_bsf_free(&bsf[i]);
+    free(bsf);
     avformat_close_input(&in);
+    clip_lead_clear(&lead);
+    free(lead.p);
     free(map);
     free(done);
+    free(last_dts);
     if (ret != 0) {
         if (created) {          /* don't leave a broken clip behind -- only ever the file we made */
 #if defined(_WIN32)

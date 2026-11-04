@@ -436,6 +436,9 @@ typedef struct {
     int64_t start_ms, end_ms;
     char    dir[1024];
     char    stem[128];
+    char    fourcc_buf[128][16];      /* the file's codec allow-list, copied */
+    const char *fourccs[128];
+    int     fourcc_count;
 } clip_job_t;
 
 typedef struct {
@@ -447,7 +450,8 @@ static void *clip_thread_main(void *arg) {
     clip_job_t *job = (clip_job_t *)arg;
     lumen_playback_state_t *st = job->st;
     char out[1024], err[512] = "";
-    int rc = job->dmx->export_clip(job->path, job->start_ms, job->end_ms, job->dir, job->stem,
+    int rc = job->dmx->export_clip(job->path, job->fourccs, job->fourcc_count,
+                                   job->start_ms, job->end_ms, job->dir, job->stem,
                                    out, sizeof(out), err, sizeof(err));
     st->clip_result_ok = rc == 0;
     snprintf(st->clip_result_msg, sizeof(st->clip_result_msg), "%s", rc == 0 ? out : (err[0] ? err : "unknown error"));
@@ -466,7 +470,8 @@ static void clip_report(lumen_playback_state_t *st, const char *msg) {
 }
 
 static void clip_poll(clip_worker_t *w, lumen_playback_state_t *st,
-                      const lumen_demuxer_vtable_t *dmx, const char *path) {
+                      const lumen_demuxer_vtable_t *dmx, const char *path,
+                      const char *const *allowed, int allowed_count) {
     if (w->running && !__atomic_load_n(&st->clip_busy, __ATOMIC_ACQUIRE)) {
         pthread_join(w->thread, NULL);          /* finished: reap it */
         w->running = 0;
@@ -484,6 +489,10 @@ static void clip_poll(clip_worker_t *w, lumen_playback_state_t *st,
     job->end_ms = st->clip_end_ms;
     snprintf(job->dir, sizeof(job->dir), "%s", st->clip_out_dir);
     snprintf(job->stem, sizeof(job->stem), "%s", st->clip_stem);
+    for (int i = 0; i < allowed_count && i < 128; i++) {
+        snprintf(job->fourcc_buf[i], sizeof(job->fourcc_buf[i]), "%s", allowed[i]);
+        job->fourccs[job->fourcc_count++] = job->fourcc_buf[i];
+    }
     __atomic_store_n(&st->clip_busy, 1, __ATOMIC_RELEASE);
     if (pthread_create(&w->thread, NULL, clip_thread_main, job) != 0) {
         __atomic_store_n(&st->clip_busy, 0, __ATOMIC_RELEASE);
@@ -1475,7 +1484,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             stop_requested = 1;
             break;
         }
-        clip_poll(&clipper, state, dmx, path);         /* Video > Clip Back / Forward */
+        clip_poll(&clipper, state, dmx, path, allowed, allowed_count);   /* Video > Clip Back / Forward */
 
         /* Save the resume position every 30 s too, not only on close, so a
          * crash or power cut doesn't lose it. */

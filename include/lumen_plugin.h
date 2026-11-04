@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 24
+#define LUMEN_ABI_VERSION 25
 #define LUMEN_MAX_AUDIO_TRACKS 16
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
@@ -113,6 +113,11 @@ typedef struct {
     /* Demuxer authors: FFmpeg-based decoders need 64 zeroed bytes after
      * `size` (AV_INPUT_BUFFER_PADDING_SIZE). demux_libav provides them and
      * decoder_libav re-pads defensively; don't assume either elsewhere. */
+    /* v25. Decode this packet but don't show/play what it produces: lead-in
+     * that an MP4/MOV edit list cuts off (e.g. the frames from the keyframe
+     * before a cut point, in clips and edited videos). The decoder still
+     * needs them as references. 0 = normal (zero-initialized). */
+    int       discard;
 } lumen_packet_t;
 
 /* One entry per elementary stream a demuxer found in the file. A typical
@@ -543,14 +548,19 @@ typedef struct {
      * there's no keyframe in that direction (e.g. forward near the end). */
     int (*seek_ex)(lumen_demuxer_ctx_t *ctx, int64_t target_ms, int flags);
 
-    /* v24, optional (NULL = this demuxer can't make clips). Copy the part
+    /* v25, optional (NULL = this demuxer can't make clips). Copy the part
      * of `path` between start_ms and end_ms (on the same timeline as the
      * packets' pts_ms) into a NEW file in out_dir named stem + an
      * extension the demuxer picks (e.g. ".mp4"), without re-encoding.
+     * allowed_fourccs: the same allow-list as open_ex -- analysing a file
+     * well enough to copy it (timestamps, sample rates) needs its
+     * decoders, and only these may be used.
      * Independent of any open demuxer context: the core calls it from its
      * own thread while playback carries on. On success returns 0 with the
-     * file's full path in out_path; else -1 with a reason in err. */
-    int (*export_clip)(const char *path, int64_t start_ms, int64_t end_ms,
+     * file's full path in out_path; else -1 with a reason in err.
+     * (v24 had this without the allow-list; v25 replaced it.) */
+    int (*export_clip)(const char *path, const char *const *allowed_fourccs, int allowed_count,
+                       int64_t start_ms, int64_t end_ms,
                        const char *out_dir, const char *stem,
                        char *out_path, size_t out_size, char *err, size_t err_size);
 } lumen_demuxer_vtable_t;

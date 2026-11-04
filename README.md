@@ -131,14 +131,17 @@ DTS-HD MA), Dolby TrueHD, ALAC and PCM.
 **Clips.** Video > *Clip Back* (`Shift+Left`) saves the 15 seconds before
 the current position as a new video, *Clip Forward* (`Shift+Right`) the 15
 seconds from it; the length is set in Preferences > Playback (5-120 s).
-Clips go to your Videos folder as `qqvideo-clip-2026-11-04_00-22-15.mp4`,
-are copied rather than re-encoded (same quality, saved in about a
-second, while playback carries on) and keep every audio and subtitle
-track the container allows, with their languages. MP4/MOV sources make
-MP4 clips that start exactly on time (an edit list skips the lead-in to
-the previous keyframe); other sources make Matroska (`.mkv`, or `.webm`
-for WebM) clips, which start at that keyframe, so up to a few seconds
-early.
+Clips go to your Videos folder (on Windows the shell's Videos folder,
+OneDrive included) as `qqvideo-clip-2026-11-04_00-22-15.mp4`. They're
+copied rather than re-encoded -- same quality, saved in about a second
+while playback carries on -- with every audio track and their languages.
+Whenever everything in the file fits MP4 (H.264/HEVC/AV1/MPEG-4 video,
+AAC/AC-3/MP3/Opus/... audio, no subtitle tracks), the clip is an MP4 that
+starts exactly on time, whatever the source container (MKV, TS, AVI...):
+an edit list hides the lead-in from the previous keyframe. QuickTime
+`.mov` sources make `.mov` clips; files with subtitles or codecs MP4 can't
+hold make Matroska (`.mkv`; `.webm` for WebM), which keeps everything but
+starts at that keyframe, so up to a few seconds early.
 
 **On-screen notices.** Pausing, playing, seeking with the arrow keys
 (presses in a row add up: "+30s"), volume and mute changes, aspect ratio

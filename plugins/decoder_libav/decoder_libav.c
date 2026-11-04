@@ -444,6 +444,9 @@ static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lum
     ctx->avpkt->pts = pkt->pts_ms >= 0 ? pkt->pts_ms : AV_NOPTS_VALUE;
     ctx->avpkt->dts = AV_NOPTS_VALUE;
     ctx->avpkt->flags = pkt->keyframe ? AV_PKT_FLAG_KEY : 0;
+    /* Lead-in cut by an edit list: libavcodec decodes it (later frames
+     * reference it) and drops the frames/samples it produces. */
+    if (pkt->discard) ctx->avpkt->flags |= AV_PKT_FLAG_DISCARD;
     ctx->skip_start = pkt->skip_samples_start;
     ctx->skip_end = pkt->skip_samples_end;
 

@@ -116,8 +116,46 @@ is listed; in a folder with several videos (a TV season) only files named
 after that episode are, so episodes never pick up each other's subs.
 Text formats are supported (SubRip, ASS/SSA, WebVTT, MP4 timed text):
 styling tags are stripped and text is drawn outlined at the bottom of the
-picture, scaled to the video. Image-based subtitles (Blu-ray PGS, DVD
-VobSub, DVB) are listed but grayed out until there's a bitmap renderer.
+picture, scaled to the video. Image-based subtitles -- Blu-ray PGS
+(`.sup`, or inside MKV rips), DVD VobSub and DVB -- are drawn as the
+pictures they are, in their own colours, scaled with the video and kept
+centred on it. `G` / `H` move subtitles 50 ms earlier / later (an
+on-screen notice shows the total; Subtitles > *Reset Delay* clears it);
+the delay is per file.
+
+**Playback speed.** `]` faster, `[` slower, `=` back to normal, through
+VLC's steps 0.25x 0.5x 0.75x 1x 1.25x 1.5x 1.75x 2x 2.5x 3x 4x; also in
+the *Playback* menu. Speech and music keep their pitch (WSOLA
+time-stretching, the same method as FFmpeg's `atempo`), so 1.5x sounds
+like a faster speaker, not a chipmunk. Off 1x, a speed button sits in the
+control bar; clicking it goes back to 1x. Video without audio follows the
+speed too. The speed carries over to the next file in the queue and goes
+back to 1x when qqvideo is restarted.
+
+**Audio delay.** `J` / `K` move the sound 50 ms earlier / later (up to
++-2 s), for a file whose sound is out of step with the picture or a
+Bluetooth headset that lags. This is the same setting as Preferences >
+Audio > *Audio delay*, so it's remembered.
+
+**Hardware decoding.** Preferences > Video > *Hardware decoding* (on by
+default) lets the graphics card decode the video: D3D11VA (or DXVA2 on
+older Windows), VA-API (or NVDEC/CUDA) on Linux, VideoToolbox on macOS.
+That takes most of the work off the CPU for 4K/HEVC/AV1 and high frame
+rates. The preference page shows what's in use for the current video
+("Now: d3d11va" or "Now: software"). Anything the card can't decode --
+an unusual profile, 4:4:4, a codec it doesn't have -- quietly uses the
+CPU, per video; a card that starts failing mid-file is dropped after
+three errors and that file carries on in software. On Linux this needs
+an FFmpeg built with VA-API (Gentoo: `USE=vaapi` on `media-video/ffmpeg`;
+Debian/Ubuntu/Arch/Fedora packages have it) and the VA driver for your
+card (`intel-media-driver`, `mesa` for AMD). On Windows the FFmpeg build
+needs `--enable-d3d11va --enable-dxva2` (docs/BUILD-WINDOWS.md).
+
+**Queue.** The playlist button in the control bar (it shows the count)
+opens the queue in a Bluecurve window like the preferences one: numbered list, the playing item
+highlighted with a play mark, files still being scanned shown as
+"(adding...)". Double-click an entry to play it; the list scrolls to
+keep the current item in view.
 
 **Audio menu** (between Video and Subtitles): *Audio Track* lists every
 audio stream -- language, title, channels, codec -- and switches live

@@ -28,6 +28,8 @@ void lumen_prefs_defaults(lumen_playback_state_t *st) {
     st->pref_audio_device[0] = '\0';
     st->pref_volume_step = 5;
     st->pref_av_offset_ms = 0;
+    st->playback_speed = 1.0f;
+    st->pref_hwdec = 1;
     st->pref_sub_autoload = 1;
     st->pref_sub_lang[0] = '\0';
     st->pref_sub_scale_pct = 100;
@@ -104,6 +106,7 @@ void lumen_prefs_load(lumen_playback_state_t *st) {
         else if (!strcmp(key, "resize_window"))   st->pref_resize_window = v != 0;
         else if (!strcmp(key, "seek_step"))       st->pref_seek_step_s = clampi(v, 1, 300);
         else if (!strcmp(key, "clip_seconds"))    st->pref_clip_seconds = clampi(v, 1, 600);
+        else if (!strcmp(key, "hardware_decoding")) st->pref_hwdec = v != 0;
         else if (!strcmp(key, "decode_threads"))  st->pref_decode_threads = clampi(v, 0, 64);
         else if (!strcmp(key, "smooth_scaling"))  st->pref_scale_smooth = v != 0;
         else if (!strcmp(key, "keep_aspect"))     st->pref_keep_aspect = v != 0;
@@ -138,6 +141,7 @@ int lumen_prefs_save(const lumen_playback_state_t *st) {
     fprintf(f, "resize_window = %d\n", st->pref_resize_window ? 1 : 0);
     fprintf(f, "seek_step = %d\n", st->pref_seek_step_s);
     fprintf(f, "clip_seconds = %d\n", st->pref_clip_seconds);
+    fprintf(f, "hardware_decoding = %d\n", st->pref_hwdec ? 1 : 0);
     fprintf(f, "decode_threads = %d\n", st->pref_decode_threads);
     fprintf(f, "smooth_scaling = %d\n", st->pref_scale_smooth ? 1 : 0);
     fprintf(f, "keep_aspect = %d\n", st->pref_keep_aspect ? 1 : 0);

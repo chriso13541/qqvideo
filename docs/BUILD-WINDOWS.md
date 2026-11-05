@@ -50,13 +50,15 @@ pacman -S --needed mingw-w64-ucrt-x86_64-nasm
 git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src && cd ffmpeg-src
 ./configure --prefix="$HOME/ffmpeg-lgpl" \
     --enable-shared --disable-static --disable-programs --disable-doc --disable-debug \
-    --disable-autodetect --enable-w32threads
+    --disable-autodetect --enable-w32threads --enable-d3d11va --enable-dxva2
 make -j"$(nproc)" && make install
 ```
 
 (`--disable-autodetect --enable-w32threads` keeps it from pulling in other
-MSYS2 libraries while keeping multithreaded decoding; see the Linux section
-for the reasoning.)
+MSYS2 libraries while keeping multithreaded decoding, and
+`--enable-d3d11va --enable-dxva2` turn hardware decoding back on, which
+`--disable-autodetect` also switches off; see the Linux section for the
+reasoning.)
 
 **Quick development builds** without packaging work too:
 
@@ -128,7 +130,7 @@ cd ffmpeg-win
     --cross-prefix=x86_64-w64-mingw32- \
     --enable-shared --disable-static \
     --disable-programs --disable-doc --disable-debug \
-    --disable-autodetect --enable-w32threads
+    --disable-autodetect --enable-w32threads --enable-d3d11va --enable-dxva2
 make -j"$(nproc)"
 make install
 ```
@@ -143,6 +145,11 @@ Why these options:
   also turns off FFmpeg's threading, which is autodetected too, so
   `--enable-w32threads` turns it back on. Without it decoding is
   single-threaded and HD video stutters.
+- `--enable-d3d11va --enable-dxva2`: hardware decoding (the graphics card
+  decodes; Preferences > Video > Hardware decoding). Also autodetected, so
+  also off after `--disable-autodetect`. They only need Windows' own
+  headers, which MinGW-w64 has: nothing extra to install. Without them
+  qqvideo still works, decoding everything on the CPU.
 - No `--enable-gpl`: the default LGPL build has every decoder qqvideo
   uses (H.264, HEVC, AV1, VP9, ...); GPL only adds *encoders* like x264.
 - `nasm` must be installed: FFmpeg's hand-written SIMD decoding code

@@ -35,7 +35,7 @@ extern "C" {
   #define LUMEN_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define LUMEN_ABI_VERSION 25
+#define LUMEN_ABI_VERSION 26
 #define LUMEN_MAX_AUDIO_TRACKS 16
 
 /* v16: was 8. A Blu-ray rip MKV routinely has 1 video + several audio +
@@ -167,6 +167,20 @@ typedef struct {
 
 /* A decoded frame, tagged by stream type. Exactly one arm of the union
  * is valid, selected by `type`. */
+/* v26. An image subtitle: one or more rectangles of RGBA pixels placed on
+ * a canvas -- the frame size the subtitle was authored for (1920x1080 for
+ * a Blu-ray, 720x480/576 for a DVD). 0x0 = the video's own size. */
+typedef struct {
+    int      x, y, w, h;         /* on the canvas */
+    uint8_t *rgba;               /* w*h*4 bytes: R,G,B,A (straight alpha), rows top to bottom */
+} lumen_sub_rect_t;
+
+typedef struct lumen_sub_image {
+    int               canvas_w, canvas_h;
+    int               count;
+    lumen_sub_rect_t *rects;
+} lumen_sub_image_t;
+
 typedef struct {
     lumen_stream_type_t type;
     int64_t              pts;
@@ -177,6 +191,9 @@ typedef struct {
             int      width;
             int      height;
             int      pixel_format;
+            /* v26. Which hardware decoder produced this frame ("d3d11va",
+             * "vaapi"...; a static string), NULL = decoded on the CPU. */
+            const char *hwaccel;
         } video;
         struct {
             uint8_t *data;       /* interleaved samples, all channels */
@@ -192,6 +209,10 @@ typedef struct {
             char    *text;
             int64_t  start_ms;
             int64_t  end_ms;     /* -1 = until the next cue replaces it */
+            /* v26. Image subtitles (Blu-ray PGS, DVD VobSub, DVB): the
+             * picture instead of text (text is then ""). An image cue with
+             * image == NULL clears the screen -- how PGS ends a subtitle. */
+            struct lumen_sub_image *image;
         } subtitle;
     };
 } lumen_frame_t;
@@ -491,6 +512,19 @@ typedef struct {
     int     clip_result_serial;
     int     clip_result_ok;
     char    clip_result_msg[1200];  /* the file's path, or why it failed */
+
+    /* ---- Appended: delays and speed (no plugin reads these) ---- */
+    int     subtitle_delay_ms;      /* + = subtitles later (G/H keys); per file, reset to 0 */
+    /* Image subtitle on screen now (core -> UI), NULL = none. Owned by the
+     * core's cue store: valid until the serial changes. The UI caches its
+     * textures by the serial, never by the pointer. */
+    const lumen_sub_image_t *subtitle_image;
+    int     subtitle_image_serial;
+
+    /* Hardware decoding (Preferences > Video). */
+    int     pref_hwdec;             /* 1 = use the GPU's video decoder when it can (default) */
+    char    hwdec_now[32];          /* core: what decodes the video now: "d3d11va", "software", "" = no video */
+    float   playback_speed;         /* 1.0 = normal; 0.25..4.0 ([ and ] keys, Playback menu) */
 } lumen_playback_state_t;
 
 /* ---------------------------------------------------------------------- */

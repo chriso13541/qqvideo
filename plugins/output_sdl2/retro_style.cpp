@@ -330,3 +330,11 @@ void qq_retro_decorate_windows(void) {
         dl->PopClipRect();
     }
 }
+
+/* Windows that belong to the player itself (the queue panel) keep the
+ * active Grape title bar whatever has focus: they're part of the main
+ * window, not separate windows, and the pale inactive bar looked washed
+ * out over the video. Identified by their ImGui ID suffix. */
+bool QQ_RetroAlwaysActive(const char *window_name) {
+    return window_name && strstr(window_name, "###qq_queue") != NULL;
+}

@@ -58,6 +58,7 @@
 #include <math.h>   /* lroundf: volume steps */
 
 #define LUMEN_SDL2_DROP_THRESHOLD_MS 100
+#define LUMEN_CTRL_BAR_H 60.0f
 #define LUMEN_UI_REDRAW_INTERVAL_MS 16 /* ~60fps cap on actual redraws/presents */
 #define LUMEN_VIDEO_DRIVES_REDRAW_MS 60 /* video frames this recent: they do the redrawing
                                          * (UI-only redraws resume below ~17 fps, or paused) */
@@ -194,6 +195,14 @@ struct lumen_output_ctx {
     int             osd_seen_vol;      /* source (keys, buttons, slider, wheel); -1 = */
     int             osd_seen_muted;    /* nothing seen yet */
     int             clip_serial_seen;  /* last clip result shown */
+    int             last_queue_scrolled; /* queue panel: item last scrolled into view */
+    /* Image subtitles (PGS/VobSub/DVB): textures for the picture on screen,
+     * rebuilt when the core publishes another one (serial changes). */
+    int             sub_img_serial;
+    SDL_Texture    *sub_tex[16];
+    SDL_Rect        sub_rect[16];        /* on the canvas */
+    int             sub_tex_n;
+    int             sub_canvas_w, sub_canvas_h;
 };
 
 /* ---- Video > Aspect Ratio / Crop ---------------------------------------
@@ -275,6 +284,36 @@ static void set_crop(lumen_output_ctx_t *ctx, int idx) {
 static void request_snapshot(lumen_output_ctx_t *ctx) {
     if (ctx->state && ctx->state->has_file && ctx->have_frame && ctx->texture) ctx->snapshot_requested = 1;
     else osd_show(ctx, 2000, "No video to take a snapshot of");
+}
+
+/* ---- Playback speed ------------------------------------------------------
+ * VLC's keys: [ slower, ] faster, = normal. Audio keeps its pitch (tempo.c
+ * in the audio output); video follows the audio clock. Kept between files,
+ * not saved. */
+static const float k_speeds[] = { 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f };
+#define LUMEN_N_SPEEDS ((int)(sizeof(k_speeds) / sizeof(k_speeds[0])))
+
+static void speed_label(float sp, char *out, size_t n) {
+    if (sp > 0.999f && sp < 1.001f) snprintf(out, n, "Normal");
+    else snprintf(out, n, "%g\xC3\x97", (double)sp);           /* "1.5x" with a real times sign */
+}
+
+static void set_speed(lumen_output_ctx_t *ctx, float sp) {
+    if (!ctx->state) return;
+    if (sp < 0.25f) sp = 0.25f;
+    if (sp > 4.0f) sp = 4.0f;
+    ctx->state->playback_speed = sp;
+    char l[32];
+    speed_label(sp, l, sizeof(l));
+    osd_show(ctx, 1500, "Speed: %s", l);
+}
+
+static void step_speed(lumen_output_ctx_t *ctx, int dir) {
+    const float cur = ctx->state ? ctx->state->playback_speed : 1.0f;
+    float next = cur;
+    if (dir > 0) { for (int i = 0; i < LUMEN_N_SPEEDS; i++) if (k_speeds[i] > cur + 0.001f) { next = k_speeds[i]; break; } }
+    else         { for (int i = LUMEN_N_SPEEDS - 1; i >= 0; i--) if (k_speeds[i] < cur - 0.001f) { next = k_speeds[i]; break; } }
+    set_speed(ctx, next);
 }
 
 /* Video > Clip Back / Clip Forward: the clip length (Preferences >
@@ -919,6 +958,34 @@ static int handle_events(lumen_output_ctx_t *ctx) {
                 ctx->state && ctx->state->has_file) {
                 ctx->state->paused = !ctx->state->paused;
             }
+            /* VLC's speed keys: [ slower, ] faster, = normal. */
+            if (!ImGui::GetIO().WantCaptureKeyboard && ctx->state && ctx->state->has_file &&
+                !(e.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI))) {
+                const SDL_Keycode kc = e.key.keysym.sym;
+                if (kc == SDLK_LEFTBRACKET)  step_speed(ctx, -1);
+                if (kc == SDLK_RIGHTBRACKET) step_speed(ctx, +1);
+                if (kc == SDLK_EQUALS && !(e.key.keysym.mod & KMOD_SHIFT)) set_speed(ctx, 1.0f);
+            }
+            /* VLC's delay keys, 50 ms a press: G/H subtitles earlier/later,
+             * J/K audio earlier/later. Holding the key repeats. */
+            {
+                const Uint16 dm = e.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI | KMOD_SHIFT);
+                const SDL_Scancode sc = e.key.keysym.scancode;
+                if (dm == 0 && !ImGui::GetIO().WantCaptureKeyboard && ctx->state && ctx->state->has_file &&
+                    (sc == SDL_SCANCODE_G || sc == SDL_SCANCODE_H || sc == SDL_SCANCODE_J || sc == SDL_SCANCODE_K)) {
+                    lumen_playback_state_t *st = ctx->state;
+                    if (sc == SDL_SCANCODE_G || sc == SDL_SCANCODE_H) {
+                        int v = st->subtitle_delay_ms + (sc == SDL_SCANCODE_H ? 50 : -50);
+                        st->subtitle_delay_ms = v < -60000 ? -60000 : v > 60000 ? 60000 : v;
+                        osd_show(ctx, 1500, "Subtitle delay %+d ms", st->subtitle_delay_ms);
+                    } else {
+                        int v = st->pref_av_offset_ms + (sc == SDL_SCANCODE_K ? 50 : -50);
+                        st->pref_av_offset_ms = v < -2000 ? -2000 : v > 2000 ? 2000 : v;
+                        st->prefs_dirty = 1;          /* same setting as Preferences > Audio */
+                        osd_show(ctx, 1500, "Audio delay %+d ms", st->pref_av_offset_ms);
+                    }
+                }
+            }
             /* VLC's keys: A cycles the aspect ratio, C the crop, Shift+S
              * takes a snapshot. (Plain keys only: Ctrl+C etc. stay free.) */
             {
@@ -1285,6 +1352,29 @@ static void prefs_page_playback(lumen_output_ctx_t *ctx, lumen_playback_state_t 
 static void prefs_page_video(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
     (void)ctx;
     ImGui::SeparatorText("Decoding");
+    pref_check("Hardware decoding", &st->pref_hwdec, st);
+    {
+#if defined(_WIN32)
+        const char *how = "D3D11VA, then DXVA2";
+#elif defined(__APPLE__)
+        const char *how = "VideoToolbox";
+#else
+        const char *how = "VA-API (Intel, AMD; NVIDIA with nvidia-vaapi-driver), then CUDA";
+#endif
+        char note[400];
+        snprintf(note, sizeof(note),
+                 "The graphics card decodes the video (%s): smooth 4K and HEVC on a modest CPU, "
+                 "and far less battery use. Videos it can't handle are decoded on the CPU "
+                 "automatically. Takes effect with the next video.", how);
+        pref_note(note);
+        ImGui::Indent(24.0f);
+        if (st->hwdec_now[0])
+            ImGui::Text("Now: %s", strcmp(st->hwdec_now, "software") == 0 ? "the CPU (software)" : st->hwdec_now);
+        else
+            ImGui::TextDisabled("Now: no video playing");
+        ImGui::Unindent(24.0f);
+        ImGui::Spacing();
+    }
     pref_check("Adaptive frame skipping", &st->pref_frameskip, st);
     pref_note("When video falls behind, skip frames nothing else depends on (then the "
               "deblocking filter) so more frames arrive on time. Audio always comes first.");
@@ -1352,12 +1442,12 @@ static void prefs_page_audio(lumen_output_ctx_t *ctx, lumen_playback_state_t *st
     pref_slider("Up/Down arrow step", &st->pref_volume_step, 1, 25, "%d%%", st);
 
     ImGui::SeparatorText("Sync");
-    pref_slider("Audio delay", &st->pref_av_offset_ms, -1000, 1000, "%+d ms", st);
+    pref_slider("Audio delay", &st->pref_av_offset_ms, -2000, 2000, "%+d ms", st);
     ImGui::SameLine();
     if (ImGui::Button("Reset")) { st->pref_av_offset_ms = 0; st->prefs_dirty = 1; }
     pref_note("If voices don't match lips: + makes the sound later than the picture, "
               "- earlier. Bluetooth headphones often need about +150 to +250 ms. "
-              "Applies immediately.");
+              "Applies immediately. While watching: J / K, 50 ms a press.");
 }
 
 static void prefs_page_subtitles(lumen_output_ctx_t *ctx, lumen_playback_state_t *st) {
@@ -1769,6 +1859,26 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Playback")) {
+            const bool has_file = state->has_file != 0;
+            if (ImGui::BeginMenu("Speed", has_file)) {
+                for (int i = 0; i < LUMEN_N_SPEEDS; i++) {
+                    char l[32], item[48];
+                    speed_label(k_speeds[i], l, sizeof(l));
+                    snprintf(item, sizeof(item), "%s##spd%d", l, i);
+                    const float d = state->playback_speed - k_speeds[i];
+                    if (ImGui::MenuItem(item, NULL, d > -0.001f && d < 0.001f)) set_speed(ctx, k_speeds[i]);
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Faster", "]", false, has_file)) step_speed(ctx, +1);
+            if (ImGui::MenuItem("Slower", "[", false, has_file)) step_speed(ctx, -1);
+            if (ImGui::MenuItem("Normal Speed", "=", false, has_file && (state->playback_speed < 0.999f || state->playback_speed > 1.001f)))
+                set_speed(ctx, 1.0f);
+            ImGui::Separator();
+            if (ImGui::MenuItem(state->paused ? "Play" : "Pause", "Space", false, has_file)) state->paused = !state->paused;
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Video")) {
             const bool has_video = state->has_file && ctx->texture;
             if (ImGui::MenuItem("Fullscreen", "F", ctx->fullscreen != 0)) toggle_fullscreen(ctx);
@@ -1879,6 +1989,16 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
                 }
                 ImGui::EndMenu();
             }
+            ImGui::Separator();
+            {
+                char lbl[64];
+                snprintf(lbl, sizeof(lbl), "Reset Delay (%+d ms)##subdelay", state->subtitle_delay_ms);
+                if (ImGui::MenuItem(lbl, NULL, false, has_file && state->subtitle_delay_ms != 0)) {
+                    state->subtitle_delay_ms = 0;
+                    osd_show(ctx, 1500, "Subtitle delay +0 ms");
+                }
+                ImGui::SetItemTooltip("G / H: subtitles 50 ms earlier / later");
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
@@ -1909,6 +2029,11 @@ static void draw_menu_bar(lumen_output_ctx_t *ctx) {
  * between file plays). Showing them here gives IMMEDIATE visual feedback
  * that the file was added, rather than making the user wait until the
  * current movie ends for the queue to visually update. */
+/* The queue: a small Bluecurve window above the control bar, bottom
+ * right -- Grape title bar with a close button (the same frame as the file
+ * browser, drawn by retro_style.cpp), and inside a sunken white list in the
+ * style of a Windows 2000 list view: the playing item highlighted in navy
+ * with a play mark, files still being added in grey. Double-click plays. */
 static void draw_queue_panel(lumen_output_ctx_t *ctx) {
     lumen_playback_state_t *state = ctx->state;
     int total_visible = (state ? state->queue_count : 0) + (state ? state->pending_add_count : 0);
@@ -1916,102 +2041,97 @@ static void draw_queue_panel(lumen_output_ctx_t *ctx) {
 
     int win_w, win_h;
     SDL_GetWindowSize(ctx->window, &win_w, &win_h);
+    const ImGuiStyle &st = ImGui::GetStyle();
+    const float row_h = ImGui::GetTextLineHeight() + 6.0f;
+    const int MAX_VISIBLE = 8;
+    const int rows = total_visible < MAX_VISIBLE ? total_visible : MAX_VISIBLE;
+    const float title_h = ImGui::GetFontSize() + st.FramePadding.y * 2.0f;
+    const float list_h = (float)rows * row_h + 4.0f;                /* + the sunken border */
+    const float panel_h = title_h + st.WindowPadding.y * 2.0f + list_h;
+    float panel_w = (float)win_w * 0.38f;
+    if (panel_w < 300.0f) panel_w = 300.0f;
+    if (panel_w > 460.0f) panel_w = 460.0f;
+    if (panel_w > (float)win_w - 16.0f) panel_w = (float)win_w - 16.0f;
+    const float margin = 8.0f;
+    const float bottom = (float)win_h - LUMEN_CTRL_BAR_H - margin;
 
-    /* Compute panel height from ImGui style metrics instead of hardcoded
-     * constants. The old values (item_h=22, header_h=26) didn't account
-     * for the WindowPadding on both the outer panel AND the inner child
-     * window, causing items to be clipped -- confirmed directly from
-     * the screenshot where the single item was half-visible.
-     *
-     * Derivation (using ImGui::GetStyle() values):
-     *   outer panel h = 2*wpad + title_row + 1px(sep) + isp + child_h
-     *   child_h       = 2*wpad + n * item_h
-     *   total         = 4*wpad + title_row_h + 1 + isp + n * item_h
-     *
-     * item_h uses GetFrameHeightWithSpacing() (not GetTextLineHeight)
-     * because each Selectable row takes a full frame height including
-     * padding and the item spacing between rows. */
-    float wpad     = ImGui::GetStyle().WindowPadding.y;
-    float isp      = ImGui::GetStyle().ItemSpacing.y;
-    float item_h   = ImGui::GetFrameHeightWithSpacing();
-    float title_h  = ImGui::GetFrameHeightWithSpacing(); /* title + [x] button row */
+    ImGui::SetNextWindowPos(ImVec2(floorf((float)win_w - panel_w - margin), floorf(bottom - panel_h)));
+    ImGui::SetNextWindowSize(ImVec2(floorf(panel_w), floorf(panel_h)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, QQ_WM_ROUNDING);   /* Bluecurve frame corners */
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    ImVec4 face = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg); face.w = 1.0f;   /* solid, not see-through */
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, face);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 1));               /* white list, like a list view */
 
-    const int MAX_VISIBLE = 5;
-    int capped = total_visible < MAX_VISIBLE ? total_visible : MAX_VISIBLE;
-    float panel_h = 4.0f * wpad + title_h + 1.0f + isp + (float)capped * item_h;
-    const float panel_w = ((float)win_w * 0.35f > 280.0f ? (float)win_w * 0.35f : 280.0f);
-    const float ctrl_bar_h = 60.0f;
-
-    ImGui::SetNextWindowPos(ImVec2((float)win_w - panel_w, (float)win_h - ctrl_bar_h - panel_h));
-    ImGui::SetNextWindowSize(ImVec2(panel_w, panel_h));
-    ImGui::SetNextWindowBgAlpha(0.88f);
-
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                              ImGuiWindowFlags_NoFocusOnAppearing;
-    ImGui::Begin("##queue", NULL, flags);
-
-    /* Title + [x] close button on the same line */
-    ImGui::TextColored(ImVec4(0.3f,0.3f,0.8f,1.0f), "Queue (%d item%s)",
-        total_visible, total_visible == 1 ? "" : "s");
-    ImGui::SameLine();
-    /* Push the button to the right edge so it doesn't float mid-title */
-    float btn_w = ImGui::CalcTextSize("x").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btn_w - ImGui::GetStyle().WindowPadding.x);
-    if (ImGui::SmallButton("x")) {
-        state->show_queue = 0;
-    }
-    ImGui::Separator();
-
-    ImGui::BeginChild("##qscroll", ImVec2(0, 0), false, 0);
-
-    /* Committed queue items */
-    for (int i = 0; i < state->queue_count; i++) {
-        bool is_current = (i == state->queue_position);
-        if (is_current) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.1f, 0.5f, 0.9f, 1.0f));
-
-        const char *name = state->queue_names ? state->queue_names[i] : "(unknown)";
-
-        char label[32];
-        snprintf(label, sizeof(label), "%s%d.##qlbl%d", is_current ? "> " : "  ", i + 1, i);
-        ImGui::Selectable(label, is_current, 0, ImVec2(34, item_h));
-        ImGui::SameLine();
-
-        char keyed[520];
-        snprintf(keyed, sizeof(keyed), "%s##qitem%d", name, i);
-        ImGui::Selectable(keyed, is_current, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, item_h));
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-            state->queue_jump_requested = 1;
-            state->queue_jump_index = i;
+    char title[64];
+    snprintf(title, sizeof(title), "Queue - %d item%s###qq_queue", total_visible, total_visible == 1 ? "" : "s");
+    bool open = true;
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoScrollbar;
+    if (ImGui::Begin(title, &open, flags)) {
+        ImGui::BeginChild("##qlist", ImVec2(0, 0), ImGuiChildFlags_Borders);   /* sunken (retro_style) */
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const float num_w = ImGui::CalcTextSize("00.").x + 6.0f;
+        const float icon_w = 16.0f;
+        auto row = [&](int idx, const char *name, const char *tip, bool current, bool pending) {
+            ImGui::PushID(idx);
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float w = ImGui::GetContentRegionAvail().x;
+            const bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, row_h));
+            const bool hovered = ImGui::IsItemHovered();
+            if (!pending && hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                state->queue_jump_requested = 1;
+                state->queue_jump_index = idx;
+            }
+            (void)clicked;
+            const ImVec2 p1(p0.x + w, p0.y + row_h);
+            ImU32 text = pending ? IM_COL32(128, 128, 128, 255) : IM_COL32(0, 0, 0, 255);
+            if (current) {                                              /* navy, white text */
+                dl->AddRectFilled(p0, p1, QQ_NAVY);
+                text = IM_COL32_WHITE;
+            } else if (hovered && !pending) {
+                dl->AddRectFilled(p0, p1, IM_COL32(224, 232, 246, 255));
+            }
+            const float ty = p0.y + (row_h - ImGui::GetTextLineHeight()) * 0.5f;
+            if (current) dl->AddText(ImVec2(p0.x + 3.0f, ty), text, ICON_PLAY);
+            char num[16];
+            snprintf(num, sizeof(num), "%d.", idx + 1);
+            const float nw = ImGui::CalcTextSize(num).x;
+            dl->AddText(ImVec2(p0.x + icon_w + num_w - nw - 4.0f, ty), current ? text : IM_COL32(110, 110, 110, 255), num);
+            const float nx = p0.x + icon_w + num_w + 2.0f, nmax = p1.x - 6.0f;
+            ImGui::PushStyleColor(ImGuiCol_Text, text);
+            ImGui::RenderTextEllipsis(dl, ImVec2(nx, ty), ImVec2(nmax, p1.y), nmax, nmax, name, NULL, NULL);
+            ImGui::PopStyleColor();
+            if (hovered && tip) ImGui::SetTooltip("%s", tip);
+            ImGui::PopID();
+        };
+        for (int i = 0; i < state->queue_count; i++) {
+            const char *name = state->queue_names ? state->queue_names[i] : "(unknown)";
+            row(i, name, name, i == state->queue_position, false);
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name);
-        if (is_current) ImGui::PopStyleColor();
-    }
-
-    /* Pending items (not yet drained by main.c -- shown immediately for feedback) */
-    if (state->pending_add_count > 0) {
-        if (state->queue_count > 0) ImGui::Separator();
-        for (int i = 0; i < state->pending_add_count; i++) {
+        for (int i = 0; i < state->pending_add_count; i++) {      /* not yet taken in by main.c */
             const char *path = state->pending_add_paths[i];
             const char *name = strrchr(path, '/');
             if (!name) name = strrchr(path, '\\');
             name = name ? name + 1 : path;
-
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-            char label[48];
-            snprintf(label, sizeof(label), "  %d.##qplbl%d", state->queue_count + i + 1, i);
-            ImGui::Selectable(label, false, 0, ImVec2(34, item_h));
-            ImGui::SameLine();
-            char display[530];
-            snprintf(display, sizeof(display), "%s  (pending)##qpend%d", name, i);
-            ImGui::Selectable(display, false, 0, ImVec2(0, item_h));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path);
-            ImGui::PopStyleColor();
+            char disp[540];
+            snprintf(disp, sizeof(disp), "%s (adding...)", name);
+            row(state->queue_count + i, disp, path, false, true);
         }
+        /* keep the playing item in view when the list scrolls */
+        if (ctx->last_queue_scrolled != state->queue_position) {
+            ctx->last_queue_scrolled = state->queue_position;
+            ImGui::SetScrollY((float)state->queue_position * row_h - ImGui::GetWindowHeight() * 0.5f + row_h * 0.5f);
+        }
+        ImGui::EndChild();
     }
-
-    ImGui::EndChild();
     ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(4);
+    if (!open) state->show_queue = 0;
 }
 
 /* ---- Transport icons (Remix Icon) ----------------------------------------
@@ -2078,7 +2198,6 @@ static bool icon_button(const char *label_with_id, const char *tooltip) {
 }
 
 /* Height of the control bar; the min-size math and the video letterbox use it. */
-#define LUMEN_CTRL_BAR_H 60.0f
 
 /* Minimum window size = the narrowest the control bar can get with its
  * two button groups side by side at normal spacing, never overlapping.
@@ -2413,6 +2532,15 @@ static void draw_controls(lumen_output_ctx_t *ctx) {
                     ctx->fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)")) {
         toggle_fullscreen(ctx);
     }
+    /* Not at normal speed: say so, and a click goes back to 1x. */
+    if (has_file && (state->playback_speed < 0.999f || state->playback_speed > 1.001f)) {
+        ImGui::SameLine();
+        char l[32], b[48];
+        speed_label(state->playback_speed, l, sizeof(l));
+        snprintf(b, sizeof(b), "%s##speedbtn", l);
+        if (ImGui::Button(b, ImVec2(0, ImGui::GetFrameHeight()))) set_speed(ctx, 1.0f);
+        ImGui::SetItemTooltip("Playback speed -- click for normal ([ / ] to change)");
+    }
 
     /* --- Row 2 right: Queue, Mute, Volume -- right-aligned -------------- */
     /* Compute how much space the right cluster needs, then jump there. */
@@ -2602,6 +2730,54 @@ static void debug_fake_vsync(void) {
     while ((double)SDL_GetPerformanceCounter() * 1000.0 / (double)f < next) {
         const double left = next - (double)SDL_GetPerformanceCounter() * 1000.0 / (double)f;
         if (left > 1.5) SDL_Delay(1);
+    }
+}
+
+/* ---- Image subtitles ------------------------------------------------------ */
+static void sub_images_clear(lumen_output_ctx_t *ctx) {
+    for (int i = 0; i < ctx->sub_tex_n; i++) SDL_DestroyTexture(ctx->sub_tex[i]);
+    ctx->sub_tex_n = 0;
+}
+
+static void sub_images_update(lumen_output_ctx_t *ctx) {
+    const lumen_playback_state_t *st = ctx->state;
+    if (!st || st->subtitle_image_serial == ctx->sub_img_serial) return;
+    ctx->sub_img_serial = st->subtitle_image_serial;
+    sub_images_clear(ctx);
+    const lumen_sub_image_t *im = st->subtitle_image;
+    if (!im) return;
+    ctx->sub_canvas_w = im->canvas_w > 0 ? im->canvas_w : ctx->width;
+    ctx->sub_canvas_h = im->canvas_h > 0 ? im->canvas_h : ctx->height;
+    for (int i = 0; i < im->count && ctx->sub_tex_n < 16; i++) {
+        const lumen_sub_rect_t *r = &im->rects[i];
+        SDL_Texture *t = SDL_CreateTexture(ctx->renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, r->w, r->h);
+        if (!t) continue;
+        SDL_UpdateTexture(t, NULL, r->rgba, r->w * 4);
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
+        ctx->sub_rect[ctx->sub_tex_n] = { r->x, r->y, r->w, r->h };
+        ctx->sub_tex[ctx->sub_tex_n++] = t;
+    }
+}
+
+/* Draw them over the picture. The canvas (e.g. a Blu-ray's 1920x1080) is
+ * scaled to the picture's width and centered on it: on a 1920x800 encode
+ * with the black bars cropped off, the subtitles keep their shape and sit
+ * where the disc put them relative to the picture, instead of being
+ * squashed to fit. `dest`/`src`: the picture on screen and the part of
+ * the frame shown (Video > Crop). */
+static void sub_images_draw(lumen_output_ctx_t *ctx, const SDL_Rect &dest, const SDL_Rect &src) {
+    if (ctx->sub_tex_n == 0 || ctx->sub_canvas_w <= 0 || ctx->sub_canvas_h <= 0 || src.w <= 0 || src.h <= 0) return;
+    const double sx = (double)dest.w / src.w, sy = (double)dest.h / src.h;
+    const double pic_x = dest.x - src.x * sx, pic_y = dest.y - src.y * sy;   /* whole frame, before crop */
+    const double pic_w = ctx->width * sx, pic_h = ctx->height * sy;
+    const double k = pic_w / ctx->sub_canvas_w;
+    const double y0 = pic_y + (pic_h - ctx->sub_canvas_h * k) * 0.5;
+    for (int i = 0; i < ctx->sub_tex_n; i++) {
+        const SDL_Rect &r = ctx->sub_rect[i];
+        SDL_Rect d = { (int)lround(pic_x + r.x * k), (int)lround(y0 + r.y * k),
+                       (int)lround(r.w * k), (int)lround(r.h * k) };
+        if (d.w > 0 && d.h > 0) SDL_RenderCopy(ctx->renderer, ctx->sub_tex[i], NULL, &d);
     }
 }
 
@@ -2934,6 +3110,8 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
         double aspect;
         video_geometry(ctx, &src, &aspect);
         SDL_RenderCopy(ctx->renderer, ctx->texture, &src, &dest);
+        sub_images_update(ctx);
+        sub_images_draw(ctx, dest, src);            /* image subtitles: over the picture, under the UI */
         if (ctx->frame_undrawn) {                 /* a new frame goes on screen */
             if (FILE *fl = debug_frame_log())
                 fprintf(fl, "%.3f %lld\n", (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(),
@@ -3363,6 +3541,7 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
+    sub_images_clear(ctx);
     if (ctx->texture) SDL_DestroyTexture(ctx->texture);
     if (ctx->renderer) SDL_DestroyRenderer(ctx->renderer);
     if (ctx->window) SDL_DestroyWindow(ctx->window);

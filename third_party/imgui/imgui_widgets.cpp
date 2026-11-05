@@ -868,7 +868,8 @@ bool ImGui::CloseButton(ImGuiID id, const ImVec2& pos)
 
     // Render
 #ifdef IMGUI_QQ_RETRO   // qqvideo: Bluecurve-style close button (drawn by the hook)
-    const bool qq_active = g.NavWindow && window->RootWindowForTitleBarHighlight == g.NavWindow->RootWindowForTitleBarHighlight;
+    const bool qq_active = (g.NavWindow && window->RootWindowForTitleBarHighlight == g.NavWindow->RootWindowForTitleBarHighlight) ||
+                           QQ_RetroAlwaysActive(window->RootWindow->Name);
     QQ_RetroCloseButton(window->DrawList, bb.Min, bb.Max, qq_active, hovered, held && hovered);
     RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
     return pressed;

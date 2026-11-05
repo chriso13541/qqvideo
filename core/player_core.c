@@ -89,6 +89,14 @@ typedef struct {
 } stream_state_t;
 
 /* Every packet starts as "no timing info" (-1), not 0: 0 is a real time. */
+/* A decoded subtitle into its track: text, or (image subtitles) a picture
+ * -- or, from an image track, an empty event that clears the screen. */
+static int sub_add_frame(lumen_sub_track_t *t, const lumen_frame_t *f) {
+    if (f->subtitle.image || !f->subtitle.text || !f->subtitle.text[0])
+        return lumen_sub_track_add_image(t, f->subtitle.start_ms, f->subtitle.end_ms, f->subtitle.image);
+    return lumen_sub_track_add(t, f->subtitle.start_ms, f->subtitle.end_ms, f->subtitle.text);
+}
+
 static void reset_pkt(lumen_packet_t *pkt) {
     memset(pkt, 0, sizeof(*pkt));
     pkt->pts_ms = -1;
@@ -96,6 +104,7 @@ static void reset_pkt(lumen_packet_t *pkt) {
 }
 
 static int g_threads_env_external;   /* QQVIDEO_DECODE_THREADS was set at launch */
+static int g_hwdec_env_external;     /* QQVIDEO_HWDEC was set at launch */
 
 /* ---- Subtitles ------------------------------------------------------- */
 
@@ -223,7 +232,7 @@ static void load_external_subtitles(const lumen_registry_t *reg, lumen_playback_
             while (track >= 0 && dmx->read_packet(dctx, &pkt) == 0) {
                 lumen_frame_t f;
                 if (pkt.stream_index == sd->stream_index && dec->decode(cctx, &pkt, &f) == 0) {
-                    cues += lumen_sub_track_add(&tracks[track], f.subtitle.start_ms, f.subtitle.end_ms, f.subtitle.text);
+                    cues += sub_add_frame(&tracks[track], &f);
                     dec->frame_free(&f);
                 }
                 dmx->packet_free(&pkt);
@@ -257,6 +266,8 @@ static void reset_subtitle_state(lumen_playback_state_t *st) {
     st->subtitle_selected = -1;
     st->subtitle_text[0] = '\0';
     st->subtitle_add_requested = 0;
+    st->subtitle_delay_ms = 0;          /* a delay fixes one subtitle file: start each video at 0 */
+    if (st->subtitle_image) { st->subtitle_image = NULL; st->subtitle_image_serial++; }
 }
 
 /* The persistent part of the player -- video/audio outputs opened ONCE
@@ -293,6 +304,7 @@ lumen_session_t *lumen_session_open(const lumen_registry_t *reg) {
     /* Decoding threads: a QQVIDEO_DECODE_THREADS set by the user at launch
      * wins over the preference (it's how you'd troubleshoot). */
     g_threads_env_external = getenv("QQVIDEO_DECODE_THREADS") != NULL;
+    g_hwdec_env_external = getenv("QQVIDEO_HWDEC") != NULL;
     if (session->state.prefs_path[0])
         printf("lumen: preferences: %s\n", session->state.prefs_path);
 
@@ -676,6 +688,7 @@ typedef struct {
     int     catch_discarded;
     int     half_frame_ms;        /* half a video frame: tolerance for "the frame AT the target" */
     int     vq_soft, vq_hard;     /* decode-ahead limits in frames for this file's frame rate */
+    double  speed;                /* playback speed (main -> decode): media time per wall time */
     pkt_fifo_t afifo, vfifo;      /* decode thread only */
     int     active_audio;         /* stream index of the audio track that plays (-1 = none);
                                      main writes it together with a seek, see "audio switch" */
@@ -732,7 +745,10 @@ static int video_room(const engine_t *e) {
     if (e->buf_enabled)
         return e->vq_bytes < e->buf_max_bytes && e->vq_count < VQ_SLOTS - 1 &&
                video_ahead_ms(e) < e->buf_target_ms;
-    return e->vq_count < e->vq_soft && e->vq_bytes < VQ_MAX_BYTES;
+    /* At 2x the video is used up twice as fast: keep as much WALL time ahead. */
+    int soft = e->speed > 1.0 ? (int)(e->vq_soft * e->speed) : e->vq_soft;
+    if (soft > VQ_SLOTS - 2) soft = VQ_SLOTS - 2;
+    return e->vq_count < soft && e->vq_bytes < VQ_MAX_BYTES;
 }
 static int audio_room(const engine_t *e) {
     if (e->aq_count >= AQ_CAP - 8) return 0;
@@ -746,7 +762,8 @@ static int audio_room(const engine_t *e) {
 static void push_frame(engine_t *e, lumen_frame_t *f, const lumen_decoder_vtable_t *dec) {
     int video = f->type == LUMEN_STREAM_VIDEO;
     pthread_mutex_lock(&e->lock);
-    int vcap = e->buf_enabled ? VQ_SLOTS : e->vq_hard;
+    int vcap = e->buf_enabled ? VQ_SLOTS : (e->speed > 1.0 ? (int)(e->vq_hard * e->speed) : e->vq_hard);
+    if (vcap > VQ_SLOTS - 1) vcap = VQ_SLOTS - 1;
     while (!e->abort && !e->seek_pending && (video ? e->vq_count >= vcap : e->aq_count >= AQ_CAP))
         pthread_cond_wait(&e->cond, &e->lock);
     if (e->abort || e->seek_pending) {
@@ -845,7 +862,7 @@ static void skip_policy(engine_t *e, stream_state_t *ss, skip_state_t *k, int64_
      * decoded-but-not-yet-queued audio too. */
     pthread_mutex_lock(&e->lock);
     int valid = e->clk_valid;
-    int64_t clk = e->clk_ms + (e->clk_running ? now_ms() - e->clk_at : 0);
+    int64_t clk = e->clk_ms + (e->clk_running ? (int64_t)((now_ms() - e->clk_at) * e->speed) : 0);
     int reserve = e->clk_buf_ms + (int)e->aq_ms;
     pthread_mutex_unlock(&e->lock);
     if (!valid) return;
@@ -896,8 +913,7 @@ static void deliver(engine_t *e, stream_state_t *ss, skip_state_t *skip, lumen_f
     if (ss->type == LUMEN_STREAM_SUBTITLE) {
         if (ss->sub_track >= 0) {
             pthread_mutex_lock(&e->lock);
-            lumen_sub_track_add(&e->sub_tracks[ss->sub_track], f->subtitle.start_ms,
-                                f->subtitle.end_ms, f->subtitle.text);
+            sub_add_frame(&e->sub_tracks[ss->sub_track], f);
             pthread_mutex_unlock(&e->lock);
         }
         ss->dec_vt->frame_free(f);
@@ -1021,7 +1037,7 @@ static void *decode_thread_main(void *arg) {
         e->room_wait = 0;
         drop_ok = e->clk_valid && e->clk_running && e->catch_target < 0;
         int skip_ok = e->pref_frameskip;
-        clk_now = e->clk_ms + (e->clk_running ? now_ms() - e->clk_at : 0);
+        clk_now = e->clk_ms + (e->clk_running ? (int64_t)((now_ms() - e->clk_at) * e->speed) : 0);
         if (e->abort) { pthread_mutex_unlock(&e->lock); break; }
         if (e->seek_pending) {
             int64_t target = e->seek_target;
@@ -1233,6 +1249,16 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         setenv("QQVIDEO_DECODE_THREADS", n, 1);
 #endif
     }
+    /* Preferences > Video > Hardware decoding, the same way. */
+    if (!g_hwdec_env_external) {
+        const char *v = state->pref_hwdec ? "auto" : "0";
+#if defined(_WIN32)
+        _putenv_s("QQVIDEO_HWDEC", v);
+#else
+        setenv("QQVIDEO_HWDEC", v, 1);
+#endif
+    }
+    state->hwdec_now[0] = '\0';
 
     stream_state_t streams[LUMEN_MAX_STREAMS];
     memset(streams, 0, sizeof(streams));
@@ -1483,6 +1509,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         }
     e->vq_soft = VQ_SOFT;
     e->vq_hard = VQ_HARD;
+    e->speed = 1.0;
     if (vfps > 0) {                              /* at least VQ_SOFT_MS / VQ_HARD_MS of video */
         int soft = (int)(vfps * VQ_SOFT_MS / 1000.0 + 0.5), hard = (int)(vfps * VQ_HARD_MS / 1000.0 + 0.5);
         if (soft > e->vq_soft) e->vq_soft = soft;
@@ -1507,7 +1534,10 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     for (int i = 0; i < table.stream_count; i++)
         if (table.streams[i].type == LUMEN_STREAM_VIDEO && streams[table.streams[i].stream_index].in_use)
             state->video_fps = table.streams[i].frame_rate;
-    int64_t wall_anchor = 0;      /* wall-clock pacing: frame pts p is due at wall_anchor + p */
+    /* Wall-clock pacing (no audio clock): the frame at anchor_pts was shown
+     * at anchor_t; media time runs at the playback speed from there. */
+    int64_t anchor_t = 0, anchor_pts = 0;
+    double anchor_speed = 1.0;    /* speed the anchor was set at */
     int wall_anchor_valid = 0;
     /* Settling: after starting or seeking, hold the audio until the first
      * video frame from the new position is decoded. Audio decodes far
@@ -1557,11 +1587,15 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             int sel = state->subtitle_selected;
             if (sel >= 0 && sel < state->subtitle_track_count && state->subtitle_tracks[sel].available) {
                 pthread_mutex_lock(&e->lock);
-                lumen_sub_track_text_at(&sub_tracks[sel], state->position_ms,
-                                        state->subtitle_text, sizeof(state->subtitle_text));
+                /* subtitle delay: + shows each cue that much later */
+                const int64_t at = state->position_ms - state->subtitle_delay_ms;
+                lumen_sub_track_text_at(&sub_tracks[sel], at, state->subtitle_text, sizeof(state->subtitle_text));
+                const lumen_sub_image_t *img = lumen_sub_track_image_at(&sub_tracks[sel], at);
                 pthread_mutex_unlock(&e->lock);
+                if (img != state->subtitle_image) { state->subtitle_image = img; state->subtitle_image_serial++; }
             } else {
                 state->subtitle_text[0] = '\0';
+                if (state->subtitle_image) { state->subtitle_image = NULL; state->subtitle_image_serial++; }
             }
         }
 
@@ -1662,6 +1696,22 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         }
         if (was_paused) { was_paused = 0; wall_anchor_valid = 0; }
 
+        /* Playback speed ([ and ], Playback > Speed): media time per wall time. */
+        double speed = state->playback_speed;
+        if (!(speed > 0)) speed = 1.0;
+        if (speed < 0.25) speed = 0.25;
+        if (speed > 4.0) speed = 4.0;
+
+        /* Speed changed while the wall clock paces: carry on from where the
+         * old speed got to (the anchor is otherwise left alone while it
+         * paces -- re-anchoring every frame added up rounding errors). */
+        if (wall_anchor_valid && (speed > anchor_speed + 1e-6 || speed < anchor_speed - 1e-6)) {
+            const int64_t t = now_ms();
+            anchor_pts += (int64_t)((t - anchor_t) * anchor_speed);
+            anchor_t = t;
+            anchor_speed = speed;
+        }
+
         /* Settings the decode thread follows, refreshed every pass so
          * Preferences changes apply immediately. */
         int64_t ahead_ms;
@@ -1672,6 +1722,7 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
         e->buf_target_ms = (int64_t)state->pref_buffer_seconds * 1000;
         e->buf_max_bytes = (size_t)state->pref_buffer_mb << 20;
         e->play_pos      = state->position_ms;
+        e->speed         = speed;
         e->pref_frameskip = state->pref_frameskip;
         ahead_ms = e->has_video ? video_ahead_ms(e) : e->aq_ms;
         full     = e->room_wait;
@@ -1774,6 +1825,8 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             qitem_t it;
             int got = 0, stale = 0, more = 0;
             int64_t now = now_ms();
+            int64_t due_in = 0;           /* media ms until the popped frame was due (+ early, - late) */
+            int timed_by_audio = 0;
             pthread_mutex_lock(&e->lock);
             if (e->vq_count > 0) {
                 qitem_t *h = &e->vq[e->vq_head];
@@ -1781,10 +1834,12 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
                 int64_t clk;
                 int use_audio = have_aclk && (abuf > 0 || state->paused);
                 if (use_audio)               clk = aclk;
-                else if (wall_anchor_valid)  clk = now - wall_anchor;
+                else if (wall_anchor_valid)  clk = anchor_pts + (int64_t)((now - anchor_t) * anchor_speed);
                 else                         clk = h->frame.pts;   /* first frame: show now, anchor on it */
                 int64_t d = h->frame.pts - clk;
                 if (stale || !vout || d <= 1) {
+                    due_in = d;
+                    timed_by_audio = use_audio;
                     vq_pop(e, &it);
                     got = 1;
                     more = e->vq_count > 0;
@@ -1815,11 +1870,24 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
             if (stale == 3) superseded++;
             if (!stale) {
                 state->position_ms = it.frame.pts;
+                {   /* what decodes the picture: Preferences > Video shows it */
+                    const char *hw = it.frame.video.hwaccel ? it.frame.video.hwaccel : "software";
+                    if (strcmp(state->hwdec_now, hw) != 0)
+                        snprintf(state->hwdec_now, sizeof(state->hwdec_now), "%s", hw);
+                }
                 if (vout) {
                     /* Keep the wall anchor continuous so pacing carries on
                      * seamlessly if the audio clock goes away. */
-                    wall_anchor = now - it.frame.pts;
-                    wall_anchor_valid = 1;
+                    /* Anchor on when this frame was DUE, not when it went
+                     * up: frames go up to 1 ms early, and anchoring on "now"
+                     * moved the clock that much ahead every frame (silent
+                     * video ran ~3% fast). Late frames don't drag it back. */
+                    if (timed_by_audio || !wall_anchor_valid) {
+                        anchor_t = now + (int64_t)(due_in / speed);
+                        anchor_pts = it.frame.pts;
+                        anchor_speed = speed;
+                        wall_anchor_valid = 1;
+                    }
                     state->video_sync_external = 1;   /* already timed: show immediately */
                     if (vout->present(session->vout_ctx, &it.frame) != 0) stop_requested = 1;
                 }
@@ -1891,8 +1959,9 @@ int lumen_session_play_file(lumen_session_t *session, const char *path, lumen_pl
     clip_wait(&clipper);          /* a clip still being saved runs code in the demuxer plugin */
     dmx->close(dctx);
     lumen_unload_plugin(&demux_plugin);
+    reset_subtitle_state(state);        /* first: the UI must stop pointing into the cues */
+    state->hwdec_now[0] = '\0';
     for (int i = 0; i < LUMEN_MAX_SUB_TRACKS; i++) lumen_sub_track_free(&sub_tracks[i]);
-    reset_subtitle_state(state);
 
     /* Remember where this file was stopped (or forget it if finished). */
     if (state->pref_resume)

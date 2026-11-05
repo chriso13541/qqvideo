@@ -27,6 +27,8 @@
  */
 #include "../../include/lumen_plugin.h"
 #include "../common/libav_common.h"
+#include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 #include <stdlib.h>
@@ -54,7 +56,83 @@ struct lumen_decoder_ctx {
     struct SwsContext *sws;               /* video: lazily created, only if needed */
     SwrContext        *swr;               /* audio: lazily created on first frame */
     int                channels;
+    int                bitmap;            /* image subtitles (PGS, VobSub, DVB) */
+    enum AVCodecID     bitmap_codec;
+
+    /* Hardware decoding: the GPU decodes, frames are copied back to
+     * memory (av_hwframe_transfer_data) and converted like any other. */
+    AVBufferRef       *hw_device;         /* NULL = software */
+    enum AVPixelFormat hw_pix_fmt;        /* frames in GPU memory come in this format */
+    const char        *hw_name;           /* "d3d11va", "vaapi", ... */
+    int                hw_active;         /* the current stream really decodes on the GPU */
+    AVFrame           *swframe;           /* GPU frames copied back here */
+    const AVCodec     *codec;             /* for reopening in software after a GPU failure */
+    int                hw_errors;         /* GPU decode errors (3 = give up on the GPU) */
+    int                hw_said_cpu;       /* "can't decode this video" already logged */
 };
+
+/* ---- hardware decoding ----------------------------------------------------
+ * Tried in this order where FFmpeg was built with them (`ffmpeg -hwaccels`)
+ * and the codec supports them; the first device that opens wins. Off with
+ * QQVIDEO_HWDEC=0 (the core sets it from Preferences > Video). */
+static const enum AVHWDeviceType k_hw_types[] = {
+#if defined(_WIN32)
+    AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_DXVA2,
+#elif defined(__APPLE__)
+    AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+#else
+    AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA,
+#endif
+};
+
+/* libavcodec offers the formats it can decode this stream to: take the
+ * GPU's if it's among them, else fall back to software for this stream
+ * (the GPU can't do this profile / size -- 4:4:4 H.264, say). */
+static enum AVPixelFormat pick_format(AVCodecContext *avctx, const enum AVPixelFormat *fmts) {
+    lumen_decoder_ctx_t *ctx = (lumen_decoder_ctx_t *)avctx->opaque;
+    for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
+        if (*p == ctx->hw_pix_fmt) {
+            if (!ctx->hw_active) printf("decoder_libav: hardware decoding (%s)\n", ctx->hw_name);
+            ctx->hw_active = 1;
+            return *p;
+        }
+    if (ctx->hw_active || !ctx->hw_said_cpu)
+        printf("decoder_libav: %s can't decode this video -- using the CPU\n", ctx->hw_name);
+    ctx->hw_active = 0;
+    ctx->hw_said_cpu = 1;
+    for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(*p);
+        if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *p;
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+/* Set up the first hardware decoder that works for this codec. */
+static void hw_setup(lumen_decoder_ctx_t *ctx, const AVCodec *codec) {
+    const char *env = getenv("QQVIDEO_HWDEC");
+    if (env && (env[0] == '0' || !strcmp(env, "off") || !strcmp(env, "no"))) return;
+    for (size_t t = 0; t < sizeof(k_hw_types) / sizeof(k_hw_types[0]); t++) {
+        enum AVPixelFormat fmt = AV_PIX_FMT_NONE;
+        for (int i = 0;; i++) {
+            const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+            if (!cfg) break;
+            if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && cfg->device_type == k_hw_types[t]) {
+                fmt = cfg->pix_fmt;
+                break;
+            }
+        }
+        if (fmt == AV_PIX_FMT_NONE) continue;                 /* codec can't use this one */
+        AVBufferRef *dev = NULL;
+        if (av_hwdevice_ctx_create(&dev, k_hw_types[t], NULL, NULL, 0) < 0) continue;   /* no such GPU/driver */
+        ctx->hw_device = dev;
+        ctx->hw_pix_fmt = fmt;
+        ctx->hw_name = av_hwdevice_get_type_name(k_hw_types[t]);
+        ctx->avctx->hw_device_ctx = av_buffer_ref(dev);
+        ctx->avctx->opaque = ctx;
+        ctx->avctx->get_format = pick_format;
+        return;
+    }
+}
 
 /* libavcodec needs AV_INPUT_BUFFER_PADDING_SIZE zero bytes after every
  * packet (decoders over-read for speed; text subtitle decoders need the 0
@@ -80,7 +158,6 @@ static uint8_t *padded(lumen_decoder_ctx_t *ctx, const uint8_t *data, size_t siz
 static int libav_probe(const char *codec_fourcc) {
     const lumen_libav_codec_t *c = lumen_libav_by_fourcc(codec_fourcc);
     if (!c) return 0;                           /* not on the allowlist */
-    if (c->bitmap) return 0;                    /* image subtitles: no renderer yet */
     if (!avcodec_find_decoder(c->id)) return 0; /* system FFmpeg built without it */
     return c->kind;
 }
@@ -102,7 +179,12 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
     if (!ctx->avctx) { free(ctx); return -1; }
 
     if (c->kind == LUMEN_PROBE_SUBTITLE) {
-        if (c->bitmap) { avcodec_free_context(&ctx->avctx); free(ctx); return -1; }
+        ctx->bitmap = c->bitmap;
+        ctx->bitmap_codec = c->id;
+        if (stream->width > 0 && stream->height > 0) {   /* image subtitles' canvas, if known */
+            ctx->avctx->width = stream->width;
+            ctx->avctx->height = stream->height;
+        }
         /* The demuxer hands us pts_ms/duration_ms, so tell libavcodec the
          * packet clock is milliseconds: it then fills AVSubtitle.pts and
          * end_display_time (from packet duration) on that same clock. */
@@ -137,6 +219,13 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
         const char *env = getenv("QQVIDEO_DECODE_THREADS");
         ctx->avctx->thread_count = env ? atoi(env) : 0;
         ctx->avctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        ctx->codec = codec;
+        hw_setup(ctx, codec);
+        if (!ctx->hw_device) {
+            const char *hv = getenv("QQVIDEO_HWDEC");
+            if (!hv || (hv[0] != '0' && strcmp(hv, "off") && strcmp(hv, "no")))
+                printf("decoder_libav: no hardware decoder for %s here -- using the CPU\n", c->fourcc);
+        }
     }
     if (avcodec_open2(ctx->avctx, codec, NULL) < 0) {
         avcodec_free_context(&ctx->avctx);
@@ -148,6 +237,38 @@ static int libav_open(lumen_decoder_ctx_t **out_ctx, const lumen_stream_desc_t *
     ctx->avframe = av_frame_alloc();
     *out_ctx = ctx;
     return 0;
+}
+
+/* The GPU failed mid-stream (driver error, lost device, failed copy-back):
+ * rebuild the decoder in software from the same stream parameters and
+ * carry on. The picture resumes at the next keyframe. */
+static void hw_give_up(lumen_decoder_ctx_t *ctx, const char *why) {
+    if (!ctx->hw_device || !ctx->codec) return;
+    AVCodecParameters *par = avcodec_parameters_alloc();
+    AVCodecContext *n = avcodec_alloc_context3(ctx->codec);
+    int ok = par && n && avcodec_parameters_from_context(par, ctx->avctx) >= 0 &&
+             avcodec_parameters_to_context(n, par) >= 0;
+    if (ok) {
+        n->pkt_timebase = ctx->avctx->pkt_timebase;
+        n->thread_count = ctx->avctx->thread_count;
+        n->thread_type = ctx->avctx->thread_type;
+        n->skip_frame = ctx->avctx->skip_frame;
+        n->skip_loop_filter = ctx->avctx->skip_loop_filter;
+        ok = avcodec_open2(n, ctx->codec, NULL) >= 0;
+    }
+    avcodec_parameters_free(&par);
+    if (!ok) { avcodec_free_context(&n); return; }
+    printf("decoder_libav: %s failed (%s) -- switching to the CPU\n", ctx->hw_name, why);
+    avcodec_free_context(&ctx->avctx);
+    ctx->avctx = n;
+    av_buffer_unref(&ctx->hw_device);
+    ctx->hw_active = 0;
+    av_packet_unref(ctx->pending);
+}
+
+/* A decode error while the GPU decodes: three of those and it's the GPU. */
+static void hw_error(lumen_decoder_ctx_t *ctx, const char *why) {
+    if (ctx->hw_device && ctx->hw_active && ++ctx->hw_errors >= 3) hw_give_up(ctx, why);
 }
 
 /* ---- video: any pixfmt -> tightly-packed YUV420P ------------------- */
@@ -221,7 +342,26 @@ static void video_frame_release(lumen_frame_t *f) {
     for (int p = 0; p < 4; p++) f->video.planes[p] = NULL;
 }
 
+/* P010/P016's interleaved UV (16-bit, value in the top bits) -> separate
+ * 8-bit U and V planes. */
+static void split_uv(const uint8_t *src, int sstride, uint8_t *u, uint8_t *v, int dstride, int cw, int ch) {
+    for (int y = 0; y < ch; y++) {
+        uint8_t *up = u + (size_t)y * dstride, *vp = v + (size_t)y * dstride;
+        const uint16_t *sp = (const uint16_t *)(src + (size_t)y * sstride);
+        for (int x = 0; x < cw; x++) { up[x] = (uint8_t)(sp[2 * x] >> 8); vp[x] = (uint8_t)(sp[2 * x + 1] >> 8); }
+    }
+}
+
 static int emit_video(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_t *out) {
+    const char *hw = NULL;
+    if (ctx->hw_device && avf->format == ctx->hw_pix_fmt) {
+        /* Decoded on the GPU: copy it back to memory (NV12 or P010, usually). */
+        if (!ctx->swframe && !(ctx->swframe = av_frame_alloc())) return -1;
+        av_frame_unref(ctx->swframe);
+        if (av_hwframe_transfer_data(ctx->swframe, avf, 0) < 0) { hw_error(ctx, "copying a frame back"); return -1; }
+        avf = ctx->swframe;
+        hw = ctx->hw_name;
+    }
     int w = avf->width, h = avf->height;
     int cw = (w + 1) / 2, ch = (h + 1) / 2;   /* round UP for odd sizes */
 
@@ -230,6 +370,7 @@ static int emit_video(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_
     out->video.width = w;
     out->video.height = h;
     out->video.pixel_format = LUMEN_PIXFMT_YUV420P;
+    out->video.hwaccel = hw;
 
     int pw[3] = { w, cw, cw }, ph[3] = { h, ch, ch };
     const size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
@@ -254,6 +395,20 @@ static int emit_video(lumen_decoder_ctx_t *ctx, const AVFrame *avf, lumen_frame_
     if (fmt == AV_PIX_FMT_YUV420P10LE) {
         for (int p = 0; p < 3; p++)
             shift_10_to_8(avf->data[p], avf->linesize[p], out->video.planes[p], pw[p], pw[p], ph[p]);
+        return 0;
+    }
+
+    /* 10-bit from the GPU: P010 (10 bits in the top of 16, U and V
+     * interleaved). A plain loop here is twice as fast as swscale (1.75 vs
+     * 3.88 ms per 1080p frame, measured). 8-bit NV12 goes through swscale
+     * below: its SIMD de-interleave beats a plain loop (0.36 vs 0.69 ms). */
+    if (fmt == AV_PIX_FMT_P010LE || fmt == AV_PIX_FMT_P016LE) {
+        for (int y = 0; y < h; y++) {
+            const uint16_t *sp = (const uint16_t *)(avf->data[0] + (size_t)y * avf->linesize[0]);
+            uint8_t *dp = out->video.planes[0] + (size_t)y * pw[0];
+            for (int x = 0; x < w; x++) dp[x] = (uint8_t)(sp[x] >> 8);
+        }
+        split_uv(avf->data[1], avf->linesize[1], out->video.planes[1], out->video.planes[2], cw, cw, ch);
         return 0;
     }
 
@@ -404,6 +559,56 @@ static void append_plain(const char *ass, char *out, size_t cap, size_t *len) {
     out[*len] = '\0';
 }
 
+/* Image subtitles: each AVSubtitleRect is 8-bit palette indices plus a
+ * palette of 32-bit 0xAARRGGBB colors; turn them into RGBA pictures. */
+static lumen_sub_image_t *bitmap_image(lumen_decoder_ctx_t *ctx, const AVSubtitle *sub) {
+    int n = 0;
+    for (unsigned i = 0; i < sub->num_rects; i++)
+        if (sub->rects[i]->type == SUBTITLE_BITMAP && sub->rects[i]->w > 0 && sub->rects[i]->h > 0) n++;
+    if (n == 0) return NULL;
+    lumen_sub_image_t *im = (lumen_sub_image_t *)calloc(1, sizeof(*im));
+    if (!im) return NULL;
+    im->rects = (lumen_sub_rect_t *)calloc((size_t)n, sizeof(lumen_sub_rect_t));
+    if (!im->rects) { free(im); return NULL; }
+    im->canvas_w = ctx->avctx->width;
+    im->canvas_h = ctx->avctx->height;
+    if ((im->canvas_w <= 0 || im->canvas_h <= 0) && ctx->bitmap_codec == AV_CODEC_ID_DVB_SUBTITLE) {
+        im->canvas_w = 720;                     /* DVB's default display, when none is given */
+        im->canvas_h = 576;
+    }
+    for (unsigned i = 0; i < sub->num_rects; i++) {
+        const AVSubtitleRect *r = sub->rects[i];
+        if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 || !r->data[0] || !r->data[1]) continue;
+        uint8_t *px = (uint8_t *)malloc((size_t)r->w * r->h * 4);
+        if (!px) break;
+        const uint32_t *pal = (const uint32_t *)r->data[1];
+        const int ncolors = r->nb_colors > 0 && r->nb_colors <= 256 ? r->nb_colors : 256;
+        for (int y = 0; y < r->h; y++) {
+            const uint8_t *src = r->data[0] + (size_t)y * r->linesize[0];
+            uint8_t *dst = px + (size_t)y * r->w * 4;
+            for (int x = 0; x < r->w; x++) {
+                const uint32_t c = src[x] < ncolors ? pal[src[x]] : 0;
+                dst[x * 4 + 0] = (uint8_t)(c >> 16);    /* R */
+                dst[x * 4 + 1] = (uint8_t)(c >> 8);     /* G */
+                dst[x * 4 + 2] = (uint8_t)c;            /* B */
+                dst[x * 4 + 3] = (uint8_t)(c >> 24);    /* A */
+            }
+        }
+        lumen_sub_rect_t *o = &im->rects[im->count++];
+        o->x = r->x; o->y = r->y; o->w = r->w; o->h = r->h;
+        o->rgba = px;
+    }
+    if (im->count == 0) { free(im->rects); free(im); return NULL; }
+    return im;
+}
+
+static void bitmap_image_free(lumen_sub_image_t *im) {
+    if (!im) return;
+    for (int i = 0; i < im->count; i++) free(im->rects[i].rgba);
+    free(im->rects);
+    free(im);
+}
+
 static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lumen_frame_t *out) {
     AVSubtitle sub;
     int got = 0;
@@ -439,8 +644,25 @@ static int decode_subtitle(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, 
     int64_t end = -1;
     if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX)
         end = base + sub.end_display_time;
-    else if (pkt->duration_ms > 0)
+    else if (pkt->duration_ms > 0 && !ctx->bitmap)    /* PGS: the next event ends it */
         end = start + pkt->duration_ms;
+
+    if (ctx->bitmap) {
+        /* An image -- or, with no rectangles, a "clear the screen" event
+         * (PGS ends every subtitle that way): emitted too, as an empty cue. */
+        lumen_sub_image_t *im = bitmap_image(ctx, &sub);
+        avsubtitle_free(&sub);
+        if (base < 0) { bitmap_image_free(im); return 1; }
+        memset(out, 0, sizeof(*out));
+        out->type = LUMEN_STREAM_SUBTITLE;
+        out->pts = start;
+        out->subtitle.text = strdup("");
+        out->subtitle.start_ms = start;
+        out->subtitle.end_ms = end;
+        out->subtitle.image = im;
+        if (!out->subtitle.text) { bitmap_image_free(im); return -1; }
+        return 0;
+    }
     avsubtitle_free(&sub);
 
     /* Empty events are "clear the screen" markers (mov_text uses them
@@ -483,6 +705,7 @@ static int libav_receive(lumen_decoder_ctx_t *ctx, lumen_frame_t *out) {
             if (s < 0) return -1;
             continue;
         }
+        if (rc != AVERROR(EAGAIN) && rc != AVERROR_EOF && ctx->kind == LUMEN_PROBE_VIDEO) hw_error(ctx, "decoding");
         return (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) ? 1 : -1;
     }
 }
@@ -511,6 +734,7 @@ static int libav_decode(lumen_decoder_ctx_t *ctx, const lumen_packet_t *pkt, lum
         if (ctx->pending->data) av_packet_unref(ctx->pending);
         if (av_packet_ref(ctx->pending, ctx->avpkt) < 0) return -1;
     } else if (send_rc < 0) {
+        if (ctx->kind == LUMEN_PROBE_VIDEO) hw_error(ctx, "decoding");
         return -1;
     }
     return libav_receive(ctx, out);
@@ -547,6 +771,8 @@ static void libav_frame_free(lumen_frame_t *frame) {
     } else if (frame->type == LUMEN_STREAM_SUBTITLE) {
         free(frame->subtitle.text);
         frame->subtitle.text = NULL;
+        bitmap_image_free(frame->subtitle.image);     /* the core keeps its own copy */
+        frame->subtitle.image = NULL;
     } else {
         free(frame->audio.data);
         frame->audio.data = NULL;
@@ -568,6 +794,8 @@ static void libav_close(lumen_decoder_ctx_t *ctx) {
     if (!ctx) return;
     if (ctx->swr) swr_free(&ctx->swr);
     if (ctx->sws) sws_freeContext(ctx->sws);
+    av_frame_free(&ctx->swframe);
+    av_buffer_unref(&ctx->hw_device);
     free(ctx->pad_buf);
     av_frame_free(&ctx->avframe);
     av_packet_free(&ctx->avpkt);

@@ -103,6 +103,9 @@ static int fill_stream_table(AVFormatContext *fmt_ctx, lumen_stream_table_t *out
         } else if (sd->type == LUMEN_STREAM_AUDIO) {
             sd->sample_rate = cp->sample_rate;
             sd->channels = cp->ch_layout.nb_channels;
+        } else if (sd->type == LUMEN_STREAM_SUBTITLE) {
+            sd->width = cp->width;            /* image subtitles: the canvas they're drawn for */
+            sd->height = cp->height;
         }
         sd->extradata = cp->extradata;
         sd->extradata_size = cp->extradata_size;

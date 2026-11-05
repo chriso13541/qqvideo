@@ -34,9 +34,8 @@ typedef struct {
     const char     *fourcc;   /* what demuxers report / manifests claim */
     enum AVCodecID  id;
     int             kind;     /* 1 video, 2 audio, 3 subtitle (LUMEN_PROBE_*) */
-    int             bitmap;   /* subtitle rendered as images, not text: known
-                                 (so tracks get a real label) but decoder_libav
-                                 won't claim it until there's a bitmap renderer */
+    int             bitmap;   /* subtitle rendered as images, not text (decoder_libav
+                                 turns them into RGBA pictures, v26) */
 } lumen_libav_codec_t;
 
 static const lumen_libav_codec_t LUMEN_LIBAV_CODECS[] = {

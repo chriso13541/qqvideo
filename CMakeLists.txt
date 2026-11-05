@@ -87,6 +87,7 @@ if (SDL2_FOUND)
       plugins/output_sdl2/retro_style.cpp
       plugins/output_sdl2/snapshot.cpp
       plugins/output_sdl2_audio/output_sdl2_audio.c
+      plugins/output_sdl2_audio/tempo.c
       third_party/imgui/imgui.cpp
       third_party/imgui/imgui_draw.cpp
       third_party/imgui/imgui_tables.cpp

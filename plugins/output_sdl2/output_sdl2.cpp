@@ -489,6 +489,143 @@ static HWND wm_hwnd(lumen_output_ctx_t *ctx) {
     if (!SDL_GetWindowWMInfo(ctx->window, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return NULL;
     return info.info.win.window;
 }
+
+/* ---- Keep playing while a window is dragged or resized (Windows) ----
+ *
+ * Holding a window's title bar or edge makes Windows run its own
+ * move/size loop inside DefWindowProc -- i.e. inside SDL_PumpEvents --
+ * and only return when the mouse is let go. The player's whole loop (the
+ * frames to show, the sound to queue) runs on this thread between event
+ * pumps, so video froze and sound ran dry for as long as the drag lasted.
+ *
+ * So events are pumped on a separate fiber (a second stack on the same
+ * thread). While Windows' loop runs, a 10 ms timer inside it switches
+ * back to the player, which carries on as if the pump had returned: it
+ * shows the frames that are due and keeps the sound fed, and on its next
+ * pump switches back into Windows' loop, which picks up the mouse where
+ * it left off. When the drag ends, the pump finishes normally. Nothing
+ * runs twice and nothing waits: it's one thread taking turns.
+ *
+ * Between ticks the player keeps the thread until it has put a frame up
+ * or LIVE_HOLD_MS have passed, so frames still go up on time and the
+ * window still follows the mouse closely. */
+#define LIVE_TIMER_ID  0x51517631u   /* our WM_TIMER, told apart from anyone else's */
+#define LIVE_HOLD_MS   8
+#define LIVE_PROP_W    L"qqvideo.live.prevproc"
+
+static struct {
+    LPVOID main_fiber;         /* the thread's original stack (the player) */
+    LPVOID pump_fiber;         /* runs SDL_PumpEvents */
+    int    converted;          /* we turned the thread into a fiber (undo on close) */
+    int    pump_busy;          /* pump_fiber is part-way through a pump (in Windows' loop) */
+    int    modal;              /* Windows' move/size loop is running */
+    int    presented;          /* a frame went up since the player got the thread back */
+    Uint64 resumed_at;         /* when the player got the thread back */
+    int    windows;            /* windows subclassed */
+} g_live;
+
+static VOID CALLBACK live_pump_main(LPVOID) {
+    for (;;) {
+        SDL_PumpEvents();
+        g_live.pump_busy = 0;
+        SwitchToFiber(g_live.main_fiber);
+    }
+}
+
+static LRESULT CALLBACK live_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC prev = (WNDPROC)GetPropW(hwnd, LIVE_PROP_W);
+    switch (msg) {
+    case WM_ENTERSIZEMOVE:
+        g_live.modal = 1;
+        SetTimer(hwnd, LIVE_TIMER_ID, USER_TIMER_MINIMUM, NULL);
+        break;
+    case WM_EXITSIZEMOVE:
+        g_live.modal = 0;
+        KillTimer(hwnd, LIVE_TIMER_ID);
+        break;
+    case WM_TIMER:
+        if (wp == LIVE_TIMER_ID) {
+            /* Inside Windows' loop, on the pump fiber: let the player run. */
+            if (g_live.pump_fiber && GetCurrentFiber() == g_live.pump_fiber)
+                SwitchToFiber(g_live.main_fiber);
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        KillTimer(hwnd, LIVE_TIMER_ID);
+        if (prev) SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)prev);
+        RemovePropW(hwnd, LIVE_PROP_W);
+        if (g_live.windows > 0) g_live.windows--;
+        break;
+    }
+    return prev ? CallWindowProcW(prev, hwnd, msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Call for each window we create (the video window, Preferences...):
+ * dragging any of them would otherwise stop playback. */
+static void live_attach(SDL_Window *win) {
+    if (!win) return;
+    if (!g_live.pump_fiber) {
+        g_live.main_fiber = ConvertThreadToFiber(NULL);
+        g_live.converted = g_live.main_fiber != NULL;
+        if (!g_live.main_fiber && GetLastError() == ERROR_ALREADY_FIBER)
+            g_live.main_fiber = GetCurrentFiber();       /* someone else made it a fiber */
+        if (!g_live.main_fiber) return;
+        g_live.pump_fiber = CreateFiber(1 << 20, live_pump_main, NULL);
+        if (!g_live.pump_fiber) return;     /* falls back to plain SDL_PumpEvents */
+    }
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+    HWND hwnd = info.info.win.window;
+    if (GetPropW(hwnd, LIVE_PROP_W)) return;
+    LONG_PTR prev = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (!prev) return;
+    SetPropW(hwnd, LIVE_PROP_W, (HANDLE)prev);
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)live_wndproc);
+    g_live.windows++;
+}
+
+/* SDL_PumpEvents, by way of the pump fiber. Mid-drag, returns at once
+ * (the player keeps the thread) until it's been LIVE_HOLD_MS or a frame
+ * went up, then hands the thread back to Windows' loop. */
+static void live_pump(void) {
+    if (!g_live.pump_fiber) { SDL_PumpEvents(); return; }
+    if (g_live.pump_busy && !g_live.presented &&
+        SDL_GetTicks64() - g_live.resumed_at < LIVE_HOLD_MS)
+        return;
+    g_live.pump_busy = 1;
+    SwitchToFiber(g_live.pump_fiber);
+    /* back: the pump finished (pump_busy = 0), or a drag tick handed over */
+    g_live.presented = 0;
+    g_live.resumed_at = SDL_GetTicks64();
+}
+
+/* Before windows go away: end a drag that's in progress (dropping the
+ * mouse capture ends Windows' loop) and let the pump finish, so no
+ * window is destroyed under a suspended loop. Then free the fiber. */
+static void live_finish(void) {
+    for (int i = 0; i < 100 && g_live.pump_fiber && g_live.pump_busy; i++) {
+        ReleaseCapture();
+        SwitchToFiber(g_live.pump_fiber);
+    }
+}
+static void live_shutdown(void) {
+    live_finish();
+    if (g_live.pump_fiber && !g_live.pump_busy) {
+        DeleteFiber(g_live.pump_fiber);
+        g_live.pump_fiber = NULL;
+        if (g_live.converted) { ConvertFiberToThread(); g_live.converted = 0; }
+        g_live.main_fiber = NULL;
+    }
+}
+#define LIVE_PRESENTED() (g_live.presented = 1)
+#else
+static void live_attach(SDL_Window *) { }
+static void live_pump(void) { SDL_PumpEvents(); }
+static void live_finish(void) { }
+static void live_shutdown(void) { }
+#define LIVE_PRESENTED() ((void)0)
 #endif
 
 #if !defined(_WIN32)
@@ -806,7 +943,11 @@ static float draw_wm_titlebar(lumen_output_ctx_t *ctx) {
 
 static int handle_events(lumen_output_ctx_t *ctx) {
     SDL_Event e;
-    while (SDL_PollEvent(&e)) {
+    /* Pump, then drain SDL's queue without pumping again: mid-drag on
+     * Windows the pump is suspended inside Windows' move loop (see
+     * live_pump) and mustn't be re-entered. */
+    live_pump();
+    while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT) > 0) {
         /* Route events to the correct ImGui context based on window ID.
          * Each context stores its backend data independently, so we must
          * switch before calling ImGui_ImplSDL2_ProcessEvent. */
@@ -1148,6 +1289,7 @@ static bool aux_window_create(lumen_output_ctx_t *ctx, const char *title, int w,
     memset(wm, 0, sizeof(*wm));
     wm->win = *win;
     SDL_SetWindowHitTest(*win, aux_hit_test, wm);
+    live_attach(*win);                 /* dragging it mustn't stop the video */
     aux_apply_frame(ctx, wm);
     SDL_SetWindowPosition(*win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);   /* re-center at the final size */
     SDL_ShowWindow(*win);
@@ -3113,6 +3255,7 @@ static void maybe_redraw(lumen_output_ctx_t *ctx, bool new_frame = false) {
         sub_images_update(ctx);
         sub_images_draw(ctx, dest, src);            /* image subtitles: over the picture, under the UI */
         if (ctx->frame_undrawn) {                 /* a new frame goes on screen */
+            LIVE_PRESENTED();                     /* mid-drag: Windows' loop may have the thread back */
             if (FILE *fl = debug_frame_log())
                 fprintf(fl, "%.3f %lld\n", (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(),
                         (long long)ctx->shown_pts);
@@ -3174,6 +3317,7 @@ static int sdl2_open(lumen_output_ctx_t **out_ctx) {
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
     if (ctx->window && SDL_SetWindowHitTest(ctx->window, wm_hit_test, ctx) != 0)
         fprintf(stderr, "lumen: window hit-testing unavailable (%s) -- the Bluecurve frame can't be dragged\n", SDL_GetError());
+    live_attach(ctx->window);          /* keep playing while it's dragged (Windows) */
     if (!ctx->window) {
         fprintf(stderr, "lumen: SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -3529,6 +3673,7 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
         SDL_DestroyMutex(ctx->dialog_mutex);
         ctx->dialog_mutex = NULL;
     }
+    live_finish();                        /* no window goes away mid-drag */
     lumen_fb_destroy(ctx->fb);
     ctx->fb = NULL;
     /* Tear down the package manager window and its own ImGui context */
@@ -3546,6 +3691,7 @@ static void sdl2_close(lumen_output_ctx_t *ctx) {
     if (ctx->renderer) SDL_DestroyRenderer(ctx->renderer);
     if (ctx->window) SDL_DestroyWindow(ctx->window);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    live_shutdown();
     free(ctx);
 }
 

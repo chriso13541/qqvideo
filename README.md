@@ -828,10 +828,8 @@ skips the drain phase, closes every output and decoder, no crash.
    pipeline blocks identically either way, the window just shows its
    last-painted frame motionless during the drag (the OS isn't asking
    for a repaint, so there's nothing new to show) and resumes cleanly on
-   release thanks to the same drop logic. Eliminating the freeze itself
-   (not just the post-freeze glitch) needs decode moved off the main
-   thread entirely -- a real, separate piece of future work, not a
-   quick fix.
+   release thanks to the same drop logic. *Update:* the freeze itself is
+   gone too -- see "Playing while the window is dragged" below.
 5. **Blocky/aliased scaling, read as "fuzzy" playback.** SDL defaults to
    nearest-neighbor texture scaling; any time the destination size
    doesn't exactly match the video's native resolution -- which the
@@ -847,6 +845,28 @@ skips the drain phase, closes every output and decoder, no crash.
    compatibility-stretched by Windows itself, producing the identical
    blurry symptom through a completely different layer; costs nothing
    on non-scaled displays.
+
+## Playing while the window is dragged (Windows)
+
+Decoding has its own thread now, but showing frames and feeding the
+sound still happen on the main thread, between event pumps. On Windows,
+holding a window's title bar or edge makes the system run its own
+move/size loop *inside* the event pump (`DefWindowProc`), returning only
+when the mouse is let go: the picture froze and the sound ran dry for the
+whole drag. (Linux isn't affected: qqvideo moves the window itself there.)
+
+`output_sdl2` now pumps events on a second fiber -- another stack on the
+same thread. On `WM_ENTERSIZEMOVE` it starts a 10 ms timer; each
+`WM_TIMER`, delivered inside Windows' loop, switches back to the player,
+which carries on exactly as if the pump had returned (frames due go up,
+sound is queued) until it has shown a frame or 8 ms have passed, then
+switches back into Windows' loop where the mouse picks up where it left
+off. Events are drained with `SDL_PeepEvents` so the suspended pump is
+never re-entered. The video window and the Preferences / Packages
+windows all get this. Measured under Wine with a 60 fps test loop: the
+old way stopped for the full 3.7 s drag; with the fiber the longest
+gap was 22 ms, and frames went up at every position the window passed
+through. Live resizing redraws too.
 
 ## Proven in this sandbox (synthetic pipeline)
 
@@ -944,15 +964,6 @@ To actually build on Windows:
   silently falls back to software, the same `update-alternatives`-style
   pattern as Gentoo's own slot/priority resolution, just applied to
   decoder selection.
-- **Decode off the main thread.** Right now demux+decode+present all run
-  on one thread, so any OS-modal operation (window move/resize) freezes
-  playback entirely for its duration -- confirmed directly as the cause
-  of the freeze-while-dragging behavior. The drop-stale-frames fix above
-  makes *resuming* clean, but doesn't stop the freeze itself. Fixing
-  that for real means a decode thread feeding a frame queue, with the
-  main thread's event/render loop continuing to drain already-decoded
-  frames even while modally blocked on a drag -- a real architecture
-  change (queue, mutex/condvar synchronization), not a quick flag.
 - **Per-decoder process sandboxing.** Right now plugins run in-process,
   same as VLC. The next real security hardening step is running each
   decoder plugin in its own child process (job object / AppContainer on
